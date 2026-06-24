@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     llm_provider: str = "evowit"
     llm_gateway_url: str = ""
     llm_gateway_key: str = ""
+    embed_url: str = ""
+    embed_dim: int = 512
     llm_max_concurrency: int = 1
     llm_min_interval_seconds: float = 8.0
     llm_queue_warn_size: int = 3

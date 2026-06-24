@@ -17,6 +17,8 @@ services:
       # new-api gateway (internal, tailscale-only). Token injected via .env (gitignored).
       XUE_LLM_GATEWAY_URL: http://100.64.0.13:8031/v1
       XUE_LLM_GATEWAY_KEY: ${XUE_LLM_GATEWAY_KEY:-}
+      # local bge-small-zh embedding service (TEI) for per-account semantic knowledge base
+      XUE_EMBED_URL: http://100.64.0.13:8082
       XUE_LLM_MAX_CONCURRENCY: 1
       XUE_LLM_MIN_INTERVAL_SECONDS: 8
       XUE_LLM_QUEUE_WARN_SIZE: 3

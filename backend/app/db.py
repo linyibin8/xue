@@ -702,6 +702,21 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             WHERE status IN ('ignored', 'mastered') OR review_state IN ('ignored', 'mastered')
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS knowledge_vectors (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                ref_id TEXT NOT NULL,
+                student_profile_id TEXT NOT NULL DEFAULT '',
+                text TEXT NOT NULL DEFAULT '',
+                embedding TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                UNIQUE(kind, ref_id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_vectors_kind ON knowledge_vectors(kind, updated_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_users_account ON users(account_id, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_account_members_user ON account_members(user_id, status)")

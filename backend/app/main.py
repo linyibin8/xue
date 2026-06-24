@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 
-from . import llm, prompts
+from . import embeddings, llm, prompts
 from .config import get_settings
 from .db import connect, connect_control, ensure_account_db, init_db, list_account_ids, set_current_account, utc_now
 
@@ -7573,6 +7573,106 @@ def delete_profile(profile_id: str, request: Request) -> dict:
             (now, profile_id, principal["account_id"]),
         )
     return {"ok": True, "profiles": account_profiles(principal["account_id"])}
+
+
+async def index_knowledge_items(items: list[dict]) -> int:
+    """Embed + upsert knowledge texts into the active account's knowledge_vectors table."""
+    if not embeddings.embed_enabled():
+        return 0
+    items = [it for it in items if (it.get("text") or "").strip()]
+    if not items:
+        return 0
+    try:
+        vectors = await embeddings.embed_texts([it["text"][:1000] for it in items])
+    except Exception:
+        return 0
+    if len(vectors) != len(items):
+        return 0
+    now = utc_now()
+    with connect() as conn:
+        for it, vec in zip(items, vectors):
+            conn.execute(
+                """
+                INSERT INTO knowledge_vectors(id, kind, ref_id, student_profile_id, text, embedding, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(kind, ref_id) DO UPDATE SET
+                    text=excluded.text, embedding=excluded.embedding,
+                    student_profile_id=excluded.student_profile_id, updated_at=excluded.updated_at
+                """,
+                (uuid.uuid4().hex, it["kind"], it["ref_id"], it.get("student_profile_id", ""),
+                 it["text"][:2000], json_dumps(vec), now),
+            )
+    return len(items)
+
+
+def collect_account_knowledge_rows() -> list[dict]:
+    rows: list[dict] = []
+    with connect() as conn:
+        for r in conn.execute(
+            "SELECT id, title, question_text, knowledge_points, subject, error_reason FROM mistake_items WHERE status NOT IN ('deleted')"
+        ):
+            d = dict(r)
+            text = " ".join(str(d.get(k) or "") for k in ("subject", "title", "question_text", "knowledge_points", "error_reason")).strip()
+            if text:
+                rows.append({"kind": "mistake", "ref_id": d["id"], "student_profile_id": "", "text": text})
+        for r in conn.execute("SELECT id, item_type, title, content, subject FROM learning_items"):
+            d = dict(r)
+            text = " ".join(str(d.get(k) or "") for k in ("subject", "item_type", "title", "content")).strip()
+            if text:
+                rows.append({"kind": "learning", "ref_id": d["id"], "student_profile_id": "", "text": text})
+    return rows
+
+
+async def knowledge_semantic_search(query: str, k: int = 5, kinds: list[str] | None = None) -> list[dict]:
+    if not embeddings.embed_enabled() or not query.strip():
+        return []
+    try:
+        qvec = await embeddings.embed_text(query[:1000])
+    except Exception:
+        return []
+    if not qvec:
+        return []
+    results: list[dict] = []
+    with connect() as conn:
+        sql = "SELECT kind, ref_id, student_profile_id, text, embedding FROM knowledge_vectors"
+        params: list = []
+        if kinds:
+            sql += " WHERE kind IN (%s)" % ",".join("?" * len(kinds))
+            params.extend(kinds)
+        for r in conn.execute(sql, params):
+            try:
+                vec = json.loads(r["embedding"])
+            except Exception:
+                continue
+            results.append({
+                "kind": r["kind"], "ref_id": r["ref_id"], "student_profile_id": r["student_profile_id"],
+                "text": r["text"], "score": round(embeddings.cosine(qvec, vec), 4),
+            })
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[: max(1, min(k, 50))]
+
+
+@app.post("/api/knowledge/reindex")
+async def reindex_knowledge(request: Request) -> dict:
+    principal_from_request(request, required=True)
+    rows = collect_account_knowledge_rows()
+    count = await index_knowledge_items(rows)
+    return {"ok": True, "indexed": count, "embed_enabled": embeddings.embed_enabled()}
+
+
+@app.post("/api/knowledge/search")
+async def search_knowledge(request: Request) -> dict:
+    principal_from_request(request, required=True)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(422, "invalid JSON body")
+    query = clean_user_text(body.get("query") or body.get("q"), 500)
+    if not query:
+        raise HTTPException(422, "query is required")
+    k = int(body.get("k") or 5)
+    kinds = body.get("kinds") if isinstance(body.get("kinds"), list) else None
+    results = await knowledge_semantic_search(query, k=k, kinds=kinds)
+    return {"query": query, "results": results, "embed_enabled": embeddings.embed_enabled()}
 
 
 @app.get("/api/model-platforms")
