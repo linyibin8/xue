@@ -243,6 +243,7 @@ struct ContentView: View {
                 BackgroundCameraHost(state: state)
             }
         }
+        .overlay(alignment: .topTrailing) { AccountBadge().padding(.top, 6).padding(.trailing, 10) }
         .background(Color(.secondarySystemBackground).ignoresSafeArea())
         .task {
             state.log("App 启动，后端地址 \(serverBaseURL.absoluteString)")
@@ -8794,6 +8795,9 @@ final class AppState: ObservableObject {
             if !goal.isEmpty {
                 fields["student_goal"] = goal
             }
+            if !AuthSession.shared.activeStudentId.isEmpty {
+                fields["student_profile_id"] = AuthSession.shared.activeStudentId
+            }
             let data = try await postForm(path: "/api/sessions", fields: fields, files: [])
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let id = json["session_id"] as? String {
@@ -10295,6 +10299,9 @@ final class AppState: ObservableObject {
             if !goal.isEmpty {
                 fields["student_goal"] = goal
             }
+            if !AuthSession.shared.activeStudentId.isEmpty {
+                fields["student_profile_id"] = AuthSession.shared.activeStudentId
+            }
             let data = try await postForm(path: "/api/sessions", fields: fields, files: [])
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any], let id = json["session_id"] as? String {
                 guard isBursting, generation == burstGeneration else { return false }
@@ -10611,6 +10618,7 @@ final class AppState: ObservableObject {
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             setControlTokenHeader(&request)
+            if let auth = AuthSession.shared.authHeader { request.setValue(auth, forHTTPHeaderField: "Authorization") }
             request.timeoutInterval = 8
             let state = await MainActor.run { remoteControlStatePayload() }
             let payload: [String: Any] = [
@@ -10705,6 +10713,7 @@ final class AppState: ObservableObject {
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             setControlTokenHeader(&request)
+            if let auth = AuthSession.shared.authHeader { request.setValue(auth, forHTTPHeaderField: "Authorization") }
             request.timeoutInterval = 8
             let state = await MainActor.run { remoteControlStatePayload() }
             let payload: [String: Any] = [
@@ -10738,6 +10747,7 @@ final class AppState: ObservableObject {
     private func uploadLog(_ message: String, level: String) async {
         var request = URLRequest(url: serverBaseURL.appending(path: "/api/logs"))
         request.httpMethod = "POST"
+        if let auth = AuthSession.shared.authHeader { request.setValue(auth, forHTTPHeaderField: "Authorization") }
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let payload: [String: Any] = [
             "session_id": sessionId ?? NSNull(),
@@ -10755,6 +10765,7 @@ final class AppState: ObservableObject {
         var request = URLRequest(url: serverBaseURL.appending(path: path))
         request.httpMethod = "POST"
         request.timeoutInterval = files.isEmpty ? 45 : 120
+        if let auth = AuthSession.shared.authHeader { request.setValue(auth, forHTTPHeaderField: "Authorization") }
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         request.httpBody = makeMultipartBody(boundary: boundary, fields: fields, files: files)
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -10762,6 +10773,7 @@ final class AppState: ObservableObject {
             throw NetworkRequestError.missingHTTPResponse
         }
         guard (200..<300).contains(http.statusCode) else {
+            if http.statusCode == 401 { AuthSession.shared.handleUnauthorized() }
             let body = String(data: data.prefix(600), encoding: .utf8) ?? ""
             throw NetworkRequestError.badStatus(http.statusCode, body)
         }
@@ -10771,6 +10783,7 @@ final class AppState: ObservableObject {
     private func patchJSON(path: String, payload: [String: Any]) async throws -> Data {
         var request = URLRequest(url: serverBaseURL.appending(path: path))
         request.httpMethod = "PATCH"
+        if let auth = AuthSession.shared.authHeader { request.setValue(auth, forHTTPHeaderField: "Authorization") }
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -10778,6 +10791,7 @@ final class AppState: ObservableObject {
             throw NetworkRequestError.missingHTTPResponse
         }
         guard (200..<300).contains(http.statusCode) else {
+            if http.statusCode == 401 { AuthSession.shared.handleUnauthorized() }
             let body = String(data: data.prefix(600), encoding: .utf8) ?? ""
             throw NetworkRequestError.badStatus(http.statusCode, body)
         }
@@ -10788,6 +10802,7 @@ final class AppState: ObservableObject {
         var request = URLRequest(url: serverBaseURL.appending(path: path))
         request.httpMethod = "POST"
         request.timeoutInterval = timeout
+        if let auth = AuthSession.shared.authHeader { request.setValue(auth, forHTTPHeaderField: "Authorization") }
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -10795,6 +10810,7 @@ final class AppState: ObservableObject {
             throw NetworkRequestError.missingHTTPResponse
         }
         guard (200..<300).contains(http.statusCode) else {
+            if http.statusCode == 401 { AuthSession.shared.handleUnauthorized() }
             let body = String(data: data.prefix(600), encoding: .utf8) ?? ""
             throw NetworkRequestError.badStatus(http.statusCode, body)
         }
@@ -10809,11 +10825,13 @@ final class AppState: ObservableObject {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 12
+        if let auth = AuthSession.shared.authHeader { request.setValue(auth, forHTTPHeaderField: "Authorization") }
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw NetworkRequestError.missingHTTPResponse
         }
         guard (200..<300).contains(http.statusCode) else {
+            if http.statusCode == 401 { AuthSession.shared.handleUnauthorized() }
             let body = String(data: data.prefix(600), encoding: .utf8) ?? ""
             throw NetworkRequestError.badStatus(http.statusCode, body)
         }
