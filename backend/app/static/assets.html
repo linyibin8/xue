@@ -165,6 +165,20 @@
     </section>
   </main>
   <script>
+    (function () {
+      const authTokenStorageKey = "xue.authToken";
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = (input, init = {}) => {
+        const url = typeof input === "string" ? input : (input && input.url) || "";
+        const target = new URL(url, location.href);
+        const headers = new Headers(init.headers || (typeof input !== "string" ? input.headers : undefined) || {});
+        const token = localStorage.getItem(authTokenStorageKey) || "";
+        if (token && target.origin === location.origin && !headers.has("Authorization")) {
+          headers.set("Authorization", `Bearer ${token}`);
+        }
+        return originalFetch(input, { ...init, headers, credentials: init.credentials || "same-origin" });
+      };
+    })();
     let page = 1;
     let latest = null;
     let loading = false;
