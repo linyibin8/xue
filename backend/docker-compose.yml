@@ -20,7 +20,7 @@ services:
       # Per-account architecture: control.sqlite3 + data/accounts/<id>.sqlite3.
       # No Redis/MySQL — per-account files keep reads fast; the LLM concurrency
       # gate is in-process (single worker). Add Redis only when scaling to >1 worker.
-      XUE_AUTH_REQUIRED: "false"
+      XUE_AUTH_REQUIRED: "true"
       XUE_REGISTRATION_ENABLED: "true"
       XUE_DEFAULT_ACCOUNT_ID: local
       # Disable host-injected proxy (127.0.0.1:7897) so httpx reaches the LLM
