@@ -8222,6 +8222,7 @@ def get_teaching_visualization_file(filename: str) -> FileResponse:
 @app.post("/api/visualizations")
 async def create_teaching_visualization(request: Request) -> dict:
     init_db()
+    principal_from_request(request)  # binds the per-account DB context for this request
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(422, "invalid JSON body")
@@ -8575,6 +8576,7 @@ async def create_control_command(request: Request) -> dict:
 @app.post("/api/control-commands/{command_id}/ack")
 async def acknowledge_control_command(command_id: str, request: Request) -> dict:
     init_db()
+    principal_from_request(request)  # binds the per-account DB context for this request
     body = await request.json()
     require_control_token(request, body)
     status = clean_user_text(body.get("status"), 40) or "applied"
