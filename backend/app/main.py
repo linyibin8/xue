@@ -7509,6 +7509,72 @@ async def post_profile(request: Request) -> dict:
     return {"profile": profile, "profiles": account_profiles(principal["account_id"])}
 
 
+@app.patch("/api/profiles/{profile_id}")
+async def update_profile(profile_id: str, request: Request) -> dict:
+    principal = principal_from_request(request, required=True)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(422, "invalid JSON body")
+    fields: list[str] = []
+    params: list[object] = []
+    if any(k in body for k in ("display_name", "displayName", "name")):
+        fields.append("display_name=?")
+        params.append(clean_auth_text(body.get("display_name") or body.get("displayName") or body.get("name"), 120))
+    if "relation" in body:
+        fields.append("relation=?")
+        params.append(clean_auth_text(body.get("relation"), 80))
+    if "student_id" in body or "studentId" in body:
+        fields.append("student_id=?")
+        params.append(clean_auth_text(body.get("student_id") or body.get("studentId"), 80))
+    if isinstance(body.get("metadata"), dict):
+        fields.append("metadata=?")
+        params.append(json_dumps(body["metadata"]))
+    if "status" in body:
+        status_value = clean_auth_text(body.get("status"), 20)
+        if status_value in ("active", "inactive"):
+            fields.append("status=?")
+            params.append(status_value)
+    if not fields:
+        raise HTTPException(422, "no updatable fields provided")
+    fields.append("updated_at=?")
+    params.append(utc_now())
+    params.extend([profile_id, principal["account_id"]])
+    with connect_control() as conn:
+        cursor = conn.execute(
+            f"UPDATE identity_profiles SET {', '.join(fields)} WHERE id=? AND account_id=?",
+            params,
+        )
+        if cursor.rowcount != 1:
+            raise HTTPException(404, "profile not found")
+        row = conn.execute("SELECT * FROM identity_profiles WHERE id=?", (profile_id,)).fetchone()
+    return {"profile": dict(row), "profiles": account_profiles(principal["account_id"])}
+
+
+@app.delete("/api/profiles/{profile_id}")
+def delete_profile(profile_id: str, request: Request) -> dict:
+    principal = principal_from_request(request, required=True)
+    now = utc_now()
+    with connect_control() as conn:
+        profile = conn.execute(
+            "SELECT * FROM identity_profiles WHERE id=? AND account_id=? AND status='active'",
+            (profile_id, principal["account_id"]),
+        ).fetchone()
+        if not profile:
+            raise HTTPException(404, "profile not found")
+        if profile["profile_type"] == "student":
+            remaining = conn.execute(
+                "SELECT COUNT(*) AS c FROM identity_profiles WHERE account_id=? AND profile_type='student' AND status='active' AND id!=?",
+                (principal["account_id"], profile_id),
+            ).fetchone()["c"]
+            if remaining == 0:
+                raise HTTPException(422, "cannot remove the last student profile")
+        conn.execute(
+            "UPDATE identity_profiles SET status='inactive', updated_at=? WHERE id=? AND account_id=?",
+            (now, profile_id, principal["account_id"]),
+        )
+    return {"ok": True, "profiles": account_profiles(principal["account_id"])}
+
+
 @app.get("/api/model-platforms")
 def model_platforms() -> dict:
     return {
