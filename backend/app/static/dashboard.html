@@ -151,19 +151,30 @@
     .qa-frame-preview { display: block; border: 1px solid #d0d5dd; border-radius: 8px; overflow: hidden; background: #f8fafc; text-decoration: none; color: #475467; }
     .qa-frame-preview img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: contain; background: #eef2f6; }
     .qa-frame-preview span { display: block; padding: 6px 8px; font-size: 12px; }
-    .qa-rich-answer { display: grid; gap: 8px; }
-    .qa-card-section { border: 1px solid #e4e7ec; border-left-width: 4px; border-radius: 8px; background: #ffffff; padding: 10px 12px; line-height: 1.55; }
-    .qa-card-section h4 { margin: 0 0 6px; font-size: 13px; color: #344054; }
-    .qa-card-section p { margin: 0; }
-    .qa-card-section ol { margin: 0; padding-left: 20px; display: grid; gap: 4px; }
+    .qa-rich-answer { display: grid; gap: 7px; }
+    .qa-card-section { border: 1px solid #edf0f4; border-left: 3px solid #cbd5e1; border-radius: 10px; background: #ffffff; padding: 9px 12px 10px; line-height: 1.6; }
+    .qa-card-section h4 { display: flex; align-items: center; gap: 6px; margin: 0 0 5px; font-size: 12px; font-weight: 700; letter-spacing: .02em; color: #475467; }
+    .qa-card-section .qa-ico { font-size: 13px; line-height: 1; }
+    .qa-card-section p { margin: 0; font-size: 14px; color: #1d2939; }
+    .qa-card-section ol { margin: 0; padding-left: 18px; display: grid; gap: 4px; font-size: 14px; color: #1d2939; }
     .qa-card-section li { padding-left: 2px; }
-    .qa-topic { border-left-color: #175cd3; background: #f8fbff; }
-    .qa-facts, .qa-idea { border-left-color: #0e9384; background: #f6fefc; }
-    .qa-student { border-left-color: #7a5af8; background: #f7f5ff; }
-    .qa-check, .qa-warning { border-left-color: #d92d20; background: #fff7f6; }
+    .qa-card-section li::marker { color: #98a2b3; font-size: 12px; }
+    .qa-topic   { border-left-color: #2563eb; background: #f8fbff; }
+    .qa-topic h4 { color: #1d4ed8; }
+    .qa-facts, .qa-idea { border-left-color: #0e9384; background: #f4fefb; }
+    .qa-facts h4, .qa-idea h4 { color: #0e7c70; }
+    .qa-student { border-left-color: #7a5af8; background: #f8f6ff; }
+    .qa-student h4 { color: #6938ef; }
+    .qa-check { border-left-color: #16a34a; background: #f5fdf8; }
+    .qa-check h4 { color: #157f3c; }
+    .qa-warning { border-left-color: #f04438; background: #fffbfa; }
+    .qa-warning h4 { color: #d92d20; }
     .qa-steps { border-left-color: #f79009; background: #fffcf5; }
-    .qa-fix, .qa-result { border-left-color: #12b76a; background: #f6fef9; }
+    .qa-steps h4 { color: #b54708; }
+    .qa-fix, .qa-result { border-left-color: #12b76a; background: #f5fdf8; }
+    .qa-fix h4, .qa-result h4 { color: #027a48; }
     .qa-follow { border-left-color: #2e90fa; background: #f5faff; }
+    .qa-follow h4 { color: #175cd3; }
     .qa-math { display: inline-block; padding: 1px 5px; border-radius: 5px; background: rgba(23, 92, 211, .08); color: #175cd3; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
     .qa-plain-text { white-space: pre-wrap; line-height: 1.55; }
     .thumb.duplicate { opacity: .62; }
@@ -196,7 +207,8 @@
     .chat-message.assistant { justify-self: start; }
     .message-meta { display: flex; align-items: center; gap: 8px; color: #667085; font-size: 12px; }
     .chat-message.user .message-meta { justify-content: flex-end; }
-    .chat-bubble { border: 1px solid #dce3ec; border-radius: 8px; padding: 12px 13px; background: #ffffff; line-height: 1.58; overflow-wrap: anywhere; box-shadow: 0 1px 2px rgba(16,24,40,.04); }
+    .chat-bubble { border: 1px solid #dce3ec; border-radius: 8px; padding: 12px 13px; background: #ffffff; line-height: 1.58; white-space: pre-wrap; overflow-wrap: anywhere; box-shadow: 0 1px 2px rgba(16,24,40,.04); }
+    .chat-bubble .qa-rich-answer { white-space: normal; }
     .chat-message.user .chat-bubble { border-color: #175cd3; background: #175cd3; color: #ffffff; }
     .message-actions { display: flex; flex-wrap: wrap; gap: 7px; }
     .message-actions button, .composer-tools button, .context-tabs button { min-height: 32px; border: 1px solid #c7d0dc; border-radius: 7px; background: #ffffff; color: #1d2939; padding: 0 10px; cursor: pointer; font-size: 12px; }
@@ -1372,6 +1384,7 @@
             title: event.status === "failed" ? "回答失败" : "AI 回答",
             time: event.created_at,
             body: truncateText(plainQAAnswer(event), 1400),
+            bodyHtml: event.status === "failed" ? "" : safeQAHtml(event),
             image: event.selected_image_filename || event.image_filename || "",
             captures: [
               event.selected_image_filename ? {
@@ -1427,7 +1440,7 @@
         return `
           <article class="chat-message ${message.role}">
             <div class="message-meta"><span>${escapeHtml(message.title || "")}${time}</span></div>
-            <div class="chat-bubble">${escapeHtml(message.body || "")}</div>
+            <div class="chat-bubble">${message.bodyHtml ? message.bodyHtml : escapeHtml(message.body || "")}</div>
             ${renderMessageCaptures(message.captures || [])}
             ${visualizationAction}
             ${image}

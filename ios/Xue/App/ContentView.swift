@@ -243,7 +243,13 @@ struct ContentView: View {
                 BackgroundCameraHost(state: state)
             }
         }
-        .overlay(alignment: .topTrailing) { AccountBadge().padding(.top, 6).padding(.trailing, 10) }
+        .overlay(alignment: .topTrailing) {
+            VStack(alignment: .trailing, spacing: 6) {
+                AccountBadge()
+                GenerationBanner()
+            }
+            .padding(.top, 6).padding(.trailing, 10)
+        }
         .background(Color(.secondarySystemBackground).ignoresSafeArea())
         .task {
             state.log("App 启动，后端地址 \(serverBaseURL.absoluteString)")
@@ -4794,10 +4800,14 @@ struct QARichAnswerView: View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(sections) { section in
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(section.title)
-                        .font(.caption)
-                        .fontWeight(.semibold)
-                        .foregroundStyle(section.tint)
+                    HStack(spacing: 5) {
+                        Text(section.icon)
+                            .font(.caption)
+                        Text(section.title)
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(section.tint)
+                    }
                     if section.lines.count == 1 {
                         Text(section.lines[0])
                             .font(.callout)
@@ -4838,6 +4848,7 @@ struct QARichAnswerSection: Identifiable {
     let title: String
     let lines: [String]
     let tint: Color
+    let icon: String
 
     static func parse(_ answer: String) -> [QARichAnswerSection] {
         var sections: [(String, [String])] = []
@@ -4872,7 +4883,7 @@ struct QARichAnswerSection: Identifiable {
             sections = [("回答", [answer.trimmingCharacters(in: .whitespacesAndNewlines)])]
         }
         return sections.map { title, lines in
-            QARichAnswerSection(title: title, lines: lines, tint: tint(for: title))
+            QARichAnswerSection(title: title, lines: lines, tint: tint(for: title), icon: icon(for: title))
         }
     }
 
@@ -4930,6 +4941,23 @@ struct QARichAnswerSection: Identifiable {
             return "追问建议"
         default:
             return clean.isEmpty ? "回答" : clean
+        }
+    }
+
+    private static func icon(for title: String) -> String {
+        switch title {
+        case "题目": return "📖"
+        case "关键条件": return "🔑"
+        case "先想一想", "解题思路": return "💡"
+        case "学生答案": return "✏️"
+        case "检查结果": return "✅"
+        case "解题步骤": return "🪜"
+        case "错因提醒": return "⚠️"
+        case "订正建议": return "🛠️"
+        case "结论": return "🎯"
+        case "下一步小任务": return "🚀"
+        case "追问建议": return "💬"
+        default: return "📌"
         }
     }
 

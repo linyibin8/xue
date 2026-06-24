@@ -100,9 +100,32 @@ final class AuthSession: ObservableObject {
     @Published private(set) var isAuthenticated = false
     @Published private(set) var bootstrapping = true
 
+    // Free-tier quota (today, on our default model)
+    @Published private(set) var quotaEnabled = false
+    @Published private(set) var quotaUsed = 0
+    @Published private(set) var quotaLimit = 0
+    @Published private(set) var quotaRemaining = -1
+    // Background generation status (visualization/report) from the LLM gate
+    @Published private(set) var bgActive = false
+    @Published private(set) var bgAhead = 0
+    @Published private(set) var bgEtaSeconds = 0
+    @Published private(set) var bgRealtimeBusy = false
+
     private let activeStudentKey = "xue.activeStudentId"
+    private var opsPolling = false
 
     private init() {}
+
+    var quotaText: String? {
+        guard quotaEnabled, quotaRemaining >= 0 else { return nil }
+        return "今日剩余 \(quotaRemaining) 次"
+    }
+    var generationStatusText: String? {
+        guard bgActive else { return nil }
+        if bgRealtimeBusy { return "生成已让行：语音/问答优先，空闲后自动继续" }
+        let eta = bgEtaSeconds >= 90 ? "约 \(bgEtaSeconds / 60) 分钟" : "约 \(max(1, bgEtaSeconds)) 秒"
+        return "后台生成中：前方 \(bgAhead) 个任务，预计还需\(eta)"
+    }
 
     var authHeader: String? { token.map { "Bearer \($0)" } }
     var studentProfiles: [IdentityProfile] { profiles.filter { $0.type == "student" } }
@@ -116,6 +139,7 @@ final class AuthSession: ObservableObject {
             token = saved
             isAuthenticated = true
             await refreshMe()
+            if isAuthenticated { startOpsPolling() }
         }
         bootstrapping = false
     }
@@ -200,6 +224,79 @@ final class AuthSession: ObservableObject {
         AuthKeychain.save(newToken)
         apply(json)
         isAuthenticated = true
+        startOpsPolling()
+    }
+
+    @discardableResult
+    private func api(_ method: String, _ path: String, json: [String: Any]? = nil) async throws -> Any? {
+        guard let token else { throw AuthError.network }
+        var req = URLRequest(url: authServerBaseURL.appending(path: path))
+        req.httpMethod = method
+        req.timeoutInterval = 20
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let json {
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try JSONSerialization.data(withJSONObject: json)
+        }
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard let http = response as? HTTPURLResponse else { throw AuthError.network }
+        if http.statusCode == 401 { await signOut(); throw AuthError.server(401, "登录已过期，请重新登录") }
+        guard (200..<300).contains(http.statusCode) else {
+            let detail = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["detail"] as? String
+            throw AuthError.server(http.statusCode, detail ?? "请求失败（\(http.statusCode)）")
+        }
+        return try? JSONSerialization.jsonObject(with: data)
+    }
+
+    private func applyProfilesResponse(_ r: Any?) {
+        guard let j = r as? [String: Any], let raw = j["profiles"] as? [[String: Any]] else { return }
+        profiles = raw.compactMap { IdentityProfile($0) }
+        let students = profiles.filter { $0.type == "student" }
+        if activeStudentId.isEmpty || !students.contains(where: { $0.id == activeStudentId }) {
+            setActiveStudent(students.first?.id ?? "")
+        }
+    }
+
+    func addProfile(type: String, name: String) async throws {
+        applyProfilesResponse(try await api("POST", "/api/profiles", json: ["profile_type": type, "display_name": name]))
+    }
+    func renameProfile(id: String, name: String) async throws {
+        applyProfilesResponse(try await api("PATCH", "/api/profiles/\(id)", json: ["display_name": name]))
+    }
+    func deleteProfile(id: String) async throws {
+        applyProfilesResponse(try await api("DELETE", "/api/profiles/\(id)"))
+    }
+
+    func refreshOps() async {
+        guard isAuthenticated, let j = (try? await api("GET", "/api/observability")) as? [String: Any] else { return }
+        if let q = j["quota"] as? [String: Any] {
+            quotaEnabled = (q["enabled"] as? Bool) ?? false
+            quotaUsed = (q["used"] as? Int) ?? 0
+            quotaLimit = (q["limit"] as? Int) ?? 0
+            quotaRemaining = (q["remaining"] as? Int) ?? -1
+        }
+        let usage = j["llm_usage"] as? [String: Any]
+        if let g = j["llm_gate"] as? [String: Any] {
+            let ahead = ((g["waiting_background"] as? Int) ?? 0) + ((g["inflight_background"] as? Int) ?? 0)
+            let realtimeBusy = (((g["inflight_realtime"] as? Int) ?? 0) + ((g["waiting_realtime"] as? Int) ?? 0)) > 0
+            let avgSec = max(20, Int(((usage?["avg_duration_ms"] as? Double) ?? 0) / 1000.0))
+            bgAhead = ahead
+            bgRealtimeBusy = realtimeBusy
+            bgActive = ahead > 0
+            bgEtaSeconds = (ahead + 1) * avgSec
+        }
+    }
+
+    func startOpsPolling() {
+        guard !opsPolling else { return }
+        opsPolling = true
+        Task { @MainActor [weak self] in
+            while let self, self.isAuthenticated {
+                await self.refreshOps()
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
+            }
+            self?.opsPolling = false
+        }
     }
 
     func signOut() async {
@@ -208,6 +305,8 @@ final class AuthSession: ObservableObject {
         profiles = []
         email = ""
         accountName = ""
+        quotaEnabled = false
+        bgActive = false
         AuthKeychain.clear()
     }
 
@@ -330,23 +429,28 @@ struct AuthGateView: View {
 
 struct AccountBadge: View {
     @ObservedObject private var auth = AuthSession.shared
+    @State private var showIdentities = false
 
     var body: some View {
         Menu {
             if !auth.email.isEmpty {
                 Section(auth.accountName.isEmpty ? auth.email : "\(auth.accountName) · \(auth.email)") {
                     let students = auth.studentProfiles
-                    if students.count > 1 {
-                        ForEach(students) { profile in
-                            Button {
-                                auth.setActiveStudent(profile.id)
-                            } label: {
-                                Label(profile.name.isEmpty ? "学生" : profile.name,
-                                      systemImage: profile.id == auth.activeStudentId ? "checkmark.circle.fill" : "person.circle")
-                            }
+                    ForEach(students) { profile in
+                        Button {
+                            auth.setActiveStudent(profile.id)
+                        } label: {
+                            Label(profile.name.isEmpty ? "学生" : profile.name,
+                                  systemImage: profile.id == auth.activeStudentId ? "checkmark.circle.fill" : "person.circle")
                         }
                     }
                 }
+            }
+            if let q = auth.quotaText {
+                Section { Label(q, systemImage: "bolt.horizontal.circle") }
+            }
+            Button { showIdentities = true } label: {
+                Label("管理学生 / 家长 / 老师", systemImage: "person.2.badge.gearshape")
             }
             Button(role: .destructive) {
                 Task { await auth.signOut() }
@@ -358,11 +462,144 @@ struct AccountBadge: View {
                 Image(systemName: "person.crop.circle")
                 let title = auth.activeStudentName.isEmpty ? (auth.email.isEmpty ? "账号" : auth.email) : auth.activeStudentName
                 Text(title).lineLimit(1)
+                if let q = auth.quotaText {
+                    Text(q).foregroundStyle(auth.quotaRemaining <= 10 ? .orange : .secondary)
+                }
             }
             .font(.caption.weight(.medium))
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
             .background(.ultraThinMaterial, in: Capsule())
+        }
+        .sheet(isPresented: $showIdentities) { IdentityManagerView() }
+    }
+}
+
+// MARK: - Identity management (students / parents / teachers)
+
+struct IdentityManagerView: View {
+    @ObservedObject private var auth = AuthSession.shared
+    @Environment(\.dismiss) private var dismiss
+    @State private var newType = "student"
+    @State private var newName = ""
+    @State private var busy = false
+    @State private var errorText = ""
+
+    private let types: [(String, String)] = [("student", "学生"), ("parent", "家长"), ("teacher", "老师")]
+
+    var body: some View {
+        NavigationView {
+            Form {
+                if !errorText.isEmpty {
+                    Section { Text(errorText).foregroundStyle(.red).font(.footnote) }
+                }
+                ForEach(types, id: \.0) { (type, label) in
+                    let items = auth.profiles.filter { $0.type == type }
+                    Section("\(label)（\(items.count)）") {
+                        ForEach(items) { p in
+                            HStack {
+                                if type == "student" {
+                                    Button {
+                                        auth.setActiveStudent(p.id)
+                                    } label: {
+                                        Image(systemName: p.id == auth.activeStudentId ? "checkmark.circle.fill" : "circle")
+                                    }.buttonStyle(.plain)
+                                }
+                                Text(p.name.isEmpty ? label : p.name)
+                                Spacer()
+                                Menu {
+                                    Button("重命名") { rename(p) }
+                                    Button("删除", role: .destructive) { remove(p) }
+                                } label: { Image(systemName: "ellipsis.circle") }
+                            }
+                        }
+                    }
+                }
+                Section("新增身份") {
+                    Picker("类型", selection: $newType) {
+                        ForEach(types, id: \.0) { Text($0.1).tag($0.0) }
+                    }.pickerStyle(.segmented)
+                    TextField("姓名", text: $newName)
+                    Button {
+                        add()
+                    } label: {
+                        HStack { if busy { ProgressView() }; Text("添加") }
+                    }.disabled(busy || newName.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+            .navigationTitle("身份管理")
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
+            .task { await auth.refreshOps() }
+        }
+    }
+
+    private func run(_ op: @escaping () async throws -> Void) {
+        busy = true; errorText = ""
+        Task { do { try await op() } catch { errorText = error.localizedDescription }; busy = false }
+    }
+    private func add() {
+        let name = newName.trimmingCharacters(in: .whitespaces)
+        run { try await auth.addProfile(type: newType, name: name); await MainActor.run { newName = "" } }
+    }
+    private func remove(_ p: IdentityProfile) { run { try await auth.deleteProfile(id: p.id) } }
+    private func rename(_ p: IdentityProfile) {
+        // simple inline rename via prompt-less flow: reuse newName field value if set, else append marker
+        let name = newName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { errorText = "请在下方「姓名」框输入新名字后再点重命名"; return }
+        run { try await auth.renameProfile(id: p.id, name: name); await MainActor.run { newName = "" } }
+    }
+}
+
+// MARK: - First-run onboarding
+
+struct OnboardingView: View {
+    var onDone: () -> Void
+    private let steps: [(String, String, String)] = [
+        ("camera.viewfinder", "拍题解析", "对准课本/试卷拍一张，AI 帮你识别题目并分步讲解。"),
+        ("mic.circle", "语音问答", "按住说话直接问，支持连续追问，语音优先实时响应。"),
+        ("rectangle.stack.badge.person.crop", "智能观察 & 错题本", "固定机位自动观察学习过程，错题与知识点自动沉淀，按艾宾浩斯复习。"),
+    ]
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [Color(red: 0.05, green: 0.12, blue: 0.18), Color(red: 0.02, green: 0.07, blue: 0.12)],
+                           startPoint: .topLeading, endPoint: .bottomTrailing).ignoresSafeArea()
+            VStack(spacing: 22) {
+                Text("欢迎使用 知进伴学").font(.title.bold()).foregroundStyle(.white).padding(.top, 36)
+                ForEach(steps, id: \.0) { (icon, title, desc) in
+                    HStack(alignment: .top, spacing: 14) {
+                        Image(systemName: icon).font(.title2).foregroundStyle(.cyan).frame(width: 34)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(title).font(.headline).foregroundStyle(.white)
+                            Text(desc).font(.subheadline).foregroundStyle(.white.opacity(0.78))
+                        }
+                        Spacer()
+                    }.padding(.horizontal, 26)
+                }
+                Spacer()
+                Button(action: onDone) {
+                    Text("开始使用").fontWeight(.semibold).frame(maxWidth: .infinity).padding(.vertical, 14)
+                }
+                .buttonStyle(.borderedProminent)
+                .padding(.horizontal, 26).padding(.bottom, 30)
+            }
+        }
+    }
+}
+
+// MARK: - Background generation banner (queue / ETA, voice-priority)
+
+struct GenerationBanner: View {
+    @ObservedObject private var auth = AuthSession.shared
+    var body: some View {
+        if let text = auth.generationStatusText {
+            HStack(spacing: 6) {
+                Image(systemName: "hourglass")
+                Text(text).lineLimit(2)
+            }
+            .font(.caption2)
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(.ultraThinMaterial, in: Capsule())
+            .transition(.opacity)
         }
     }
 }

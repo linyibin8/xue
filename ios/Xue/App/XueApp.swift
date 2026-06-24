@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct XueApp: App {
     @StateObject private var auth = AuthSession.shared
+    @AppStorage("xue.onboarded") private var onboarded = false
 
     var body: some Scene {
         WindowGroup {
@@ -14,6 +15,9 @@ struct XueApp: App {
                     }
                 } else if auth.isAuthenticated {
                     ContentView()
+                        .fullScreenCover(isPresented: Binding(get: { !onboarded }, set: { if !$0 { onboarded = true } })) {
+                            OnboardingView { onboarded = true }
+                        }
                 } else {
                     AuthGateView()
                 }

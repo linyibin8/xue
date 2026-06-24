@@ -5143,6 +5143,21 @@ QA_SECTION_ORDER = [
     "下一步小任务",
     "追问建议",
 ]
+# 给每个栏目配一个学生看得懂的图标，便于扫读。
+QA_SECTION_ICON = {
+    "题目": "📖",
+    "关键条件": "🔑",
+    "先想一想": "💭",
+    "学生答案": "✏️",
+    "检查结果": "✅",
+    "解题思路": "💡",
+    "解题步骤": "🪜",
+    "错因提醒": "⚠️",
+    "订正建议": "🛠️",
+    "结论": "🎯",
+    "下一步小任务": "🚀",
+    "追问建议": "💬",
+}
 QA_SECTION_PATTERN = re.compile(r"^\s*(?:#{1,4}\s*)?(?:[-*]\s*)?([A-Za-z\u4e00-\u9fff]{2,12})[：:]\s*(.*)$")
 QA_NUMBERED_PATTERN = re.compile(r"^\s*(?:\d+[\.、)]|[（(]\d+[）)]|[-*])\s*(.+)$")
 
@@ -5204,8 +5219,10 @@ def qa_answer_html(answer: str) -> str:
         if not lines:
             continue
         class_name = QA_SECTION_CLASS.get(title, "plain")
+        icon = QA_SECTION_ICON.get(title, "")
+        icon_html = f'<span class="qa-ico" aria-hidden="true">{icon}</span>' if icon else ""
         parts.append(f'<section class="qa-card-section qa-{class_name}">')
-        parts.append(f"<h4>{html.escape(title)}</h4>")
+        parts.append(f"<h4>{icon_html}{html.escape(title)}</h4>")
         if len(lines) == 1:
             parts.append(f"<p>{inline_qa_markup(lines[0])}</p>")
         else:
@@ -5233,6 +5250,31 @@ def qa_answer_html(answer: str) -> str:
     return truncate_text("".join(parts), QA_HTML_CHAR_LIMIT)
 
 
+# 大模型常把所有“题目/关键条件/学生答案/检查结果/...”标签和分题挤在一行返回，
+# 前端按行解析时就变成一整段没有换行的文字。这里在已知标签和分题号前补回换行，
+# 让网页和 iOS 都能按段落/卡片渲染。已经换行的内容不会被重复拆分。
+QA_REFLOW_LABELS = sorted(set(QA_SECTION_ALIASES), key=len, reverse=True)
+QA_REFLOW_LABEL_PATTERN = re.compile(
+    r"(?<!\n)(?<![一-鿿])[^\S\n]*"
+    r"((?:" + "|".join(re.escape(label) for label in QA_REFLOW_LABELS) + r")[：:])"
+)
+QA_REFLOW_PROBLEM_PATTERN = re.compile(r"(?<!\n)[^\S\n]*(题\s*\d+\s*[：:])")
+QA_REFLOW_OPTION_PATTERN = re.compile(
+    r"(?<!\n)[^\S\n]*(\d+\s*[\.、)]\s*(?:举一反三|总结知识点|按用户偏好))"
+)
+
+
+def reflow_qa_answer(answer: str) -> str:
+    text = (answer or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return text
+    text = QA_REFLOW_PROBLEM_PATTERN.sub(r"\n\1", text)
+    text = QA_REFLOW_OPTION_PATTERN.sub(r"\n\1", text)
+    text = QA_REFLOW_LABEL_PATTERN.sub(r"\n\1", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def qa_event_row_to_dict(row: dict) -> dict:
     item = dict(row)
     for key in ("focus", "context", "gesture"):
@@ -5253,6 +5295,7 @@ def qa_event_row_to_dict(row: dict) -> dict:
     item["current_image_rejected"] = bool(context.get("current_image_rejected")) if context else False
     item["rejected_image_id"] = str(context.get("rejected_image_id") or "")
     item["rejected_image_filename"] = str(context.get("rejected_image_filename") or "")
+    item["answer"] = reflow_qa_answer(item.get("answer") or "")
     item["answer_html"] = qa_answer_html(item.get("answer") or "")
     return item
 
@@ -5809,7 +5852,8 @@ Use the current camera frame when provided, the session context, and the student
 Be concise, but include enough reasoning steps for a student to continue solving.
 If the student asks to check mistakes, compare the visible work, point out likely wrong parts, and give the next correction step.
 If the referenced problem is ambiguous, say what you can infer and ask for a short clarification.
-Format the answer as short labeled lines so the UI can render it as a study card. Use these labels when relevant:
+Format the answer as short labeled lines so the UI can render it as a study card.
+Put every labeled section on its own line, separated by an actual newline. Never run several labels together in one paragraph, and start each new 题号 (e.g. 题1、题2) on its own line too. Use these labels when relevant:
 题目：...
 关键条件：...
 先想一想：...
