@@ -19,7 +19,7 @@ services:
       XUE_LLM_QUEUE_WARN_SIZE: 3
       XUE_DATABASE_URL: sqlite:///data/xue.sqlite3
       XUE_REDIS_URL: redis://redis:6379/0
-      XUE_AUTH_REQUIRED: "true"
+      XUE_AUTH_REQUIRED: "false"
       XUE_REGISTRATION_ENABLED: "true"
       XUE_DEFAULT_ACCOUNT_ID: local
       # Disable host-injected proxy (127.0.0.1:7897) so httpx reaches the LLM
