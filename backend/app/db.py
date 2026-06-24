@@ -1,4 +1,7 @@
+import contextvars
+import re
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,16 +14,75 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ---------------------------------------------------------------------------
+# Per-account database routing
+#
+# Architecture: one shared control DB (auth/identity/model-config/job-queue)
+# plus one SQLite file per account holding that account's learning data. The
+# active account for the current request/task lives in a ContextVar so the
+# ~580 existing connect() call sites stay unchanged; only control-plane code
+# uses connect_control(). The full schema is created in every DB file, so the
+# unused tables in each file are simply empty.
+# ---------------------------------------------------------------------------
+
+CONTROL_DB_NAME = "control.sqlite3"
+_current_account: contextvars.ContextVar[str] = contextvars.ContextVar("xue_current_account", default="")
+_ready_accounts: set[str] = set()
+_ready_lock = threading.Lock()
+_control_ready = False
+
+
+def set_current_account(account_id: str | None):
+    return _current_account.set(account_id or "")
+
+
+def reset_current_account(token) -> None:
+    try:
+        _current_account.reset(token)
+    except Exception:
+        pass
+
+
+def _safe_account(account_id: str | None) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]", "_", account_id or "")[:120]
+    return cleaned or (get_settings().default_account_id or "local")
+
+
+def current_account_id() -> str:
+    return _safe_account(_current_account.get() or "")
+
+
+def control_db_path() -> Path:
+    return get_settings().data_dir / CONTROL_DB_NAME
+
+
+def account_db_path(account_id: str | None = None) -> Path:
+    aid = _safe_account(account_id or _current_account.get() or "")
+    directory = get_settings().data_dir / "accounts"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{aid}.sqlite3"
+
+
 def db_path() -> Path:
-    return get_settings().data_dir / "xue.sqlite3"
+    """Back-compat: path of the current account's database file."""
+    return account_db_path()
 
 
-@contextmanager
-def connect() -> Iterator[sqlite3.Connection]:
-    conn = sqlite3.connect(db_path())
+def _open(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+@contextmanager
+def connect_control() -> Iterator[sqlite3.Connection]:
+    """Connection to the shared control DB (accounts/users/identity/model_configs/task_runs)."""
+    global _control_ready
+    if not _control_ready:
+        init_control_db()
+    conn = _open(control_db_path())
     try:
         yield conn
         conn.commit()
@@ -28,8 +90,67 @@ def connect() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+@contextmanager
+def connect(account_id: str | None = None) -> Iterator[sqlite3.Connection]:
+    """Connection to a single account's data DB (defaults to the active account)."""
+    aid = _safe_account(account_id or _current_account.get() or "")
+    if aid not in _ready_accounts:
+        ensure_account_db(aid)
+    conn = _open(account_db_path(aid))
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_control_db() -> None:
+    global _control_ready
+    with _ready_lock:
+        conn = _open(control_db_path())
+        try:
+            _init_schema(conn)
+            conn.commit()
+        finally:
+            conn.close()
+        _control_ready = True
+
+
+def ensure_account_db(account_id: str) -> None:
+    aid = _safe_account(account_id)
+    if aid in _ready_accounts:
+        return
+    with _ready_lock:
+        if aid in _ready_accounts:
+            return
+        conn = _open(account_db_path(aid))
+        try:
+            _init_schema(conn)
+            conn.commit()
+        finally:
+            conn.close()
+        _ready_accounts.add(aid)
+
+
+def list_account_ids() -> list[str]:
+    """All account ids that have a data DB file (for cross-account background work)."""
+    directory = get_settings().data_dir / "accounts"
+    ids: list[str] = []
+    if directory.is_dir():
+        for path in sorted(directory.glob("*.sqlite3")):
+            ids.append(path.stem)
+    default_id = _safe_account(get_settings().default_account_id or "local")
+    if default_id not in ids:
+        ids.append(default_id)
+    return ids
+
+
 def init_db() -> None:
-    with connect() as conn:
+    init_control_db()
+    ensure_account_db(get_settings().default_account_id or "local")
+
+
+def _init_schema(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(
             """

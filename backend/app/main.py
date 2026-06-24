@@ -24,7 +24,7 @@ from PIL import Image, ImageOps
 
 from . import llm, prompts
 from .config import get_settings
-from .db import connect, init_db, utc_now
+from .db import connect, connect_control, ensure_account_db, init_db, list_account_ids, set_current_account, utc_now
 
 app = FastAPI(title="知进伴学")
 AUTH_SCHEME = "Bearer"
@@ -476,6 +476,7 @@ def public_user(user: dict) -> dict:
 
 def default_principal() -> dict:
     account_id = get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    set_current_account(account_id)
     return {
         "authenticated": False,
         "account_id": account_id,
@@ -504,7 +505,7 @@ def principal_from_request(request: Request | None, *, required: bool | None = N
     account_id = str(payload.get("account_id") or "")
     if not user_id or not account_id:
         raise HTTPException(401, "invalid token")
-    with connect() as conn:
+    with connect_control() as conn:
         row = conn.execute(
             "SELECT * FROM users WHERE id=? AND account_id=? AND status='active'",
             (user_id, account_id),
@@ -512,6 +513,8 @@ def principal_from_request(request: Request | None, *, required: bool | None = N
     if not row:
         raise HTTPException(401, "user not found or disabled")
     user = dict(row)
+    set_current_account(user["account_id"])
+    ensure_account_db(user["account_id"])
     return {
         "authenticated": True,
         "account_id": user["account_id"],
@@ -543,7 +546,7 @@ def clean_auth_text(value: object, max_chars: int = 160) -> str:
 
 
 def account_profiles(account_id: str) -> list[dict]:
-    with connect() as conn:
+    with connect_control() as conn:
         return [
             dict(row)
             for row in conn.execute(
@@ -573,13 +576,13 @@ def create_identity_profile(account_id: str, body: dict, *, user_id: str = "") -
     now = utc_now()
     profile_id = uuid.uuid4().hex
     if not user_id:
-        with connect() as conn:
+        with connect_control() as conn:
             owner = conn.execute(
                 "SELECT id FROM users WHERE account_id=? AND status='active' ORDER BY created_at ASC LIMIT 1",
                 (account_id,),
             ).fetchone()
         user_id = owner["id"] if owner else ""
-    with connect() as conn:
+    with connect_control() as conn:
         conn.execute(
             """
             INSERT INTO identity_profiles(
@@ -602,11 +605,13 @@ def create_identity_profile(account_id: str, body: dict, *, user_id: str = "") -
             ),
         )
         row = conn.execute("SELECT * FROM identity_profiles WHERE id=?", (profile_id,)).fetchone()
+    set_current_account(account_id)
+    ensure_account_db(account_id)
     return dict(row)
 
 
 def account_default_student_id(account_id: str) -> str:
-    with connect() as conn:
+    with connect_control() as conn:
         row = conn.execute(
             """
             SELECT id
@@ -623,7 +628,7 @@ def account_default_student_id(account_id: str) -> str:
 def resolve_student_profile(account_id: str, requested_id: str = "") -> str:
     requested_id = clean_auth_text(requested_id, 80)
     if requested_id:
-        with connect() as conn:
+        with connect_control() as conn:
             row = conn.execute(
                 "SELECT id FROM identity_profiles WHERE id=? AND account_id=? AND profile_type='student' AND status='active'",
                 (requested_id, account_id),
@@ -638,7 +643,7 @@ def active_model_config(account_id: str = "", user_id: str = "") -> dict:
     settings = get_settings()
     if account_id:
         try:
-            with connect() as conn:
+            with connect_control() as conn:
                 row = conn.execute(
                     """
                     SELECT *
@@ -692,7 +697,7 @@ def effective_llm_settings(account_id: str = "", user_id: str = ""):
     config_id = config.get("id") or ""
     if config_id and config_id != "system-default" and config.get("api_key_configured"):
         try:
-            with connect() as conn:
+            with connect_control() as conn:
                 row = conn.execute(
                     """
                     SELECT api_key_encrypted
@@ -1011,6 +1016,9 @@ def reschedule_task_run(task_id: str, error: str) -> None:
 
 async def execute_task_run(task: dict) -> None:
     task_id = task["id"]
+    if task.get("account_id"):
+        set_current_account(task["account_id"])
+        ensure_account_db(task["account_id"])
     payload = {}
     try:
         loaded = json.loads(task.get("payload") or "{}")
@@ -1081,11 +1089,17 @@ async def execute_task_run(task: dict) -> None:
 
 async def task_dispatcher_loop() -> None:
     while True:
+        dispatched = False
         try:
-            recover_interrupted_tasks()
-            task = claim_next_task_run()
-            if task:
-                asyncio.create_task(execute_task_run(task))
+            for account_id in list_account_ids():
+                set_current_account(account_id)
+                recover_interrupted_tasks()
+                task = claim_next_task_run()
+                if task:
+                    # execute_task_run re-binds the account context itself.
+                    asyncio.create_task(execute_task_run(task))
+                    dispatched = True
+            if dispatched:
                 await asyncio.sleep(0.1)
                 continue
         except Exception:
@@ -7365,7 +7379,7 @@ async def register_user(request: Request) -> dict:
     parent_profile_id = uuid.uuid4().hex
     student_profile_id = uuid.uuid4().hex
     try:
-        with connect() as conn:
+        with connect_control() as conn:
             existing = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
             if existing:
                 raise HTTPException(409, "email already registered")
@@ -7413,6 +7427,8 @@ async def register_user(request: Request) -> dict:
             user = dict(conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone())
     except HTTPException:
         raise
+    set_current_account(account_id)
+    ensure_account_db(account_id)
     token = make_access_token(user)
     return {
         "access_token": token,
@@ -7432,13 +7448,15 @@ async def login_user(request: Request) -> dict:
         raise HTTPException(422, "invalid JSON body")
     email = normalize_email(body.get("email"))
     password = str(body.get("password") or "")
-    with connect() as conn:
+    with connect_control() as conn:
         row = conn.execute("SELECT * FROM users WHERE email=? AND status='active'", (email,)).fetchone()
         if not row or not verify_password(password, row["password_hash"]):
             raise HTTPException(401, "invalid email or password")
         now = utc_now()
         conn.execute("UPDATE users SET last_login_at=?, updated_at=? WHERE id=?", (now, now, row["id"]))
         user = dict(conn.execute("SELECT * FROM users WHERE id=?", (row["id"],)).fetchone())
+    set_current_account(user["account_id"])
+    ensure_account_db(user["account_id"])
     return {
         "access_token": make_access_token(user),
         "token_type": AUTH_SCHEME.lower(),
@@ -7497,7 +7515,7 @@ def model_platforms() -> dict:
 @app.get("/api/model-configs")
 def list_model_configs(request: Request) -> dict:
     principal = principal_from_request(request)
-    with connect() as conn:
+    with connect_control() as conn:
         rows = [
             model_config_public(row)
             for row in conn.execute(
@@ -7530,7 +7548,7 @@ async def upsert_model_config(request: Request) -> dict:
     min_interval_seconds = max(0.0, float(body.get("min_interval_seconds") or body.get("minIntervalSeconds") or 0))
     metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
     now = utc_now()
-    with connect() as conn:
+    with connect_control() as conn:
         existing = conn.execute(
             "SELECT * FROM model_configs WHERE id=? AND account_id=?",
             (config_id, principal["account_id"]),

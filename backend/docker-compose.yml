@@ -17,8 +17,9 @@ services:
       XUE_LLM_MAX_CONCURRENCY: 1
       XUE_LLM_MIN_INTERVAL_SECONDS: 8
       XUE_LLM_QUEUE_WARN_SIZE: 3
-      XUE_DATABASE_URL: sqlite:///data/xue.sqlite3
-      XUE_REDIS_URL: redis://redis:6379/0
+      # Per-account architecture: control.sqlite3 + data/accounts/<id>.sqlite3.
+      # No Redis/MySQL — per-account files keep reads fast; the LLM concurrency
+      # gate is in-process (single worker). Add Redis only when scaling to >1 worker.
       XUE_AUTH_REQUIRED: "false"
       XUE_REGISTRATION_ENABLED: "true"
       XUE_DEFAULT_ACCOUNT_ID: local
@@ -30,13 +31,3 @@ services:
       https_proxy: ""
       NO_PROXY: "*"
       no_proxy: "*"
-    depends_on:
-      - redis
-
-  redis:
-    image: redis:7-alpine
-    container_name: xue-redis
-    restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes:
-      - ./redis-data:/data
