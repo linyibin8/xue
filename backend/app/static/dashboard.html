@@ -1186,7 +1186,7 @@
       button.disabled = true;
       const previousText = button.textContent;
       const statusEl = button.parentElement?.querySelector("[data-visualize-status]");
-      if (statusEl) statusEl.textContent = "正在生成交互 HTML 教学页，通常需要几十秒；完成后会自动打开，之后可在本条回复下再次打开。";
+      if (statusEl) statusEl.textContent = queueHint("可视化") + " 完成后可在本条回复下点「打开可视化」。";
       button.textContent = "生成中...";
       try {
         const res = await fetch("/api/visualizations", {
@@ -2033,6 +2033,21 @@
       return analyses.filter(analysis => analysis.scope === "final").at(-1);
     }
 
+    function queueHint(kindLabel) {
+      const obs = latestObservability || {};
+      const g = obs.llm_gate || {};
+      const u = obs.llm_usage || {};
+      const realtimeBusy = (Number(g.inflight_realtime || 0) + Number(g.waiting_realtime || 0)) > 0;
+      const ahead = Number(g.waiting_background || 0) + Number(g.inflight_background || 0);
+      const avgSec = Math.max(20, Math.round(Number(u.avg_duration_ms || 0) / 1000) || 30);
+      const etaSec = (ahead + 1) * avgSec;
+      const eta = etaSec >= 90 ? `约 ${Math.round(etaSec / 60)} 分钟` : `约 ${etaSec} 秒`;
+      if (realtimeBusy) {
+        return `⏳ 已让行：语音/问答正在优先使用模型，${kindLabel}会在空闲后自动继续。本页每几秒自动刷新。`;
+      }
+      return `⏳ ${kindLabel}生成中：前方 ${ahead} 个后台任务，预计还需${eta}。本页自动刷新，完成后显示。`;
+    }
+
     function renderSummary(data) {
       const finalAnalysis = data.final_analysis || latestFinalAnalysis(data.analyses);
       const generatedSummary = data.session.report_generated_at && data.session.summary;
@@ -2043,7 +2058,8 @@
       let canGenerate = data.images.length > 0;
 
       if (finalAnalysis) {
-        body = finalAnalysis.content || "全回合解析生成中...";
+        const pending = !finalAnalysis.content && ["running", "pending", "queued", "analyzing"].includes(String(finalAnalysis.status || ""));
+        body = finalAnalysis.content || (pending ? queueHint("全回合解析") : "全回合解析生成中...");
         canGenerate = finalAnalysis.status === "failed";
       } else if (generatedSummary) {
         body = data.session.summary;
