@@ -13,11 +13,30 @@ services:
       XUE_LLM_BASE_URL: http://100.64.0.5:39000/v1
       XUE_LLM_API_KEY: ollama
       XUE_LLM_MODEL: evowit-agent27b
+      XUE_LLM_PROVIDER: evowit
+      XUE_LLM_MAX_CONCURRENCY: 1
+      XUE_LLM_MIN_INTERVAL_SECONDS: 8
+      XUE_LLM_QUEUE_WARN_SIZE: 3
+      XUE_DATABASE_URL: sqlite:///data/xue.sqlite3
+      XUE_REDIS_URL: redis://redis:6379/0
+      XUE_AUTH_REQUIRED: "true"
+      XUE_REGISTRATION_ENABLED: "true"
+      XUE_DEFAULT_ACCOUNT_ID: local
       # Disable host-injected proxy (127.0.0.1:7897) so httpx reaches the LLM
-      # over the tailscale network directly (httpx does not honor CIDR no_proxy).
+      # over tailscale directly (httpx does not honor CIDR no_proxy).
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
       http_proxy: ""
       https_proxy: ""
       NO_PROXY: "*"
       no_proxy: "*"
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    container_name: xue-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ./redis-data:/data

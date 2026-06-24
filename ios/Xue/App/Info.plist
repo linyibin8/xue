@@ -20,14 +20,27 @@
 	<false/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>PAIControlToken</key>
+	<string></string>
 	<key>NSCameraUsageDescription</key>
 	<string>知进伴学 需要使用相机拍摄课本和试卷，用于上传到云端进行学习辅助解析。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>知进伴学 需要使用麦克风接收你的语音提问和打断指令。</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>知进伴学 需要使用语音识别把你的学习问题转换成文字并发送给 AI。</string>
+	<key>UIRequiresFullScreen</key>
+	<true/>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
-		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 </dict>
 </plist>
-

@@ -1,0 +1,362 @@
+import sqlite3
+from dataclasses import dataclass
+
+from .db import connect, utc_now
+
+
+@dataclass(frozen=True)
+class PromptDefinition:
+    key: str
+    label: str
+    description: str
+    default: str
+    variables: tuple[str, ...] = ()
+
+
+PROMPT_DEFINITIONS: tuple[PromptDefinition, ...] = (
+    PromptDefinition(
+        key="vision_grounding",
+        label="视觉证据规则",
+        description="拼接到每次图片识别用户提示词前，约束模型只依据可见证据。",
+        default=(
+            "重要约束：你只能依据图片中直接可见、能辨认的内容作答。"
+            "不要根据常见教材、页码相邻关系、学科主题或上下文补全题干、版本、年级、章节、题号或数字。"
+            "看不清、被遮挡、太小、模糊或无法确认的文字，一律写“未识别”；只能猜测时必须写“疑似”，不能写成确定事实。"
+            "如果课本、试卷、电子显示屏或用户期望分析的材料没有完整进入拍摄区域，必须提醒用户把材料完整放进画面或调整相机。"
+            "多张图片要逐张对应图片标签分析，不要把一张图的信息挪到另一张图。"
+            "有限输出 token 优先给所有可见题目、题号、题干关键文字数字、学生手写答案/草稿/订正痕迹和耗时线索；其他只写极简状态。"
+            "转写学生手写答案、算式和单位时使用普通文本，禁止输出 Markdown/LaTeX 数学格式、美元符号 $、反斜杠命令（如 \\times、\\div、\\frac），直接写 10×6÷2=30平方厘米。"
+            "同一事实只写一次，不要复述示例，不要输出泛泛建议。"
+        ),
+    ),
+    PromptDefinition(
+        key="vision_system",
+        label="视觉系统提示词",
+        description="图片识别请求的 system message，决定识别结果的整体口径。",
+        default=(
+            "你是 知进伴学 的学习陪伴分析助手。请用中文输出，"
+            "优先提取所有题目文字、题号、关键数字图表、学生手写答案/草稿/订正痕迹，并结合时间线给出耗时线索。"
+            "科目、学习方式、是否书写、是否翻页等只写简短状态；不要写长篇画面描述或泛泛建议。"
+            "所有结论必须来自图片中可见证据；看不清就明确写未识别，严禁编造。"
+            "若拍摄区域未包含完整的课本、试卷、电子显示屏或用户期望材料，要明确提醒用户把材料完整放入画面或调整相机。"
+            "学生手写答案、算式和单位必须按普通文本转写，不要使用 Markdown 或 LaTeX 数学格式，不要输出 $...$、\\(...\\)、\\times、\\div、\\frac 等源码符号。"
+            "输出要短而密，一条事实不要在多个栏目重复。"
+        ),
+    ),
+    PromptDefinition(
+        key="vision_image_label",
+        label="图片标签提示词",
+        description="多图识别时插在每张图片前，帮助模型对应图片序号。",
+        default="【图片 {index}】filename={filename}。下面紧跟的图片只对应这个标签。",
+        variables=("index", "filename"),
+    ),
+    PromptDefinition(
+        key="text_system",
+        label="文本总结系统提示词",
+        description="最终报告和证据提炼请求的 system message。",
+        default=(
+            "你是 知进伴学 的学习回合总结助手。请用中文输出结构清晰、可读的学习报告，"
+            "所有耗时、页码、题号、错因和知识点推断都要基于输入时间线、批次分析、结构化学习条目和错题候选；"
+            "不确定处要明确标注。可以说明报告生成依据和处理步骤，但不要输出内部思维链。"
+            "请压缩表达：保留题目、答案、错题和时间线，删除重复状态、泛泛评价和无证据建议。"
+        ),
+    ),
+    PromptDefinition(
+        key="text_token_budget_notice",
+        label="文本压缩提示",
+        description="当最终报告输入过长被后端压缩时，插入到提示词前面的提醒。",
+        default="注意：后端已根据模型 token 上下文限制进一步压缩输入；未列出的细节不要编造，只基于可见证据概述；重复事实只保留一次。",
+    ),
+    PromptDefinition(
+        key="batch_analysis",
+        label="批次图片识别提示词",
+        description="智能连拍批次的主提示词，负责提取题目、手写答案和耗时线索。",
+        default=(
+            "这是一个学习回合中的一批智能连拍照片，共 {image_count} 张。环境信息：{environment}。\n"
+            "图片附件顺序与下面的抓拍时间线一一对应：\n"
+            "{capture_lines}\n\n"
+            "此前批次关键记录（用于对比，可能为空或不完整）：\n"
+            "{previous_context}\n\n"
+            "证据规则：只能记录图片中直接可见且能辨认的内容。不要根据常见教材、页码相邻关系、学科主题或前后批次补全题干、版本、年级、章节、题号或数字。"
+            "对模糊、太小、被遮挡或只能猜测的文字，请写“未识别”；只能大致判断时请写“疑似”。\n"
+            "完整入镜提醒：如果课本、试卷、电子显示屏或用户期望看到的材料没有完整放进拍摄区域，例如只拍到局部、边缘被裁切、主体偏出画面或关键区域在画面外，必须提醒“请把课本/试卷/屏幕完整放进拍摄区域或调整相机”。这类提醒属于高优先级拍摄提醒，不算泛泛建议，精简输出时也不能删除；不要强行解读画面外内容。\n"
+            "时间主次规则：先判断连续画面中学生是否在场、正在做什么（书写、读题、翻页、指题、查资料、停顿、离开/无人），并结合 captured_at 和相邻图片间隔估计各动作持续多久。主次按持续时间和动作强度排序，不要把所有拍到的题目平均解读；没有学生/手/笔/书写证据的相机空拍时间，不能直接算作某题耗时。\n"
+            "请输出“本批次差异题目记录”，用于最终学习回合报告。有限 token 必须优先给画面里的全部题目和关键差异；题目之外只写确定性的简短文字，不要展开泛泛画面描述。\n"
+            "对比规则：把此前批次关键记录当作基准，只记录本批相对基准的新增、变化、消失、补录；未变化且此前已清楚记录的内容不要重复。若此前记录缺失/不清楚，而本批能看清题目或作答，必须作为“补录”写出，避免最终回合漏题。\n"
+            "精简规则：总输出尽量控制在 600 字内；每个事实只写一次；不要复述示例值；没有新增/变化就写“无新增关键题目/作答”。若内容过多，优先保留题目、作答变化、耗时线索，删除状态和建议。\n"
+            "必须覆盖并按重要性排序：\n"
+            "1. 差异题目：按“新增/变化/消失/补录/未变化但需保留”列出可见题目，尽量保留页码、题号、题干原文、关键文字、关键数字/图表；看不清处写“未识别”。\n"
+            "2. 学生作答差异：只记录每题可确定的新答案、改动后的答案、草稿/订正变化、空白/未作答变化；无法确定写“未识别”，不要补充解释。\n"
+            "3. 题目耗时线索：只在本栏目写耗时。结合 captured_at、相邻图片间隔、同页同题连续出现、翻页/换题变化和学生在场证据，按持续时间降序估计本批主要动作/题目前后停留多久；不确定写“疑似”。不要在其他栏目重复耗时。\n"
+            "4. 简短状态：只给离散状态，例如“科目=数学；书写=是；翻页=否；清晰=一般；有人=是(手/笔)/否/未识别；动作=书写/读题/翻页/离开/未识别；拍摄区域=未完整入镜，需调整相机”。本栏目不要写耗时、时间戳、原因或动作过程；无把握写“未识别/疑似”。\n"
+            "5. 错题本/知识点候选：只有画面明确出现错误、订正、划掉、空白、反复停留或学生要求核对答案时才写；每项不超过 20 字。明确证据指可见错答、改正、划掉、空白或停留异常；没有明确证据写“暂无明确候选”，不要硬凑建议。\n"
+            "如果看不清页码或题号，请写“未识别”，不要编造。"
+        ),
+        variables=("image_count", "environment", "capture_lines", "previous_context"),
+    ),
+    PromptDefinition(
+        key="single_analysis",
+        label="单张拍题提示词",
+        description="单张图片同步解析的主提示词。",
+        default=(
+            "请解析这张学生拍摄的课本/试卷照片。页码提示：{page_hint}；题号提示：{question_hint}。"
+            "证据规则：只能依据照片中直接可见且能辨认的文字、数字、图形和手写内容回答。"
+            "不要根据常见教材、页码、章节名、题型或上下文补全版本、年级、题干、题号、数字或答案。"
+            "看不清、太小、模糊、反光、被遮挡或只能猜测的内容，一律写“未识别”；只能大致判断时写“疑似”。"
+            "如果课本、试卷、电子显示屏或用户期望看到的材料没有完整放进拍摄区域，例如只拍到局部、边缘被裁切、主体偏出画面或关键区域在画面外，必须提醒用户把材料完整放进画面或调整相机；这类提醒不算泛泛建议，不能省略。"
+            "有限 token 优先用于提取画面中所有题目和学生手写答案，不要长篇讲解，同一事实只写一次。"
+            "请输出：1. 识别到的页码和题号；2. 所有可见题目原文或关键文字数字/图表；3. 学生手写答案、算式、草稿、订正、空白/未作答状态；"
+            "4. 简短状态：科目、是否书写、画面是否清晰、拍摄区域是否完整；5. 仅在题干和关键数字足够清楚时给一句极简核对/易错点，否则写无法可靠解题。"
+        ),
+        variables=("page_hint", "question_hint"),
+    ),
+    PromptDefinition(
+        key="distill_final_evidence",
+        label="最终报告证据提炼提示词",
+        description="大规模回合先把批次识别内容压缩成关键事实时使用。",
+        default=(
+            "请把下面这一批学习回合证据提炼为“最终报告可用关键事实”，不要写最终报告。\n\n"
+            "这是第 {chunk_index}/{chunk_count} 批证据。{compressed_notice}"
+            "原始规模：抓拍 {image_count} 张，批次分析 {analysis_count} 条，"
+            "去重后可用分析 {unique_done_analysis_count} 条，重复分析 {duplicate_done_analysis_count} 条。\n\n"
+            "请只输出紧凑要点，把 token 优先留给题目和学生手写答案，删除重复状态、泛泛建议和无证据推断，按这些栏目：\n"
+            "1. 题目清单：页码/题号/题干关键文字数字/图表\n"
+            "2. 学生手写答案：逐题答案、算式、草稿、订正、空白或未识别\n"
+            "3. 时间段、停留、翻页或换题线索：按持续时间降序列主要段，尽量对应到页/题/动作；区分相机观察总时长、学生在场活动时长和疑似离开/空拍时长；耗时只在本栏目出现\n"
+            "4. 简短状态：科目、学习方式、是否书写、学生是否在场、是否有人/手/笔、主要动作、画面清晰度；不要写耗时\n"
+            "5. 不确定或冲突信息\n\n"
+            "要求：批次证据可能是差异日志，请把“新增/变化/补录/消失”合并成当前全回合事实；同页同题后续变化应更新前序记录，补录要纳入完整题目清单，消失只作为翻页/离开线索。删除重复描述，保留具体时间、sequence_index、页码、题号、手写答案、学生在场/不在场线索；状态项只写短语，不确定必须写“疑似/未识别”。每个栏目最多 5 条，能合并就合并。若证据里出现材料未完整入镜、只拍到局部或需调整相机，必须保留该提醒；这类提醒不算泛泛建议。不要把未检测到学生或最后一张到结束的无证据尾段平均分摊给题目。\n\n"
+            "确定时间线摘要：\n"
+            "- 开始：{start}\n"
+            "- 结束：{end}\n"
+            "- 总时长：{total_duration}\n"
+            "{timeline}\n\n"
+            "本批证据：\n{notes_chunk}"
+        ),
+        variables=(
+            "chunk_index",
+            "chunk_count",
+            "compressed_notice",
+            "image_count",
+            "analysis_count",
+            "unique_done_analysis_count",
+            "duplicate_done_analysis_count",
+            "start",
+            "end",
+            "total_duration",
+            "timeline",
+            "notes_chunk",
+        ),
+    ),
+    PromptDefinition(
+        key="final_report",
+        label="最终学习报告提示词",
+        description="生成全回合最终总结报告时使用。",
+        default=(
+            "请根据“确定时间线”和“{evidence_label}”生成本次学习回合的最终总结报告。\n\n"
+            "{compressed_notice}"
+            "报告必须按以下栏目输出，栏目名称保持一致；总长度尽量控制在 1200 字内，题目多时优先保留题目、答案、错题和耗时：\n"
+            "学生要求与动态策略：1 句；没有明确要求时写“未提供，按画面动态判断”。\n"
+            "学习时长：1-2 句，写相机观察总时长、学生在场/手笔活动的有效时长和起止依据；若有疑似不在场或最后一张后继续拍摄的无证据尾段，要明确区分。\n"
+            "学习科目：1 句，写科目和最关键依据；不确定则写可能。\n"
+            "学习方式：1 句，按持续时间最主要的学生动作判断方式，并写最关键依据。\n"
+            "抓拍画面：1-2 句，概述抓拍数量、材料/页面、学生是否在场、主要动作和画面变化；若课本、试卷、电子显示屏或用户期望材料未完整进入拍摄区域，必须提醒把材料完整放进画面或调整相机，这类提醒不算泛泛建议。\n"
+            "画面中的题目和答案：只列可见题目和对应作答；按时间投入和动作证据主次排序，每题 1 条，最多 8 条，未识别就写未识别；短暂扫过的题不要写成主要学习内容。\n"
+            "错题本：只列有证据的错题/疑似错题/未完成题；证据包括可见错答、改正、划掉、空白或停留异常；最多 5 条；没有明确错题时写“暂无明确错题候选”。\n"
+            "知识点与板块：只列由题目或错题直接支持的知识点；最多 5 条；不要泛化。\n"
+            "过程解析：只解析证据足够清楚的题；每题最多 3 步；不清楚的题只写需要补拍/补充题干。\n"
+            "题目耗时：只在本栏目写耗时；结合时间线、相邻抓拍间隔、学生在场/手笔/书写证据写每页/每题/每动作停留和最长项，无法可靠对应就说明原因；不要把相机空拍或无人时段算到题目上。\n"
+            "简短状态：只用短语列状态，例如“书写=是；学生在场=是(手/笔)/否/未识别；翻页=否；主要动作=读题/书写/查资料/离开；清晰=一般；拍摄区域=完整/未完整”。不要写耗时、时间戳、原因或长句。\n\n"
+            "家长三句话：用 3 句口语化中文总结“今天学了什么、主要卡在哪里、下一次先复习什么”；必须基于证据，不要泛泛鼓励。\n"
+            "下一步帮助建议：只给基于错题、知识点、停留时长、学生要求或拍摄区域不完整的建议，最多 3 条；没有证据就写“暂无”。\n"
+            "报告生成依据：1 句说明使用了哪些证据；不要输出内部思维链。\n\n"
+            "推断规则：\n"
+            "- 整份报告要精简，删除重复事实、模板套话和没有证据的评价；同一事实只出现在最合适的一个栏目。\n"
+            "- 批次视觉分析可能是相对前序批次的差异日志；请合并“新增/变化/补录/消失”，输出完整全回合事实，不要只列最后一批差异。\n"
+            "- 总学习时长优先使用后端计算值；页/题耗时必须结合相邻抓拍时间差和批次视觉分析，不能凭空编造。\n"
+            "- 主次必须按时间权重判断：先看连续画面里学生在做什么、持续多久、是否在场，再决定哪些页/题是主要内容；不要按拍到的题目数量平均分配注意力或耗时。\n"
+            "- 如果画面中长期没有学生、手、笔或书写动作，必须写成疑似离开/空拍/在场未识别，不能直接算作有效学习或某题耗时。\n"
+            "- 如果页码或题号识别不清，要写“未识别/疑似”，并解释依据。\n"
+            "- 如果同一页连续出现，按连续时间段估算停留；如果换页或换题，按变化点分段。\n"
+            "- 平均每页停留时长只在能归并出页码/疑似页码时计算，否则说明无法可靠计算并给出近似观察。\n\n"
+            "确定时间线：\n"
+            "- 后端计算学习开始：{start}\n"
+            "- 后端计算学习结束：{end}\n"
+            "- 后端计算总学习时长：{total_duration}\n"
+            "- 抓拍数量：{image_count} 张\n"
+            "- 原始证据规模：批次分析 {analysis_count} 条，原始分析约 {raw_analysis_chars} 字，"
+            "capture_meta 约 {raw_capture_meta_chars} 字，去重后可用分析 {unique_done_analysis_count} 条，"
+            "重复分析 {duplicate_done_analysis_count} 条\n"
+            "{timeline}\n\n"
+            "{evidence_label}：\n{batch_notes}"
+        ),
+        variables=(
+            "evidence_label",
+            "compressed_notice",
+            "start",
+            "end",
+            "total_duration",
+            "image_count",
+            "analysis_count",
+            "raw_analysis_chars",
+            "raw_capture_meta_chars",
+            "unique_done_analysis_count",
+            "duplicate_done_analysis_count",
+            "timeline",
+            "batch_notes",
+        ),
+    ),
+    PromptDefinition(
+        key="final_analysis_placeholder",
+        label="最终报告占位提示词",
+        description="最终报告任务入库时保存的 prompt 名称。",
+        default="学习回合最终总结报告",
+    ),
+    PromptDefinition(
+        key="empty_report",
+        label="空回合报告文本",
+        description="没有上传图片时直接返回的默认报告。",
+        default=(
+            "学习时长：未知\n"
+            "学习科目：未识别\n"
+            "学习方式：未识别\n"
+            "抓拍画面：本回合没有上传抓拍画面。\n"
+            "画面中的题目和答案：无可分析内容。\n"
+            "错题本：暂无明确错题候选。\n"
+            "知识点与板块：无可分析内容。\n"
+            "过程解析：无可分析内容。\n"
+            "题目耗时：未知。\n"
+            "简短状态：无图片。\n"
+            "下一步帮助建议：请开始拍题或智能连拍后再生成。\n"
+            "报告生成依据：本回合没有上传图片。"
+        ),
+    ),
+)
+
+PROMPT_DEFINITION_BY_KEY = {definition.key: definition for definition in PROMPT_DEFINITIONS}
+
+
+def ensure_prompt_table() -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prompts (
+                prompt_key TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+
+def get_prompt_definition(key: str) -> PromptDefinition:
+    try:
+        return PROMPT_DEFINITION_BY_KEY[key]
+    except KeyError as exc:
+        raise KeyError(f"unknown prompt key: {key}") from exc
+
+
+def get_default_prompt(key: str) -> str:
+    return get_prompt_definition(key).default
+
+
+def _prompt_overrides() -> dict[str, dict]:
+    try:
+        with connect() as conn:
+            rows = conn.execute("SELECT prompt_key, content, updated_at FROM prompts").fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {row["prompt_key"]: dict(row) for row in rows}
+
+
+def _prompt_override(key: str) -> dict | None:
+    try:
+        with connect() as conn:
+            row = conn.execute("SELECT prompt_key, content, updated_at FROM prompts WHERE prompt_key=?", (key,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return dict(row) if row else None
+
+
+def get_prompt(key: str) -> str:
+    definition = get_prompt_definition(key)
+    row = _prompt_override(key)
+    return row["content"] if row else definition.default
+
+
+def list_prompt_records() -> list[dict]:
+    overrides = _prompt_overrides()
+    records = []
+    for definition in PROMPT_DEFINITIONS:
+        override = overrides.get(definition.key)
+        content = override["content"] if override else definition.default
+        records.append(
+            {
+                "key": definition.key,
+                "label": definition.label,
+                "description": definition.description,
+                "content": content,
+                "default_content": definition.default,
+                "variables": list(definition.variables),
+                "is_custom": override is not None,
+                "updated_at": override["updated_at"] if override else "",
+            }
+        )
+    return records
+
+
+def validate_prompt_content(key: str, content: str) -> str:
+    definition = get_prompt_definition(key)
+    normalized = str(content or "").strip()
+    if not normalized:
+        raise ValueError("提示词不能为空")
+    if definition.variables:
+        sample_values = {name: f"<{name}>" for name in definition.variables}
+        try:
+            normalized.format(**sample_values)
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(f"模板变量格式无效：{exc}") from exc
+    return normalized
+
+
+def set_prompt(key: str, content: str) -> dict:
+    normalized = validate_prompt_content(key, content)
+    ensure_prompt_table()
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO prompts(prompt_key, content, updated_at)
+            VALUES(?, ?, ?)
+            ON CONFLICT(prompt_key) DO UPDATE SET
+                content=excluded.content,
+                updated_at=excluded.updated_at
+            """,
+            (key, normalized, now),
+        )
+    return next(record for record in list_prompt_records() if record["key"] == key)
+
+
+def reset_prompt(key: str) -> dict:
+    get_prompt_definition(key)
+    ensure_prompt_table()
+    with connect() as conn:
+        conn.execute("DELETE FROM prompts WHERE prompt_key=?", (key,))
+    return next(record for record in list_prompt_records() if record["key"] == key)
+
+
+def reset_all_prompts() -> list[dict]:
+    ensure_prompt_table()
+    with connect() as conn:
+        conn.execute("DELETE FROM prompts")
+    return list_prompt_records()
+
+
+def render_prompt(key: str, **values: object) -> str:
+    definition = get_prompt_definition(key)
+    template = get_prompt(key)
+    normalized_values = {name: "" if value is None else value for name, value in values.items()}
+    try:
+        return template.format(**normalized_values)
+    except (KeyError, IndexError, ValueError):
+        return definition.default.format(**normalized_values)

@@ -5,9 +5,11 @@ __pycache__/
 .venv/
 backend/.venv/
 backend/data/
+backend/redis-data/
+backend/mysql-data/
 backend/test-data/
 build/
 DerivedData/
 *.xcarchive
 *.ipa
-
+tmp/

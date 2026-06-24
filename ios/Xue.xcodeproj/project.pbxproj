@@ -8,15 +8,28 @@
 
 /* Begin PBXBuildFile section */
 		026E6C33370C4E42FCC3DF92 /* XueApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B224C75DD5B6686DB5B1EE85 /* XueApp.swift */; };
+		3C6AD7B8A7079C1F93EDC63E /* XueUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDB2AA1B15F4D47F67F03CDC /* XueUITests.swift */; };
 		8E3BCDB89518C6305F332DD8 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 3159E19C7ABAB10F9850B0B0 /* Assets.xcassets */; };
 		FAF16D06034157490CA792CF /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB42ABB61B7AC619EE3E8A05 /* ContentView.swift */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		7B485951CCCA12C8A8E634B3 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 4F27322725D90061BB526233 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 25337A70DDED61EFEF58686D;
+			remoteInfo = Xue;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		3159E19C7ABAB10F9850B0B0 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		47FBFB21EEEBD76D8C2D4341 /* Debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Debug.xcconfig; sourceTree = "<group>"; };
+		0726CCF43C74A384C469E9E0 /* XueUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = XueUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		9087F2E5C0B190C51867CE4E /* Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Release.xcconfig; sourceTree = "<group>"; };
 		B224C75DD5B6686DB5B1EE85 /* XueApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = XueApp.swift; sourceTree = "<group>"; };
+		BDB2AA1B15F4D47F67F03CDC /* XueUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = XueUITests.swift; sourceTree = "<group>"; };
 		BBB1D6C3EB15A8144F29239A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		C08D660012E5667C4F118A89 /* Xue.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Xue.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		FB42ABB61B7AC619EE3E8A05 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -27,8 +40,17 @@
 			isa = PBXGroup;
 			children = (
 				C08D660012E5667C4F118A89 /* Xue.app */,
+				0726CCF43C74A384C469E9E0 /* XueUITests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		3AB3ACA8F53ACD0642D6C3E7 /* XueUITests */ = {
+			isa = PBXGroup;
+			children = (
+				BDB2AA1B15F4D47F67F03CDC /* XueUITests.swift */,
+			);
+			path = "XueUITests";
 			sourceTree = "<group>";
 		};
 		829101CAEDAF9836EA8DF2F5 /* App */ = {
@@ -47,6 +69,7 @@
 			isa = PBXGroup;
 			children = (
 				829101CAEDAF9836EA8DF2F5 /* App */,
+				3AB3ACA8F53ACD0642D6C3E7 /* XueUITests */,
 				CC6BC4575189E8C006A7EC59 /* Configs */,
 				08FDA1324CAEE71081812208 /* Products */,
 			);
@@ -82,6 +105,25 @@
 			productReference = C08D660012E5667C4F118A89 /* Xue.app */;
 			productType = "com.apple.product-type.application";
 		};
+		B9A3A5828C075F02274BAE0A /* XueUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = E1F756B49D19EB606A77C666 /* Build configuration list for PBXNativeTarget "XueUITests" */;
+			buildPhases = (
+				997A776545FEA7AB75252068 /* Sources */,
+				58E4B05D1098594E8D361513 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				42BA5B17E2188B90B952C597 /* PBXTargetDependency */,
+			);
+			name = XueUITests;
+			packageProductDependencies = (
+			);
+			productName = XueUITests;
+			productReference = 0726CCF43C74A384C469E9E0 /* XueUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -94,6 +136,10 @@
 					25337A70DDED61EFEF58686D = {
 						DevelopmentTeam = "$(APPLE_TEAM_ID)";
 						ProvisioningStyle = Automatic;
+					};
+					B9A3A5828C075F02274BAE0A = {
+						CreatedOnToolsVersion = 26.5;
+						TestTargetID = 25337A70DDED61EFEF58686D;
 					};
 				};
 			};
@@ -112,6 +158,7 @@
 			projectRoot = "";
 			targets = (
 				25337A70DDED61EFEF58686D /* Xue */,
+				B9A3A5828C075F02274BAE0A /* XueUITests */,
 			);
 		};
 /* End PBXProject section */
@@ -122,6 +169,13 @@
 			buildActionMask = 2147483647;
 			files = (
 				8E3BCDB89518C6305F332DD8 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		58E4B05D1098594E8D361513 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -137,7 +191,23 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		997A776545FEA7AB75252068 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				3C6AD7B8A7079C1F93EDC63E /* XueUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		42BA5B17E2188B90B952C597 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 25337A70DDED61EFEF58686D /* Xue */;
+			targetProxy = 7B485951CCCA12C8A8E634B3 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		31E2D3B5F747D74B0C2162EC /* Debug */ = {
@@ -255,6 +325,56 @@
 			};
 			name = Release;
 		};
+		CFD850B0FE1CABA2473C0AF1 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 47FBFB21EEEBD76D8C2D4341 /* Debug.xcconfig */;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = "$(APP_BUILD_NUMBER)";
+				DEVELOPMENT_TEAM = "$(APPLE_TEAM_ID)";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MARKETING_VERSION = "$(APP_VERSION)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_ID).UITests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = Xue;
+			};
+			name = Debug;
+		};
+		D6F2976B6FDFE6F0D464F33A /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 9087F2E5C0B190C51867CE4E /* Release.xcconfig */;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = "$(APP_BUILD_NUMBER)";
+				DEVELOPMENT_TEAM = "$(APPLE_TEAM_ID)";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MARKETING_VERSION = "$(APP_VERSION)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_ID).UITests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = Xue;
+			};
+			name = Release;
+		};
 		9C92AA87CB5C769F32F58CD4 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -338,6 +458,15 @@
 			buildConfigurations = (
 				31E2D3B5F747D74B0C2162EC /* Debug */,
 				67E8AF6E5900BB3202BE9ACE /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		E1F756B49D19EB606A77C666 /* Build configuration list for PBXNativeTarget "XueUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CFD850B0FE1CABA2473C0AF1 /* Debug */,
+				D6F2976B6FDFE6F0D464F33A /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;

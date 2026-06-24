@@ -1,67 +1,7100 @@
 import asyncio
+import base64
+import hmac
+import hashlib
+import html
 import json
+import re
 import shutil
 import uuid
+from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+import jwt
+try:
+    from cryptography.fernet import Fernet
+except Exception:  # pragma: no cover - deployment dependency guard
+    Fernet = None
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.security.utils import get_authorization_scheme_param
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image, ImageOps
 
-from . import llm
+from . import llm, prompts
 from .config import get_settings
 from .db import connect, init_db, utc_now
 
 app = FastAPI(title="知进伴学")
+AUTH_SCHEME = "Bearer"
+AUTH_PASSWORD_MIN_LENGTH = 8
+AUTH_DEFAULT_TOKEN_BYTES = 32
+AUTH_HASH_ITERATIONS = 210_000
+AUTH_TOKEN_ALGORITHM = "HS256"
+AUTH_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+PROFILE_TYPES = {"student", "parent", "teacher"}
+MODEL_PROVIDERS = {
+    "evowit": {"label": "EvoWit 默认模型", "supports_custom_base_url": True},
+    "openai": {"label": "OpenAI", "supports_custom_base_url": True},
+    "anthropic": {"label": "Anthropic", "supports_custom_base_url": True},
+    "gemini": {"label": "Google Gemini", "supports_custom_base_url": True},
+    "zhipu": {"label": "智谱 AI", "supports_custom_base_url": True},
+    "openai-compatible": {"label": "OpenAI-compatible", "supports_custom_base_url": True},
+}
+DEFAULT_ACCOUNT_ID = "local"
+llm_gate_lock = asyncio.Lock()
+llm_gate_inflight = 0
+llm_gate_waiting = 0
+llm_gate_last_started_at = 0.0
+llm_gate_wait_seq = 0
+llm_gate_waiters: dict[str, dict] = {}
+llm_gate_inflight_realtime = 0
+llm_gate_inflight_background = 0
+task_dispatcher_task: asyncio.Task | None = None
+THUMBNAIL_MAX_SIDE = 640
+THUMBNAIL_QUALITY = 82
+FINAL_REPORT_WAIT_SECONDS = 90
+DEFAULT_SESSION_ANALYSIS_LIMIT = 20
+MAX_SESSION_ANALYSIS_LIMIT = 100
+SESSION_OVERVIEW_IMAGE_FALLBACK_LIMIT = 80
+DEVICE_CONTROL_POLL_INTERVAL_SECONDS = 1.0
+DEVICE_CONTROL_ONLINE_SECONDS = 8
+CONTROL_COMMAND_TTL_SECONDS = 120
+CONTROL_COMMAND_TYPES = {
+    "single_capture",
+    "start_burst",
+    "stop_burst",
+    "voice_question",
+    "ok_followup",
+    "end_qa",
+    "set_goal",
+}
+CONTROL_COMMAND_ACK_STATUSES = {"applied", "failed", "ignored"}
+FINAL_REPORT_PROMPT_CHAR_LIMIT = 28000
+FINAL_REPORT_TIMELINE_CHAR_LIMIT = 8000
+FINAL_REPORT_ANALYSES_CHAR_LIMIT = 17000
+FINAL_REPORT_ANALYSIS_MAX_CHARS = 1400
+FINAL_REPORT_ANALYSIS_MIN_CHARS = 180
+FINAL_REPORT_CAPTURE_META_CHAR_LIMIT = 180
+FINAL_REPORT_DISTILL_TRIGGER_CHARS = 22000
+FINAL_REPORT_DISTILL_TRIGGER_ANALYSES = 24
+FINAL_REPORT_DISTILL_SOURCE_CHAR_LIMIT = 64000
+FINAL_REPORT_DISTILL_CHUNK_CHAR_LIMIT = 6000
+FINAL_REPORT_DISTILL_ANALYSIS_MAX_CHARS = 1100
+FINAL_REPORT_DISTILL_ANALYSIS_MIN_CHARS = 260
+FINAL_REPORT_DISTILLED_NOTES_CHAR_LIMIT = 14000
+FINAL_REPORT_DISTILL_MAX_TOKENS = 1600
+BATCH_PREVIOUS_CONTEXT_LIMIT = 5000
+BATCH_PREVIOUS_ANALYSIS_LIMIT = 6
+OBSERVATION_LOOKBACK_LIMIT = 80
+VISUAL_DUPLICATE_DISTANCE = 3.2
+VISUAL_TEXT_DUPLICATE_DISTANCE = 5.2
+TEXT_DUPLICATE_DISTANCE = 0.22
+LEARNING_ITEM_CONTENT_LIMIT = 900
+LEARNING_ITEM_TITLE_LIMIT = 120
+LEARNING_ITEM_SUMMARY_LIMIT = 6000
+SESSION_GOAL_CHAR_LIMIT = 1200
+ASSISTANT_FOCUS_CHAR_LIMIT = 1800
+REPORT_PROCESS_CHAR_LIMIT = 6000
+QA_PROMPT_CHAR_LIMIT = 16000
+QA_RECENT_ANALYSIS_LIMIT = 5
+QA_RECENT_EVENT_LIMIT = 8
+QA_CONTEXT_ITEM_LIMIT = 12
+QA_QUESTION_CHAR_LIMIT = 1200
+QA_ANSWER_CHAR_LIMIT = 12000
+QA_HTML_CHAR_LIMIT = 20000
+TEACHING_VISUALIZATION_PROMPT_CHAR_LIMIT = 22000
+TEACHING_VISUALIZATION_SOURCE_CHAR_LIMIT = 9000
+TEACHING_VISUALIZATION_HTML_CHAR_LIMIT = 260000
+TEACHING_VISUALIZATION_MAX_TOKENS = 7000
+TEACHING_VISUALIZATION_SOURCE_TYPES = {"qa_event", "analysis", "custom"}
+TEACHING_VISUALIZATION_CSP = (
+    "default-src 'self' data: blob: https://cdn.jsdelivr.net https://unpkg.com; "
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://unpkg.com; "
+    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com; "
+    "img-src 'self' data: blob:; "
+    "font-src 'self' data: https://cdn.jsdelivr.net https://unpkg.com; "
+    "connect-src 'none'; "
+    "base-uri 'none'; "
+    "form-action 'none'; "
+    "frame-ancestors 'self'"
+)
+QA_VISUAL_REVIEW_INTENTS = {"answer_check", "correction_check", "visual_check"}
+QA_MIN_TEXT_FOR_CONTEXT = 4
+QA_MIN_TEXT_WITH_RECTANGLE_FOR_CONTEXT = 2
+QA_MIN_RECTANGLES_WITHOUT_TEXT_FOR_CONTEXT = 2
+QA_IMAGE_LIGHT_COVERAGE_MIN = 0.06
+QA_IMAGE_EDGE_DENSITY_MIN = 0.018
+QA_IMAGE_CONTRAST_MIN = 5.5
+QA_IMAGE_MATERIAL_CONFIDENCE_MIN = 0.34
+IMAGE_VALIDITY_STRONG_MATERIAL_CONFIDENCE = 0.45
+IMAGE_VALIDITY_SOFT_MATERIAL_CONFIDENCE = 0.34
+IMAGE_VALIDITY_MIN_TEXT_TOKENS = 2
+IMAGE_VALIDITY_MIN_RECTANGLES = 2
+IMAGE_VALIDITY_MIN_LIGHT_COVERAGE = 0.06
+IMAGE_VALIDITY_MIN_EDGE_DENSITY = 0.018
+IMAGE_VALIDITY_MIN_CONTRAST = 5.5
+IMAGE_VALIDITY_BLUR_MIN_WITHOUT_TEXT = 0.24
+MISTAKE_REASON_LIMIT = 700
+ASSET_FIELD_LIMIT = 180
+ASSET_SOURCE_SUMMARY_LIMIT = 600
+ASSET_DOCUMENT_BODY_LIMIT = 5000
+ASSET_PAGE_SIZE_DEFAULT = 25
+ASSET_PAGE_SIZE_MAX = 100
+TASK_RECOVERY_DELAY_SECONDS = 15
+TASK_RETRY_DELAY_SECONDS = 45
+TASK_STALE_RUNNING_SECONDS = 300
+LLM_PRIORITY_REALTIME = 0
+LLM_PRIORITY_BACKGROUND = 100
+TASK_PRIORITY_BACKGROUND = 100
+TASK_PRIORITY_FINAL_REPORT = 120
+TASK_PRIORITY_MEMORY = 150
+MEMORY_CONSOLIDATION_INTERVAL_SECONDS = 3600
+MEMORY_EVENT_TEXT_LIMIT = 1200
+MEMORY_PROFILE_CHAR_LIMIT = 4000
+MEMORY_PROFILE_RECENT_EVENT_LIMIT = 80
+MISTAKE_STATUS_VALUES = {"suspected", "incomplete", "confirmed", "ignored", "corrected", "mastered"}
+MISTAKE_STATUS_ALIASES = {"resolved": "mastered"}
+MISTAKE_REVIEW_STATE_VALUES = {"new", "queued", "scheduled", "reviewing", "done", "mastered", "ignored"}
+MISTAKE_REVIEW_STATE_ALIASES = {"archived": "ignored", "due": "scheduled", "later": "scheduled"}
+ACTIVE_MISTAKE_STATUSES = {"suspected", "incomplete", "confirmed", "corrected"}
+REVIEW_QUEUE_STATUSES = {"suspected", "incomplete", "confirmed", "corrected"}
+REVIEW_SCHEDULE_DAYS = {
+    "new": 0,
+    "queued": 1,
+    "scheduled": 1,
+    "reviewing": 1,
+    "done": 3,
+    "corrected": 2,
+}
+REVIEW_EVENT_RESULTS = {"correct", "incorrect", "postpone", "mastered"}
+REVIEW_EVENT_ALIASES = {
+    "right": "correct",
+    "ok": "correct",
+    "wrong": "incorrect",
+    "again": "incorrect",
+    "delay": "postpone",
+    "later": "postpone",
+    "schedule": "postpone",
+    "done": "correct",
+}
+UNCLEAR_ANALYSIS_SIGNALS = (
+    "未识别",
+    "看不清",
+    "看不清楚",
+    "不清楚",
+    "模糊",
+    "太小",
+    "被遮挡",
+    "遮挡",
+    "反光",
+    "无法确认",
+    "无法辨认",
+    "无法识别",
+    "未能识别",
+    "识别不清",
+    "不清晰",
+    "读不清",
+    "无法读取",
+    "难以辨认",
+    "无法判断",
+    "未完整入镜",
+    "没有完整放进",
+    "没有完整进入",
+    "未完整进入",
+    "画面外",
+    "视野外",
+    "超出画面",
+    "超出视野",
+    "边缘被裁切",
+    "被裁切",
+    "截断",
+    "不完整",
+    "拍摄不完整",
+    "只拍到一部分",
+    "只拍到局部",
+    "部分可见",
+    "只有一半",
+    "主体偏出画面",
+    "内容缺失",
+    "未拍全",
+    "没拍全",
+    "没拍完整",
+    "调整相机",
+    "完整放进画面",
+    "完整放进拍摄区域",
+)
 
 
 @app.on_event("startup")
 def startup() -> None:
+    global task_dispatcher_task
     init_db()
     settings = get_settings()
     app.mount("/images", StaticFiles(directory=settings.data_dir / "images"), name="images")
+    recover_interrupted_tasks()
+    schedule_memory_consolidation_if_due()
+    try:
+        loop = asyncio.get_running_loop()
+        if task_dispatcher_task is None or task_dispatcher_task.done():
+            task_dispatcher_task = loop.create_task(task_dispatcher_loop())
+    except RuntimeError:
+        pass
 
 
 def emit_log(message: str, *, session_id: str | None = None, device_id: str | None = None, level: str = "info", source: str = "backend") -> None:
+    account_id = get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    if session_id:
+        try:
+            with connect() as conn:
+                row = conn.execute("SELECT account_id FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if row and row["account_id"]:
+                account_id = row["account_id"]
+        except Exception:
+            account_id = get_settings().default_account_id or DEFAULT_ACCOUNT_ID
     with connect() as conn:
         conn.execute(
-            "INSERT INTO logs(session_id, device_id, level, source, message, created_at) VALUES(?, ?, ?, ?, ?, ?)",
-            (session_id, device_id, level, source, message, utc_now()),
+            "INSERT INTO logs(account_id, session_id, device_id, level, source, message, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (account_id, session_id, device_id, level, source, message, utc_now()),
         )
+
+
+def normalize_llm_max_concurrency(value: int) -> int:
+    return max(1, min(4, int(value or 1)))
+
+
+def normalize_llm_min_interval(value: float) -> float:
+    return max(0.0, min(120.0, float(value or 0.0)))
+
+
+def session_llm_identity(session_id: str | None = None, *, account_id: str = "", user_id: str = "") -> tuple[str, str]:
+    settings = get_settings()
+    resolved_account_id = account_id or settings.default_account_id or DEFAULT_ACCOUNT_ID
+    resolved_user_id = user_id or ""
+    if session_id:
+        try:
+            with connect() as conn:
+                row = conn.execute(
+                    "SELECT account_id, created_by_user_id FROM sessions WHERE id=?",
+                    (session_id,),
+                ).fetchone()
+            if row:
+                resolved_account_id = row["account_id"] or resolved_account_id
+                resolved_user_id = row["created_by_user_id"] or resolved_user_id
+        except Exception:
+            pass
+    return resolved_account_id, resolved_user_id
+
+
+def emit_llm_gate_log(message: str, *, session_id: str | None = None, level: str = "info") -> None:
+    try:
+        emit_log(message, session_id=session_id, level=level)
+    except Exception:
+        pass
+
+
+def record_task_run(
+    task_kind: str,
+    *,
+    account_id: str | None = None,
+    session_id: str | None = None,
+    analysis_id: str | None = None,
+    payload: dict | None = None,
+    delay_seconds: int = TASK_RECOVERY_DELAY_SECONDS,
+    priority: int = TASK_PRIORITY_BACKGROUND,
+) -> str:
+    task_id = uuid.uuid4().hex
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    available_at = (now_dt + timedelta(seconds=max(0, delay_seconds))).isoformat()
+    account_id = account_id or get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    if session_id:
+        try:
+            with connect() as conn:
+                row = conn.execute("SELECT account_id FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if row and row["account_id"]:
+                account_id = row["account_id"]
+        except Exception:
+            account_id = get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    try:
+        with connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO task_runs(
+                    id, account_id, task_kind, status, session_id, analysis_id, payload,
+                    priority, available_at, created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    account_id,
+                    task_kind,
+                    "queued",
+                    session_id,
+                    analysis_id,
+                    json_dumps(payload or {}),
+                    int(priority),
+                    available_at,
+                    now,
+                    now,
+                ),
+            )
+    except Exception:
+        return task_id
+    return task_id
+
+
+def mark_task_run(task_id: str | None, status: str, *, error: str = "") -> None:
+    if not task_id:
+        return
+    now = utc_now()
+    try:
+        with connect() as conn:
+            if status == "running":
+                conn.execute(
+                    """
+                    UPDATE task_runs
+                    SET status=?, attempts=attempts + 1, started_at=?, last_error='', updated_at=?
+                    WHERE id=?
+                    """,
+                    (status, now, now, task_id),
+                )
+            elif status in {"done", "failed"}:
+                conn.execute(
+                    """
+                    UPDATE task_runs
+                    SET status=?, last_error=?, finished_at=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (status, truncate_text(error, 1000), now, now, task_id),
+                )
+            else:
+                conn.execute("UPDATE task_runs SET status=?, updated_at=? WHERE id=?", (status, now, task_id))
+    except Exception:
+        pass
+
+
+def recover_interrupted_tasks() -> None:
+    now = datetime.now(timezone.utc)
+    stale_before = (now - timedelta(seconds=TASK_STALE_RUNNING_SECONDS)).isoformat()
+    now_text = now.isoformat()
+    try:
+        with connect() as conn:
+            conn.execute(
+                """
+                UPDATE task_runs
+                SET status='queued', available_at=?, updated_at=?, last_error='recovered after process restart'
+                WHERE status='running' AND (started_at='' OR started_at < ?)
+                """,
+                (now_text, now_text, stale_before),
+            )
+    except Exception:
+        pass
+
+
+def auth_secret_key() -> str:
+    settings = get_settings()
+    configured = settings.auth_secret_key.strip()
+    if configured:
+        return configured
+    secret_path = settings.data_dir / "auth_secret.key"
+    if secret_path.exists():
+        value = secret_path.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    token = base64.urlsafe_b64encode(uuid.uuid4().bytes + uuid.uuid4().bytes).decode("ascii").rstrip("=")
+    secret_path.write_text(token, encoding="utf-8")
+    return token
+
+
+def normalize_email(value: object) -> str:
+    return str(value or "").strip().lower()[:254]
+
+
+def hash_password(password: str) -> str:
+    salt = uuid.uuid4().bytes
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, AUTH_HASH_ITERATIONS)
+    return "pbkdf2_sha256${}${}${}".format(
+        AUTH_HASH_ITERATIONS,
+        base64.b64encode(salt).decode("ascii"),
+        base64.b64encode(digest).decode("ascii"),
+    )
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        scheme, iterations_raw, salt_raw, digest_raw = str(password_hash or "").split("$", 3)
+        if scheme != "pbkdf2_sha256":
+            return False
+        iterations = int(iterations_raw)
+        salt = base64.b64decode(salt_raw.encode("ascii"))
+        expected = base64.b64decode(digest_raw.encode("ascii"))
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
+def auth_public_config() -> dict:
+    settings = get_settings()
+    return {
+        "auth_required": bool(settings.auth_required),
+        "registration_enabled": bool(settings.registration_enabled),
+        "token_ttl_minutes": int(settings.auth_token_ttl_minutes or 0),
+    }
+
+
+def make_access_token(user: dict) -> str:
+    now = datetime.now(timezone.utc)
+    ttl_minutes = max(5, int(get_settings().auth_token_ttl_minutes or 0))
+    payload = {
+        "sub": user["id"],
+        "account_id": user["account_id"],
+        "email": user["email"],
+        "role": user.get("role") or "member",
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=ttl_minutes)).timestamp()),
+    }
+    return jwt.encode(payload, auth_secret_key(), algorithm=AUTH_TOKEN_ALGORITHM)
+
+
+def public_user(user: dict) -> dict:
+    return {
+        "id": user.get("id", ""),
+        "account_id": user.get("account_id", ""),
+        "email": user.get("email", ""),
+        "display_name": user.get("display_name", ""),
+        "role": user.get("role", ""),
+        "status": user.get("status", ""),
+        "created_at": user.get("created_at", ""),
+        "updated_at": user.get("updated_at", ""),
+        "last_login_at": user.get("last_login_at", ""),
+    }
+
+
+def default_principal() -> dict:
+    account_id = get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    return {
+        "authenticated": False,
+        "account_id": account_id,
+        "user_id": "",
+        "email": "",
+        "role": "legacy",
+    }
+
+
+def principal_from_request(request: Request | None, *, required: bool | None = None) -> dict:
+    settings = get_settings()
+    must_auth = settings.auth_required if required is None else required
+    authorization = request.headers.get("Authorization", "") if request else ""
+    scheme, token = get_authorization_scheme_param(authorization)
+    if not token:
+        if must_auth:
+            raise HTTPException(401, "login required")
+        return default_principal()
+    if scheme.lower() != AUTH_SCHEME.lower():
+        raise HTTPException(401, "invalid authorization scheme")
+    try:
+        payload = jwt.decode(token, auth_secret_key(), algorithms=[AUTH_TOKEN_ALGORITHM])
+    except Exception:
+        raise HTTPException(401, "invalid or expired token")
+    user_id = str(payload.get("sub") or "")
+    account_id = str(payload.get("account_id") or "")
+    if not user_id or not account_id:
+        raise HTTPException(401, "invalid token")
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE id=? AND account_id=? AND status='active'",
+            (user_id, account_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(401, "user not found or disabled")
+    user = dict(row)
+    return {
+        "authenticated": True,
+        "account_id": user["account_id"],
+        "user_id": user["id"],
+        "email": user["email"],
+        "role": user["role"],
+        "user": public_user(user),
+    }
+
+
+def account_filter(principal: dict, alias: str = "sessions") -> tuple[str, list[object]]:
+    if principal.get("authenticated") or get_settings().auth_required:
+        return f"{alias}.account_id=?", [principal.get("account_id") or DEFAULT_ACCOUNT_ID]
+    return "1=1", []
+
+
+def require_account_session(conn, session_id: str, principal: dict) -> dict:
+    if principal.get("authenticated") or get_settings().auth_required:
+        row = conn.execute("SELECT * FROM sessions WHERE id=? AND account_id=?", (session_id, principal["account_id"])).fetchone()
+    else:
+        row = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "session not found")
+    return dict(row)
+
+
+def clean_auth_text(value: object, max_chars: int = 160) -> str:
+    return str(value or "").strip()[:max_chars]
+
+
+def account_profiles(account_id: str) -> list[dict]:
+    with connect() as conn:
+        return [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM identity_profiles
+                WHERE account_id=? AND status='active'
+                ORDER BY
+                    CASE profile_type WHEN 'student' THEN 0 WHEN 'parent' THEN 1 WHEN 'teacher' THEN 2 ELSE 3 END,
+                    created_at ASC
+                """,
+                (account_id,),
+            )
+        ]
+
+
+def create_identity_profile(account_id: str, body: dict, *, user_id: str = "") -> dict:
+    profile_type = clean_auth_text(body.get("profile_type") or body.get("profileType") or "student", 40)
+    if profile_type not in PROFILE_TYPES:
+        raise HTTPException(422, "profile_type must be student, parent, or teacher")
+    display_name = clean_auth_text(body.get("display_name") or body.get("displayName") or body.get("name"), 120)
+    if not display_name:
+        display_name = {"student": "默认学生", "parent": "家长", "teacher": "老师"}[profile_type]
+    student_id = clean_auth_text(body.get("student_id") or body.get("studentId"), 80)
+    relation = clean_auth_text(body.get("relation"), 80)
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    now = utc_now()
+    profile_id = uuid.uuid4().hex
+    if not user_id:
+        with connect() as conn:
+            owner = conn.execute(
+                "SELECT id FROM users WHERE account_id=? AND status='active' ORDER BY created_at ASC LIMIT 1",
+                (account_id,),
+            ).fetchone()
+        user_id = owner["id"] if owner else ""
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO identity_profiles(
+                id, account_id, user_id, profile_type, display_name, student_id,
+                relation, metadata, status, created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+            """,
+            (
+                profile_id,
+                account_id,
+                user_id,
+                profile_type,
+                display_name,
+                student_id,
+                relation,
+                json_dumps(metadata),
+                now,
+                now,
+            ),
+        )
+        row = conn.execute("SELECT * FROM identity_profiles WHERE id=?", (profile_id,)).fetchone()
+    return dict(row)
+
+
+def account_default_student_id(account_id: str) -> str:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM identity_profiles
+            WHERE account_id=? AND profile_type='student' AND status='active'
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (account_id,),
+        ).fetchone()
+    return row["id"] if row else ""
+
+
+def resolve_student_profile(account_id: str, requested_id: str = "") -> str:
+    requested_id = clean_auth_text(requested_id, 80)
+    if requested_id:
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM identity_profiles WHERE id=? AND account_id=? AND profile_type='student' AND status='active'",
+                (requested_id, account_id),
+            ).fetchone()
+        if not row:
+            raise HTTPException(422, "student profile not found")
+        return requested_id
+    return account_default_student_id(account_id)
+
+
+def active_model_config(account_id: str = "", user_id: str = "") -> dict:
+    settings = get_settings()
+    if account_id:
+        try:
+            with connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM model_configs
+                    WHERE account_id=? AND enabled=1
+                    ORDER BY is_default DESC, updated_at DESC
+                    LIMIT 1
+                    """,
+                    (account_id,),
+                ).fetchone()
+        except Exception:
+            row = None
+        if row:
+            data = dict(row)
+            return {
+                "id": data["id"],
+                "account_id": data["account_id"],
+                "owner_user_id": data.get("owner_user_id", ""),
+                "provider": data["provider"],
+                "name": data["name"],
+                "base_url": data["base_url"],
+                "model": data["model"],
+                "enabled": bool(data["enabled"]),
+                "is_default": bool(data["is_default"]),
+                "max_concurrency": int(data.get("max_concurrency") or settings.llm_max_concurrency),
+                "min_interval_seconds": float(data.get("min_interval_seconds") or 0),
+                "metadata": parse_json_object(data.get("metadata")),
+                "api_key_configured": bool(data.get("api_key_encrypted")),
+            }
+    return {
+        "id": "system-default",
+        "account_id": account_id or "",
+        "owner_user_id": user_id or "",
+        "provider": settings.llm_provider,
+        "name": "EvoWit 默认模型",
+        "base_url": settings.llm_base_url,
+        "model": settings.llm_model,
+        "enabled": True,
+        "is_default": True,
+        "max_concurrency": normalize_llm_max_concurrency(settings.llm_max_concurrency),
+        "min_interval_seconds": normalize_llm_min_interval(settings.llm_min_interval_seconds),
+        "metadata": {"managed_by": "system"},
+                "api_key_configured": bool(settings.llm_api_key),
+    }
+
+
+def effective_llm_settings(account_id: str = "", user_id: str = ""):
+    settings = get_settings()
+    config = active_model_config(account_id, user_id)
+    api_key = settings.llm_api_key
+    config_id = config.get("id") or ""
+    if config_id and config_id != "system-default" and config.get("api_key_configured"):
+        try:
+            with connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT api_key_encrypted
+                    FROM model_configs
+                    WHERE id=? AND account_id=? AND enabled=1
+                    """,
+                    (config_id, config.get("account_id") or account_id),
+                ).fetchone()
+            if row and row["api_key_encrypted"]:
+                api_key = decrypt_model_secret(row["api_key_encrypted"])
+        except Exception:
+            api_key = settings.llm_api_key
+    updates = {
+        "llm_provider": config.get("provider") or settings.llm_provider,
+        "llm_base_url": config.get("base_url") or settings.llm_base_url,
+        "llm_api_key": api_key,
+        "llm_model": config.get("model") or settings.llm_model,
+        "llm_max_concurrency": normalize_llm_max_concurrency(config.get("max_concurrency") or settings.llm_max_concurrency),
+        "llm_min_interval_seconds": normalize_llm_min_interval(
+            config.get("min_interval_seconds")
+            if config.get("min_interval_seconds") is not None
+            else settings.llm_min_interval_seconds
+        ),
+    }
+    if hasattr(settings, "model_copy"):
+        return settings.model_copy(update=updates)
+    return settings.copy(update=updates)
+
+
+def effective_llm_settings_for_session(session_id: str | None = None, *, account_id: str = "", user_id: str = ""):
+    resolved_account_id, resolved_user_id = session_llm_identity(session_id, account_id=account_id, user_id=user_id)
+    return effective_llm_settings(resolved_account_id, resolved_user_id)
+
+
+def model_config_public(row: dict) -> dict:
+    item = dict(row)
+    item["enabled"] = bool(item.get("enabled"))
+    item["is_default"] = bool(item.get("is_default"))
+    item["api_key_configured"] = bool(item.get("api_key_encrypted"))
+    item.pop("api_key_encrypted", None)
+    item["metadata"] = parse_json_object(item.get("metadata"))
+    return item
+
+
+def model_secret_fernet():
+    if Fernet is None:
+        raise HTTPException(500, "cryptography is required for model key encryption")
+    digest = hashlib.sha256(auth_secret_key().encode("utf-8")).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def encrypt_model_secret(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return model_secret_fernet().encrypt(text.encode("utf-8")).decode("ascii")
+
+
+def decrypt_model_secret(value: str) -> str:
+    if not value:
+        return ""
+    return model_secret_fernet().decrypt(value.encode("ascii")).decode("utf-8")
+
+
+def record_llm_usage_start(label: str, session_id: str | None, lane: str, account_id: str, user_id: str = "") -> str:
+    settings = get_settings()
+    config = active_model_config(account_id, user_id)
+    event_id = uuid.uuid4().hex
+    now = utc_now()
+    try:
+        with connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO llm_usage_events(
+                    id, account_id, user_id, session_id, request_label, lane, provider,
+                    model, base_url, status, started_at, created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    account_id or settings.default_account_id or DEFAULT_ACCOUNT_ID,
+                    user_id or "",
+                    session_id or "",
+                    truncate_text(label, 180),
+                    lane,
+                    config.get("provider") or settings.llm_provider,
+                    config.get("model") or settings.llm_model,
+                    config.get("base_url") or settings.llm_base_url,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+    except Exception:
+        return ""
+    return event_id
+
+
+def record_llm_usage_finish(event_id: str, status: str, *, error: str = "", started_monotonic: float | None = None) -> None:
+    if not event_id:
+        return
+    duration_ms = 0
+    if started_monotonic is not None:
+        duration_ms = max(0, int((asyncio.get_running_loop().time() - started_monotonic) * 1000))
+    now = utc_now()
+    try:
+        with connect() as conn:
+            conn.execute(
+                """
+                UPDATE llm_usage_events
+                SET status=?, duration_ms=?, error=?, finished_at=?, updated_at=?
+                WHERE id=?
+                """,
+                (status, duration_ms, truncate_text(error, 800), now, now, event_id),
+            )
+    except Exception:
+        return
+
+
+def llm_usage_snapshot(account_id: str = "") -> dict:
+    account_id = account_id or get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    with connect() as conn:
+        total_row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done_count,
+                SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
+                SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running_count,
+                AVG(CASE WHEN duration_ms > 0 THEN duration_ms ELSE NULL END) AS avg_duration_ms
+            FROM llm_usage_events
+            WHERE account_id=? AND created_at >= ?
+            """,
+            (account_id, cutoff),
+        ).fetchone()
+        by_model = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT provider, model, status, COUNT(*) AS count
+                FROM llm_usage_events
+                WHERE account_id=? AND created_at >= ?
+                GROUP BY provider, model, status
+                ORDER BY count DESC
+                LIMIT 20
+                """,
+                (account_id, cutoff),
+            )
+        ]
+        recent = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT id, session_id, request_label, lane, provider, model, status,
+                       duration_ms, error, started_at, finished_at, created_at
+                FROM llm_usage_events
+                WHERE account_id=?
+                ORDER BY created_at DESC
+                LIMIT 20
+                """,
+                (account_id,),
+            )
+        ]
+    total = int(total_row["total"] or 0) if total_row else 0
+    done = int(total_row["done_count"] or 0) if total_row else 0
+    failed = int(total_row["failed_count"] or 0) if total_row else 0
+    running = int(total_row["running_count"] or 0) if total_row else 0
+    return {
+        "account_id": account_id,
+        "window_hours": 24,
+        "total": total,
+        "done": done,
+        "failed": failed,
+        "running": running,
+        "success_rate": round(done / total, 3) if total else 0,
+        "avg_duration_ms": round(float(total_row["avg_duration_ms"]), 1) if total_row and total_row["avg_duration_ms"] is not None else 0,
+        "by_model": by_model,
+        "recent": recent,
+    }
+
+
+def schedule_memory_consolidation_if_due(*, force: bool = False, account_id: str = "") -> str | None:
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    account_id = account_id or get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    try:
+        with connect() as conn:
+            event_count = conn.execute("SELECT COUNT(*) AS count FROM memory_events WHERE account_id=?", (account_id,)).fetchone()["count"]
+            if not event_count:
+                return None
+            pending = conn.execute(
+                """
+                SELECT id
+                FROM task_runs
+                WHERE task_kind='memory_consolidation' AND account_id=? AND status IN ('queued', 'running')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (account_id,),
+            ).fetchone()
+            if pending and not force:
+                return pending["id"]
+            profile = conn.execute("SELECT updated_at FROM memory_profiles WHERE account_id=? AND scope='global'", (account_id,)).fetchone()
+            if profile and not force:
+                updated_at = parse_datetime(profile["updated_at"])
+                if updated_at and (now_dt - updated_at).total_seconds() < MEMORY_CONSOLIDATION_INTERVAL_SECONDS:
+                    return None
+            last_done = conn.execute(
+                """
+                SELECT finished_at, updated_at
+                FROM task_runs
+                WHERE task_kind='memory_consolidation' AND account_id=? AND status='done'
+                ORDER BY finished_at DESC, updated_at DESC
+                LIMIT 1
+                """,
+                (account_id,),
+            ).fetchone()
+            if last_done and not force:
+                last_at = parse_datetime(last_done["finished_at"] or last_done["updated_at"])
+                if last_at and (now_dt - last_at).total_seconds() < MEMORY_CONSOLIDATION_INTERVAL_SECONDS:
+                    return None
+        return record_task_run(
+            "memory_consolidation",
+            account_id=account_id,
+            payload={"account_id": account_id, "scope": "global", "scheduled_at": now, "force": force},
+            delay_seconds=0,
+            priority=TASK_PRIORITY_MEMORY,
+        )
+    except Exception:
+        return None
+
+
+def claim_task_run(*, task_id: str | None = None, respect_available_at: bool = True) -> dict | None:
+    now = utc_now()
+    where = ["status='queued'", "attempts < max_attempts"]
+    params: list[object] = []
+    if task_id:
+        where.append("id=?")
+        params.append(task_id)
+    if respect_available_at:
+        where.append("available_at <= ?")
+        params.append(now)
+    where_sql = " AND ".join(where)
+    with connect() as conn:
+        row = conn.execute(
+            f"""
+            SELECT id
+            FROM task_runs
+            WHERE {where_sql}
+            ORDER BY priority ASC, available_at ASC, created_at ASC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        if not row:
+            return None
+        cursor = conn.execute(
+            """
+            UPDATE task_runs
+            SET status='running', attempts=attempts + 1, started_at=?, updated_at=?, last_error=''
+            WHERE id=? AND status='queued' AND attempts < max_attempts
+            """,
+            (now, now, row["id"]),
+        )
+        if cursor.rowcount != 1:
+            return None
+        claimed = conn.execute("SELECT * FROM task_runs WHERE id=?", (row["id"],)).fetchone()
+    return dict(claimed) if claimed else None
+
+
+def claim_next_task_run() -> dict | None:
+    return claim_task_run(respect_available_at=True)
+
+
+async def execute_task_run_by_id(task_id: str) -> None:
+    task = claim_task_run(task_id=task_id, respect_available_at=False)
+    if task:
+        await execute_task_run(task)
+
+
+async def execute_next_task_run_now() -> None:
+    task = claim_task_run(respect_available_at=False)
+    if task:
+        await execute_task_run(task)
+
+
+def reschedule_task_run(task_id: str, error: str) -> None:
+    now_dt = datetime.now(timezone.utc)
+    next_at = (now_dt + timedelta(seconds=TASK_RETRY_DELAY_SECONDS)).isoformat()
+    now = now_dt.isoformat()
+    with connect() as conn:
+        row = conn.execute("SELECT attempts, max_attempts FROM task_runs WHERE id=?", (task_id,)).fetchone()
+        if not row:
+            return
+        if int(row["attempts"] or 0) >= int(row["max_attempts"] or 3):
+            conn.execute(
+                """
+                UPDATE task_runs
+                SET status='failed', last_error=?, finished_at=?, updated_at=?
+                WHERE id=?
+                """,
+                (truncate_text(error, 1000), now, now, task_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE task_runs
+                SET status='queued', last_error=?, available_at=?, updated_at=?
+                WHERE id=?
+                """,
+                (truncate_text(error, 1000), next_at, now, task_id),
+            )
+
+
+async def execute_task_run(task: dict) -> None:
+    task_id = task["id"]
+    payload = {}
+    try:
+        loaded = json.loads(task.get("payload") or "{}")
+        payload = loaded if isinstance(loaded, dict) else {}
+    except json.JSONDecodeError:
+        payload = {}
+    try:
+        if task["task_kind"] == "vision_analysis":
+            analysis_id = task.get("analysis_id") or payload.get("analysis_id")
+            session_id = task.get("session_id") or payload.get("session_id")
+            if not analysis_id or not session_id:
+                raise RuntimeError("vision task missing analysis_id/session_id")
+            with connect() as conn:
+                row = conn.execute("SELECT batch_id, prompt, scope, status FROM analyses WHERE id=?", (analysis_id,)).fetchone()
+            if not row:
+                raise RuntimeError(f"analysis not found: {analysis_id}")
+            if row["status"] == "done":
+                mark_task_run(task_id, "done")
+                return
+            filenames = [str(name) for name in payload.get("filenames") or []]
+            summarize = bool(payload.get("scope") == "batch" or row["scope"] == "batch")
+            status, content = await run_analysis(analysis_id, session_id, row["batch_id"], row["prompt"], filenames, summarize, task_id, already_claimed=True)
+            if status == "done":
+                mark_task_run(task_id, "done")
+            else:
+                reschedule_task_run(task_id, content)
+            return
+        if task["task_kind"] == "final_report":
+            analysis_id = task.get("analysis_id") or payload.get("analysis_id")
+            session_id = task.get("session_id") or payload.get("session_id")
+            if not analysis_id or not session_id:
+                raise RuntimeError("final report task missing analysis_id/session_id")
+            with connect() as conn:
+                row = conn.execute("SELECT status FROM analyses WHERE id=?", (analysis_id,)).fetchone()
+            if row and row["status"] == "done":
+                mark_task_run(task_id, "done")
+                return
+            status, content = await run_final_report(analysis_id, session_id, task_id, already_claimed=True)
+            if status == "done":
+                mark_task_run(task_id, "done")
+            else:
+                reschedule_task_run(task_id, content)
+            return
+        if task["task_kind"] == "memory_consolidation":
+            await run_memory_consolidation(task_id=task_id, account_id=payload.get("account_id") or task.get("account_id") or "")
+            mark_task_run(task_id, "done")
+            return
+        if task["task_kind"] == "qa_session_summary":
+            analysis_id = task.get("analysis_id") or payload.get("analysis_id")
+            session_id = task.get("session_id") or payload.get("session_id")
+            if not analysis_id or not session_id:
+                raise RuntimeError("QA summary task missing analysis_id/session_id")
+            with connect() as conn:
+                row = conn.execute("SELECT status FROM analyses WHERE id=?", (analysis_id,)).fetchone()
+            if row and row["status"] == "done":
+                mark_task_run(task_id, "done")
+                return
+            status, content = await run_qa_session_summary(analysis_id, session_id, task_id, already_claimed=True)
+            if status == "done":
+                mark_task_run(task_id, "done")
+            else:
+                reschedule_task_run(task_id, content)
+            return
+        raise RuntimeError(f"unknown task kind: {task['task_kind']}")
+    except Exception as exc:
+        reschedule_task_run(task_id, str(exc))
+
+
+async def task_dispatcher_loop() -> None:
+    while True:
+        try:
+            recover_interrupted_tasks()
+            task = claim_next_task_run()
+            if task:
+                asyncio.create_task(execute_task_run(task))
+                await asyncio.sleep(0.1)
+                continue
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+
+
+def normalize_llm_priority(priority: int | str | None) -> int:
+    if isinstance(priority, str):
+        normalized = priority.strip().lower()
+        if normalized in {"realtime", "interactive", "qa", "voice", "gesture", "high"}:
+            return LLM_PRIORITY_REALTIME
+        if normalized in {"background", "batch", "vision", "report", "normal", "low"}:
+            return LLM_PRIORITY_BACKGROUND
+    try:
+        return max(0, min(1000, int(priority if priority is not None else LLM_PRIORITY_BACKGROUND)))
+    except (TypeError, ValueError):
+        return LLM_PRIORITY_BACKGROUND
+
+
+def llm_gate_waiting_counts() -> dict[str, int]:
+    realtime = sum(1 for waiter in llm_gate_waiters.values() if int(waiter.get("priority", LLM_PRIORITY_BACKGROUND)) <= LLM_PRIORITY_REALTIME)
+    background = max(0, len(llm_gate_waiters) - realtime)
+    return {"realtime": realtime, "background": background, "total": len(llm_gate_waiters)}
+
+
+def llm_gate_next_waiter_id() -> str | None:
+    if not llm_gate_waiters:
+        return None
+    return min(
+        llm_gate_waiters,
+        key=lambda key: (
+            int(llm_gate_waiters[key].get("priority", LLM_PRIORITY_BACKGROUND)),
+            int(llm_gate_waiters[key].get("seq", 0)),
+        ),
+    )
+
+
+async def run_with_llm_gate(
+    label: str,
+    session_id: str | None,
+    call,
+    *,
+    priority: int | str = LLM_PRIORITY_BACKGROUND,
+    account_id: str = "",
+    user_id: str = "",
+):
+    global llm_gate_inflight, llm_gate_waiting, llm_gate_last_started_at, llm_gate_wait_seq
+    global llm_gate_inflight_realtime, llm_gate_inflight_background
+    account_id, user_id = session_llm_identity(session_id, account_id=account_id, user_id=user_id)
+    settings = effective_llm_settings(account_id, user_id)
+    max_concurrency = normalize_llm_max_concurrency(settings.llm_max_concurrency)
+    min_interval = normalize_llm_min_interval(settings.llm_min_interval_seconds)
+    normalized_priority = normalize_llm_priority(priority)
+    lane = "realtime" if normalized_priority <= LLM_PRIORITY_REALTIME else "background"
+    warned = False
+    waiter_id = uuid.uuid4().hex
+    registered_waiter = False
+    usage_event_id = ""
+    usage_started_at: float | None = None
+    try:
+        while True:
+            async with llm_gate_lock:
+                loop = asyncio.get_running_loop()
+                now = loop.time()
+                if not registered_waiter:
+                    llm_gate_wait_seq += 1
+                    llm_gate_waiters[waiter_id] = {
+                        "priority": normalized_priority,
+                        "seq": llm_gate_wait_seq,
+                        "label": label,
+                        "session_id": session_id or "",
+                        "lane": lane,
+                    }
+                    registered_waiter = True
+                next_waiter_id = llm_gate_next_waiter_id()
+                wait_for_slot = llm_gate_inflight >= max_concurrency
+                wait_for_interval = (
+                    lane != "realtime"
+                    and llm_gate_last_started_at > 0
+                    and now - llm_gate_last_started_at < min_interval
+                )
+                wait_for_priority = next_waiter_id != waiter_id
+                if not wait_for_slot and not wait_for_interval and not wait_for_priority:
+                    llm_gate_waiters.pop(waiter_id, None)
+                    registered_waiter = False
+                    llm_gate_waiting = len(llm_gate_waiters)
+                    llm_gate_inflight += 1
+                    if lane == "realtime":
+                        llm_gate_inflight_realtime += 1
+                    else:
+                        llm_gate_inflight_background += 1
+                    llm_gate_last_started_at = now
+                    counts = llm_gate_waiting_counts()
+                    emit_llm_gate_log(
+                        (
+                            f"LLM 请求放行：{label}；优先级={lane}；并发={llm_gate_inflight}/{max_concurrency} "
+                            f"(实时={llm_gate_inflight_realtime} 后台={llm_gate_inflight_background})；"
+                            f"排队={counts['total']} (实时={counts['realtime']} 后台={counts['background']})；"
+                            f"最小间隔={min_interval:.1f}s{'，实时请求已绕过间隔' if lane == 'realtime' else ''}"
+                        ),
+                        session_id=session_id,
+                    )
+                    break
+                llm_gate_waiting = len(llm_gate_waiters)
+                wait_seconds = 1.0
+                if wait_for_interval:
+                    wait_seconds = max(0.5, min(min_interval - (now - llm_gate_last_started_at), 5.0))
+                warn_size = max(1, int(settings.llm_queue_warn_size or 1))
+                if not warned and llm_gate_waiting >= warn_size:
+                    warned = True
+                    counts = llm_gate_waiting_counts()
+                    emit_llm_gate_log(
+                        (
+                            f"LLM 请求排队：{label}；优先级={lane}；当前并发={llm_gate_inflight}，"
+                            f"排队={counts['total']} (实时={counts['realtime']} 后台={counts['background']})，"
+                            f"限制={max_concurrency}，等待模型空闲"
+                        ),
+                        session_id=session_id,
+                        level="warning",
+                    )
+            await asyncio.sleep(wait_seconds)
+    finally:
+        if registered_waiter:
+            async with llm_gate_lock:
+                llm_gate_waiters.pop(waiter_id, None)
+                llm_gate_waiting = len(llm_gate_waiters)
+    try:
+        usage_started_at = asyncio.get_running_loop().time()
+        usage_event_id = record_llm_usage_start(label, session_id, lane, account_id, user_id)
+        result = await call()
+        record_llm_usage_finish(usage_event_id, "done", started_monotonic=usage_started_at)
+        return result
+    except Exception as exc:
+        record_llm_usage_finish(usage_event_id, "failed", error=str(exc), started_monotonic=usage_started_at)
+        raise
+    finally:
+        async with llm_gate_lock:
+            llm_gate_inflight = max(0, llm_gate_inflight - 1)
+            if lane == "realtime":
+                llm_gate_inflight_realtime = max(0, llm_gate_inflight_realtime - 1)
+            else:
+                llm_gate_inflight_background = max(0, llm_gate_inflight_background - 1)
+
+
+def analysis_needs_clarity_warning(content: str) -> bool:
+    text = (content or "").strip()
+    if not text:
+        return False
+    return any(signal in text for signal in UNCLEAR_ANALYSIS_SIGNALS)
 
 
 def row_to_dict(row) -> dict:
     return dict(row) if row is not None else {}
 
 
-async def save_upload(upload: UploadFile, session_id: str, kind: str, batch_id: str | None = None) -> tuple[str, str]:
+def analysis_public_columns() -> str:
+    return "id, session_id, batch_id, scope, status, content, created_at, updated_at"
+
+
+def image_public_columns() -> str:
+    return (
+        "id, session_id, batch_id, kind, filename, original_name, "
+        "page_hint, question_hint, captured_at, sequence_index, created_at"
+    )
+
+
+def image_public_select(alias: str = "images") -> str:
+    return (
+        f"{alias}.id, {alias}.session_id, {alias}.batch_id, {alias}.kind, {alias}.filename, {alias}.original_name, "
+        f"{alias}.page_hint, {alias}.question_hint, {alias}.captured_at, {alias}.sequence_index, {alias}.created_at, "
+        "COALESCE(obs.novelty_status, 'unknown') AS novelty_status, "
+        "COALESCE(obs.signal_summary, '') AS signal_summary"
+    )
+
+
+def thumbnail_path_for(filename: str) -> Path:
+    return get_settings().data_dir / "thumbnails" / f"{Path(filename).stem}.jpg"
+
+
+def create_thumbnail(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(source) as image:
+        image = ImageOps.exif_transpose(image)
+        if image.mode in ("RGBA", "LA"):
+            background = Image.new("RGB", image.size, (255, 255, 255))
+            background.paste(image.convert("RGB"), mask=image.getchannel("A"))
+            image = background
+        elif image.mode != "RGB":
+            image = image.convert("RGB")
+        image.thumbnail((THUMBNAIL_MAX_SIDE, THUMBNAIL_MAX_SIDE), Image.Resampling.LANCZOS)
+        out = BytesIO()
+        image.save(out, format="JPEG", quality=THUMBNAIL_QUALITY, optimize=True)
+    temp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_bytes(out.getvalue())
+        temp.replace(target)
+    finally:
+        if temp.exists():
+            temp.unlink()
+
+
+def image_path_for_request(filename: str) -> Path:
+    if Path(filename).name != filename:
+        raise HTTPException(400, "invalid filename")
+    settings = get_settings()
+    image_dir = (settings.data_dir / "images").resolve()
+    path = (image_dir / filename).resolve()
+    if not path.is_relative_to(image_dir):
+        raise HTTPException(400, "invalid filename")
+    if not path.is_file():
+        raise HTTPException(404, "image not found")
+    return path
+
+
+def json_dumps(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def truncate_text(value: object, max_chars: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 20:
+        return text[:max_chars]
+    omitted = len(text) - max_chars
+    marker = f"\n...[已截断约 {omitted} 字]...\n"
+    remaining = max_chars - len(marker)
+    if remaining <= 0:
+        return text[:max_chars]
+    head_chars = max(1, int(remaining * 0.7))
+    tail_chars = max(0, remaining - head_chars)
+    tail = text[-tail_chars:].lstrip() if tail_chars else ""
+    return f"{text[:head_chars].rstrip()}{marker}{tail}"
+
+
+def compact_capture_meta(raw: str | None, max_chars: int = FINAL_REPORT_CAPTURE_META_CHAR_LIMIT) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return "{}"
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return truncate_text(text, max_chars)
+    if not isinstance(data, dict):
+        return truncate_text(text, max_chars)
+    priority_keys = (
+        "signal_summary",
+        "presence_summary",
+        "presenceSummary",
+        "student_presence_status",
+        "studentPresenceStatus",
+        "student_presence",
+        "studentPresence",
+        "has_student_presence",
+        "hasStudentPresence",
+        "hand_count",
+        "handCount",
+        "face_count",
+        "faceCount",
+        "body_count",
+        "bodyCount",
+        "activity_summary",
+        "activitySummary",
+        "action_summary",
+        "actionSummary",
+        "page_hint",
+        "pageHint",
+        "question_hint",
+        "questionHint",
+        "motion_summary",
+        "motionSummary",
+        "ocr_summary",
+        "ocrSummary",
+    )
+    compact = {key: data[key] for key in priority_keys if data.get(key) not in (None, "")}
+    return truncate_text(json_dumps(compact or data), max_chars)
+
+
+def capture_meta_dict(raw: str | None) -> dict:
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def parse_capture_meta(raw: str, expected_count: int) -> list[dict]:
+    if not raw.strip():
+        return [{} for _ in range(expected_count)]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return [{} for _ in range(expected_count)]
+    if isinstance(data, dict):
+        data = data.get("frames") or data.get("images") or data.get("captures") or []
+    if not isinstance(data, list):
+        return [{} for _ in range(expected_count)]
+    parsed: list[dict] = []
+    for index in range(expected_count):
+        item = data[index] if index < len(data) else {}
+        parsed.append(item if isinstance(item, dict) else {})
+    return parsed
+
+
+def meta_string(meta: dict) -> str:
+    return json_dumps(meta) if meta else ""
+
+
+def meta_text(meta: dict, *keys: str) -> str:
+    for key in keys:
+        value = meta.get(key)
+        if value is not None:
+            return str(value)
+    return ""
+
+
+def meta_bool(meta: dict, *keys: str) -> bool | None:
+    for key in keys:
+        value = meta.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "y", "present", "visible"}:
+                return True
+            if normalized in {"false", "0", "no", "n", "absent", "none", "not_detected"}:
+                return False
+    return None
+
+
+def meta_int(meta: dict, *keys: str) -> int | None:
+    for key in keys:
+        value = meta.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def meta_float(meta: dict, *keys: str) -> float | None:
+    for key in keys:
+        value = meta.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def meta_list(meta: dict, *keys: str) -> list:
+    for key in keys:
+        value = meta.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return parsed
+            return [part.strip() for part in re.split(r"[,，\s]+", value) if part.strip()]
+    return []
+
+
+def normalize_text_token(value: object) -> str:
+    token = str(value or "").strip().replace(" ", "")
+    return token[:80]
+
+
+def normalized_text_tokens(meta: dict) -> list[str]:
+    tokens = [normalize_text_token(item) for item in meta_list(meta, "text_tokens", "textTokens", "ocr_tokens", "ocrTokens")]
+    seen: set[str] = set()
+    result: list[str] = []
+    for token in tokens:
+        if len(token) < 2 or token in seen:
+            continue
+        seen.add(token)
+        result.append(token)
+        if len(result) >= 80:
+            break
+    return result
+
+
+def meta_dict(meta: dict, *keys: str) -> dict:
+    for key in keys:
+        value = meta.get(key)
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                return parsed
+    return {}
+
+
+def image_quality_metrics(path: Path) -> dict:
+    try:
+        with Image.open(path) as image:
+            gray = ImageOps.grayscale(image)
+            gray.thumbnail((64, 64), Image.Resampling.BILINEAR)
+            pixels = list(gray.getdata())
+            width, height = gray.size
+    except Exception:
+        return {}
+    if not pixels or width < 3 or height < 3:
+        return {}
+    light_pixels = sum(1 for value in pixels if value > 168)
+    light_coverage = light_pixels / max(1, len(pixels))
+    edge_pixels = 0
+    contrast_total = 0.0
+    edge_checks = 0
+    for y in range(height - 1):
+        for x in range(width - 1):
+            value = pixels[y * width + x]
+            right = pixels[y * width + x + 1]
+            below = pixels[(y + 1) * width + x]
+            for other in (right, below):
+                diff = abs(int(value) - int(other))
+                contrast_total += diff
+                edge_checks += 1
+                if diff > 18:
+                    edge_pixels += 1
+    edge_density = edge_pixels / max(1, edge_checks)
+    contrast = contrast_total / max(1, edge_checks)
+    return {
+        "light_coverage": light_coverage,
+        "edge_density": edge_density,
+        "contrast": contrast,
+    }
+
+
+def normalized_quality_reasons(meta: dict) -> set[str]:
+    return {str(reason).strip() for reason in meta_list(meta, "reasons", "quality_reasons", "qualityReasons") if str(reason).strip()}
+
+
+def image_content_verdict(meta: dict, filename: str | None = None) -> dict:
+    """Conservative global gate: reject only frames that are clearly unrelated or unusable."""
+    source = (
+        meta_dict(meta, "image_quality", "imageQuality", "frame_quality", "frameQuality")
+        or meta_dict(meta, "qa_frame_quality", "qaFrameQuality")
+        or meta
+    )
+    merged = dict(source)
+    text_tokens = normalized_text_tokens(source) or normalized_text_tokens(meta)
+    text_count = meta_int(source, "text_count", "textCount", "ocr_count", "ocrCount")
+    rectangle_count = meta_int(source, "rectangle_count", "rectangleCount")
+    material_confidence = meta_float(source, "material_confidence", "materialConfidence")
+    blur_score = meta_float(source, "blur_score", "blurScore")
+    light_coverage = meta_float(source, "light_coverage", "lightCoverage")
+    edge_density = meta_float(source, "edge_density", "edgeDensity")
+    contrast = meta_float(source, "contrast")
+
+    if (
+        filename
+        and (
+            light_coverage is None
+            or edge_density is None
+            or contrast is None
+        )
+    ):
+        metrics = image_quality_metrics(image_path_for_request(filename))
+        merged.update(metrics)
+        light_coverage = meta_float(merged, "light_coverage", "lightCoverage")
+        edge_density = meta_float(merged, "edge_density", "edgeDensity")
+        contrast = meta_float(merged, "contrast")
+
+    if text_count is None:
+        text_count = len(text_tokens)
+    if blur_score is None and edge_density is not None:
+        blur_score = max(0.0, min(1.0, edge_density / 0.06))
+
+    weak_text_count = max(text_count or 0, len(text_tokens))
+    weak_rectangle_count = max(rectangle_count or 0, 0)
+    has_material = meta_bool(source, "has_study_material", "hasStudyMaterial", "material_visible", "materialVisible")
+    has_explicit_evidence = meta_bool(
+        source,
+        "has_explicit_study_evidence",
+        "hasExplicitStudyEvidence",
+        "explicit_study_evidence",
+        "explicitStudyEvidence",
+    )
+    should_upload = meta_bool(source, "should_upload", "shouldUpload", "should_use", "shouldUse", "eligible")
+    quality_status = meta_text(source, "quality_status", "qualityStatus", "status").strip().lower()
+    reasons = normalized_quality_reasons(source)
+
+    metrics_present = light_coverage is not None and edge_density is not None and contrast is not None
+    usable_texture = bool(
+        metrics_present
+        and light_coverage >= IMAGE_VALIDITY_MIN_LIGHT_COVERAGE
+        and edge_density >= IMAGE_VALIDITY_MIN_EDGE_DENSITY
+        and contrast >= IMAGE_VALIDITY_MIN_CONTRAST
+    )
+    explicit_study_evidence = (
+        has_explicit_evidence is True
+        or weak_text_count >= IMAGE_VALIDITY_MIN_TEXT_TOKENS
+        or weak_rectangle_count >= IMAGE_VALIDITY_MIN_RECTANGLES
+    )
+    material_visible = (
+        has_material is True
+        or explicit_study_evidence
+        or (material_confidence is not None and material_confidence >= IMAGE_VALIDITY_STRONG_MATERIAL_CONFIDENCE)
+        or (
+            material_confidence is not None
+            and material_confidence >= IMAGE_VALIDITY_SOFT_MATERIAL_CONFIDENCE
+            and usable_texture
+        )
+    )
+
+    payload = {
+        "valid": True,
+        "reason": "study_material_visible",
+        "detail": "画面包含学习材料线索",
+        "text_tokens": text_tokens,
+        "text_count": weak_text_count,
+        "rectangle_count": weak_rectangle_count,
+        "material_confidence": material_confidence,
+        "blur_score": blur_score,
+        "light_coverage": light_coverage,
+        "edge_density": edge_density,
+        "contrast": contrast,
+    }
+    if material_visible and (explicit_study_evidence or usable_texture or has_material is True):
+        return payload
+    if should_upload is True and material_visible:
+        return {**payload, "reason": "client_accepted"}
+
+    explicit_rejection = (
+        should_upload is False
+        or has_material is False
+        or has_explicit_evidence is False
+        or quality_status in {"low_quality", "invalid", "rejected", "empty", "unrelated"}
+        or bool(reasons & {"no_material", "too_blurry", "heavy_occlusion", "empty_frame", "unrelated"})
+    )
+    if explicit_rejection and not material_visible:
+        return {
+            **payload,
+            "valid": False,
+            "reason": "no_study_material",
+            "detail": "画面无明确学习材料，已自动忽略",
+        }
+
+    if metrics_present:
+        if (
+            light_coverage < IMAGE_VALIDITY_MIN_LIGHT_COVERAGE
+            or edge_density < IMAGE_VALIDITY_MIN_EDGE_DENSITY
+            or contrast < IMAGE_VALIDITY_MIN_CONTRAST
+        ) and weak_text_count == 0 and weak_rectangle_count == 0:
+            return {
+                **payload,
+                "valid": False,
+                "reason": "image_metrics_low",
+                "detail": f"画面缺少可用纸面/屏幕纹理 edge={edge_density:.3f} contrast={contrast:.1f}",
+            }
+        if blur_score is not None and blur_score < IMAGE_VALIDITY_BLUR_MIN_WITHOUT_TEXT and weak_text_count == 0:
+            return {
+                **payload,
+                "valid": False,
+                "reason": "too_blurry",
+                "detail": "画面模糊且没有可用文字线索，已自动忽略",
+            }
+        return {
+            **payload,
+            "valid": None,
+            "reason": "unknown",
+            "detail": "画面学习价值不确定，保守保留",
+        }
+
+    return {
+        **payload,
+        "valid": None,
+        "reason": "unknown",
+        "detail": "缺少足够的画面有效性元数据，保守保留",
+    }
+
+
+def capture_meta_with_image_verdict(meta: dict, verdict: dict) -> dict:
+    next_meta = dict(meta or {})
+    next_meta["image_content_verdict"] = {
+        "valid": verdict.get("valid"),
+        "reason": verdict.get("reason") or "",
+        "detail": verdict.get("detail") or "",
+        "text_count": verdict.get("text_count") or 0,
+        "rectangle_count": verdict.get("rectangle_count") or 0,
+        "material_confidence": verdict.get("material_confidence"),
+        "blur_score": verdict.get("blur_score"),
+        "edge_density": verdict.get("edge_density"),
+        "contrast": verdict.get("contrast"),
+        "light_coverage": verdict.get("light_coverage"),
+    }
+    next_meta["image_content_valid"] = verdict.get("valid")
+    next_meta["image_content_reason"] = verdict.get("reason") or ""
+    if verdict.get("valid") is False:
+        next_meta["discarded_before_analysis"] = True
+        next_meta["discard_reason"] = verdict.get("reason") or "invalid_image"
+        next_meta["discard_detail"] = verdict.get("detail") or ""
+    return next_meta
+
+
+def qa_frame_quality_from_meta(meta: dict) -> dict:
+    qa_context = meta_dict(meta, "qa_context", "qaContext", "context")
+    qa_quality = (
+        meta_dict(meta, "qa_frame_quality", "qaFrameQuality", "frame_quality", "frameQuality")
+        or meta_dict(qa_context, "qa_frame_quality", "qaFrameQuality", "frame_quality", "frameQuality")
+    )
+    source = qa_quality if qa_quality else meta
+    text_tokens = normalized_text_tokens(source) or normalized_text_tokens(meta) or normalized_text_tokens(qa_context)
+    eligible = meta_bool(source, "qa_context_eligible", "qaContextEligible", "eligible", "should_use", "shouldUse")
+    client_submitted_for_qa = meta_bool(source, "should_upload_for_qa", "shouldUploadForQA", "submitted_current_frame", "submittedCurrentFrame")
+    has_material = meta_bool(source, "has_study_material", "hasStudyMaterial", "material_visible", "materialVisible")
+    reliable_qa_context = meta_bool(source, "qa_reliable_context", "qaReliableContext", "reliable_qa_context", "reliableQaContext")
+    has_explicit_evidence = meta_bool(source, "has_explicit_study_evidence", "hasExplicitStudyEvidence", "explicit_study_evidence", "explicitStudyEvidence")
+    text_count = meta_int(source, "text_count", "textCount", "ocr_count", "ocrCount")
+    rectangle_count = meta_int(source, "rectangle_count", "rectangleCount")
+    material_confidence = meta_float(source, "material_confidence", "materialConfidence")
+    blur_score = meta_float(source, "blur_score", "blurScore")
+    light_coverage = meta_float(source, "light_coverage", "lightCoverage")
+    edge_density = meta_float(source, "edge_density", "edgeDensity")
+    contrast = meta_float(source, "contrast")
+    reasons = [str(reason) for reason in meta_list(source, "reasons", "quality_reasons", "qualityReasons") if str(reason).strip()]
+    weak_text_count = 0 if text_count is None else text_count
+    weak_rectangle_count = 0 if rectangle_count is None else rectangle_count
+    student_intent = normalize_qa_student_intent(
+        meta_text(qa_context, "student_intent", "studentIntent", "intent_hint", "intentHint", "qa_intent", "qaIntent", "intent")
+        or meta_text(meta, "student_intent", "studentIntent", "intent_hint", "intentHint", "qa_intent", "qaIntent", "intent")
+    )
+    is_visual_review_intent = student_intent in QA_VISUAL_REVIEW_INTENTS
+    has_reliable_structure = (
+        weak_text_count >= QA_MIN_TEXT_FOR_CONTEXT
+        or (weak_text_count >= QA_MIN_TEXT_WITH_RECTANGLE_FOR_CONTEXT and weak_rectangle_count >= 1)
+        or weak_rectangle_count >= QA_MIN_RECTANGLES_WITHOUT_TEXT_FOR_CONTEXT
+    )
+    has_review_material_evidence = (
+        is_visual_review_intent
+        and (
+            has_material is True
+            or has_explicit_evidence is True
+            or reliable_qa_context is True
+            or (material_confidence is not None and material_confidence >= QA_IMAGE_MATERIAL_CONFIDENCE_MIN)
+        )
+        and (
+            weak_text_count >= 1
+            or weak_rectangle_count >= 1
+            or (
+                light_coverage is not None
+                and edge_density is not None
+                and contrast is not None
+                and light_coverage >= QA_IMAGE_LIGHT_COVERAGE_MIN
+                and edge_density >= QA_IMAGE_EDGE_DENSITY_MIN
+                and contrast >= QA_IMAGE_CONTRAST_MIN
+            )
+        )
+    )
+    if eligible is False and has_review_material_evidence:
+        return {
+            "eligible": True,
+            "reason": "visual_review_material",
+            "detail": "学生请求核对/订正，当前画面含学习材料证据",
+            "text_tokens": text_tokens,
+        }
+    if eligible is False and client_submitted_for_qa is not True:
+        return {
+            "eligible": False,
+            "reason": "client_rejected",
+            "detail": ";".join(reasons) or "客户端判断当前画面不适合做问答上下文",
+            "text_tokens": text_tokens,
+        }
+    if reliable_qa_context is False and not has_review_material_evidence:
+        return {
+            "eligible": False,
+            "reason": "no_explicit_study_evidence",
+            "detail": "当前抓拍缺少文字、题目边框或屏幕特征",
+            "text_tokens": text_tokens,
+        }
+    if has_explicit_evidence is False and not has_review_material_evidence:
+        return {
+            "eligible": False,
+            "reason": "no_explicit_study_evidence",
+            "detail": "当前抓拍缺少明确学习材料证据",
+            "text_tokens": text_tokens,
+        }
+    if (text_count is not None or rectangle_count is not None) and not has_reliable_structure and not has_review_material_evidence:
+        return {
+            "eligible": False,
+            "reason": "no_explicit_study_evidence",
+            "detail": "当前抓拍没有足够题目文字或纸张/屏幕结构，已沿用已有上下文",
+            "text_tokens": text_tokens,
+        }
+    if eligible is True:
+        return {
+            "eligible": True,
+            "reason": "client_accepted",
+            "detail": "客户端判断当前画面适合做问答上下文",
+            "text_tokens": text_tokens,
+        }
+    if has_review_material_evidence:
+        return {
+            "eligible": True,
+            "reason": "visual_review_material",
+            "detail": "学生请求核对/订正，当前画面含学习材料证据",
+            "text_tokens": text_tokens,
+        }
+    if has_material is False:
+        return {
+            "eligible": False,
+            "reason": "no_study_material",
+            "detail": "客户端未检测到课本、试卷或电子屏幕",
+            "text_tokens": text_tokens,
+        }
+    if len(text_tokens) >= QA_MIN_TEXT_FOR_CONTEXT:
+        return {"eligible": True, "reason": "ocr_tokens", "detail": "检测到可用文字", "text_tokens": text_tokens}
+    if len(text_tokens) >= QA_MIN_TEXT_WITH_RECTANGLE_FOR_CONTEXT and weak_rectangle_count >= 1:
+        return {"eligible": True, "reason": "ocr_tokens_with_structure", "detail": "检测到文字和题目结构", "text_tokens": text_tokens}
+    if len(text_tokens) > 0:
+        return {
+            "eligible": False,
+            "reason": "weak_ocr_evidence",
+            "detail": "当前抓拍文字线索不足，已沿用已有上下文",
+            "text_tokens": text_tokens,
+        }
+    if material_confidence is not None and material_confidence >= QA_IMAGE_MATERIAL_CONFIDENCE_MIN:
+        if weak_rectangle_count >= QA_MIN_RECTANGLES_WITHOUT_TEXT_FOR_CONTEXT:
+            return {"eligible": True, "reason": "material_confidence", "detail": f"学习材料置信度 {material_confidence:.2f}", "text_tokens": text_tokens}
+        return {
+            "eligible": False,
+            "reason": "weak_visual_evidence",
+            "detail": "当前抓拍只有弱视觉特征，已沿用已有上下文",
+            "text_tokens": text_tokens,
+        }
+    if has_material is True and (blur_score is None or blur_score >= 0.25):
+        if weak_rectangle_count >= QA_MIN_RECTANGLES_WITHOUT_TEXT_FOR_CONTEXT or len(text_tokens) >= QA_MIN_TEXT_WITH_RECTANGLE_FOR_CONTEXT:
+            return {"eligible": True, "reason": "material_visible", "detail": "客户端检测到学习材料可见", "text_tokens": text_tokens}
+        return {
+            "eligible": False,
+            "reason": "weak_visual_evidence",
+            "detail": "当前抓拍缺少可用题目信息，已沿用已有上下文",
+            "text_tokens": text_tokens,
+        }
+    if light_coverage is not None and edge_density is not None and contrast is not None:
+        if (
+            light_coverage >= QA_IMAGE_LIGHT_COVERAGE_MIN
+            and edge_density >= QA_IMAGE_EDGE_DENSITY_MIN
+            and contrast >= QA_IMAGE_CONTRAST_MIN
+            and has_reliable_structure
+        ):
+            return {
+                "eligible": True,
+                "reason": "image_metrics",
+                "detail": f"图像纹理/亮度可用 edge={edge_density:.3f} contrast={contrast:.1f}",
+                "text_tokens": text_tokens,
+            }
+        return {
+            "eligible": False,
+            "reason": "image_metrics_low",
+            "detail": f"图像缺少清晰纸面/屏幕特征 edge={edge_density:.3f} contrast={contrast:.1f}",
+            "text_tokens": text_tokens,
+        }
+    return {"eligible": None, "reason": "unknown", "detail": "缺少足够的画面质量元数据", "text_tokens": text_tokens}
+
+
+def qa_uploaded_frame_quality(meta: dict, filename: str | None) -> dict:
+    quality = qa_frame_quality_from_meta(meta)
+    if quality.get("eligible") is not None:
+        return quality
+    if filename:
+        metrics = image_quality_metrics(image_path_for_request(filename))
+        if metrics:
+            merged = dict(meta)
+            merged.update(metrics)
+            return qa_frame_quality_from_meta(merged)
+    return {
+        "eligible": False,
+        "reason": quality.get("reason") or "unknown",
+        "detail": quality.get("detail") or "无法确认当前画面是否包含清晰题目",
+        "text_tokens": quality.get("text_tokens") or [],
+    }
+
+
+def qa_turn_index(context: dict) -> int:
+    try:
+        return int(context.get("turn") or context.get("qa_turn") or context.get("qaTurn") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def qa_question_has_new_problem_reference(question: str) -> bool:
+    text = (question or "").strip().lower()
+    if not text:
+        return False
+    patterns = (
+        r"第\s*[\d一二三四五六七八九十]+\s*[题頁页]",
+        r"[\d一二三四五六七八九十]+\s*[题頁页]",
+        r"problem\s*\d+",
+        r"question\s*\d+",
+        r"page\s*\d+",
+        r"换[一個个]?题",
+        r"下一题",
+        r"上一题",
+    )
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+
+
+def qa_current_frame_was_submitted(context: dict) -> bool:
+    return meta_bool(
+        context or {},
+        "current_frame_submitted",
+        "currentFrameSubmitted",
+        "submitted_current_frame",
+        "submittedCurrentFrame",
+    ) is True
+
+
+def qa_is_first_or_new_problem_turn(trigger: str, context: dict, question: str) -> bool:
+    return qa_turn_index(context) <= 1 or qa_question_has_new_problem_reference(question) or not qa_is_followup_like(trigger, context, question)
+
+
+def qa_context_string(context: dict, *keys: str) -> str:
+    for key in keys:
+        value = context.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def normalize_qa_student_intent(value: object) -> str:
+    raw = str(value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "review": "answer_check",
+        "answer_review": "answer_check",
+        "check_answer": "answer_check",
+        "answer_check": "answer_check",
+        "correction": "correction_check",
+        "correction_review": "correction_check",
+        "check_correction": "correction_check",
+        "correction_check": "correction_check",
+        "visual": "visual_check",
+        "look": "visual_check",
+        "look_check": "visual_check",
+        "visual_check": "visual_check",
+        "followup": "followup_explain",
+        "follow_up": "followup_explain",
+        "explain": "followup_explain",
+        "followup_explain": "followup_explain",
+        "new": "new_question",
+        "new_question": "new_question",
+        "normal": "new_question",
+        "normal_qa": "new_question",
+    }
+    return aliases.get(raw, "")
+
+
+def infer_qa_student_intent(trigger: str, context: dict, question: str) -> str:
+    explicit = normalize_qa_student_intent(
+        qa_context_string(
+            context,
+            "student_intent",
+            "studentIntent",
+            "qa_intent",
+            "qaIntent",
+            "intent_hint",
+            "intentHint",
+            "intent",
+            "intent_type",
+            "intentType",
+        )
+    )
+    if explicit:
+        return explicit
+    text = " ".join(
+        part
+        for part in (
+            question or "",
+            qa_context_string(context, "transcript", "recognized_text", "recognizedText"),
+            qa_context_string(context, "intent_hint", "intentHint"),
+        )
+        if part
+    ).strip()
+    compact = re.sub(r"\s+", "", text.lower())
+    if not compact:
+        return "followup_explain" if qa_is_followup_like(trigger, context, question) else "new_question"
+
+    correction_terms = (
+        "改完",
+        "改好了",
+        "改好",
+        "修改",
+        "改了",
+        "订正",
+        "修正",
+        "重写",
+        "重新写",
+        "写完",
+        "做完",
+        "算完",
+        "填完",
+        "改正",
+    )
+    check_terms = (
+        "看看",
+        "看下",
+        "看一下",
+        "再看",
+        "检查",
+        "核对",
+        "批改",
+        "对不对",
+        "对了吗",
+        "对了没",
+        "是否正确",
+        "是不是对",
+        "有没有错",
+        "还错",
+        "还对",
+        "正确吗",
+        "可以吗",
+        "行不行",
+    )
+    answer_terms = ("答案", "结果", "步骤", "过程", "这道", "这题", "这里", "这步")
+    visual_terms = ("看", "图片", "照片", "拍照", "画面", "镜头", "图上", "这张")
+    if any(term in compact for term in correction_terms) and any(term in compact for term in check_terms):
+        return "correction_check"
+    if any(term in compact for term in check_terms) and any(term in compact for term in answer_terms):
+        return "answer_check"
+    if any(term in compact for term in ("check", "correct", "right", "wrong")) and any(term in compact for term in ("answer", "work", "solution", "again", "fixed", "changed")):
+        return "correction_check" if any(term in compact for term in ("fixed", "changed", "corrected", "revised")) else "answer_check"
+    if any(term in compact for term in visual_terms) and any(term in compact for term in check_terms):
+        return "visual_check"
+    if qa_question_has_new_problem_reference(question):
+        return "new_question"
+    if qa_is_followup_like(trigger, context, question):
+        return "followup_explain"
+    return "new_question"
+
+
+def qa_is_followup_like(trigger: str, context: dict, question: str) -> bool:
+    normalized_trigger = (trigger or "").strip().lower()
+    if "follow" in normalized_trigger or "ok" in normalized_trigger:
+        return True
+    if qa_turn_index(context) >= 2:
+        return True
+    text = (question or "").strip()
+    followup_terms = ("继续", "刚才", "这里", "这个", "这步", "为什么", "哪里错", "再讲", "不懂", "追问")
+    return any(term in text for term in followup_terms)
+
+
+def qa_token_overlap_score(current_tokens: list[str], previous_tokens: list[str]) -> float:
+    current = {normalize_text_token(token).lower() for token in current_tokens if normalize_text_token(token)}
+    previous = {normalize_text_token(token).lower() for token in previous_tokens if normalize_text_token(token)}
+    if not current or not previous:
+        return 0.0
+    exact = len(current & previous)
+    partial = 0
+    for token in current:
+        if token in previous:
+            continue
+        if any(token in prior or prior in token for prior in previous if len(token) >= 2 and len(prior) >= 2):
+            partial += 1
+    return (exact + partial * 0.5) / max(1, min(len(current), len(previous)))
+
+
+def qa_quality_with_relevance(
+    quality: dict,
+    *,
+    question: str,
+    trigger: str,
+    context: dict,
+    student_intent: str = "",
+    previous_image_row: dict | None = None,
+) -> dict:
+    if quality.get("eligible") is not True:
+        return quality
+    current_tokens = [str(token) for token in quality.get("text_tokens") or [] if str(token).strip()]
+    if qa_is_first_or_new_problem_turn(trigger, context, question):
+        return {**quality, "relevance": "accepted_first_or_new_problem_current_frame"}
+    if not previous_image_row:
+        return {**quality, "relevance": "accepted_no_previous_frame"}
+    if student_intent in QA_VISUAL_REVIEW_INTENTS:
+        return {**quality, "relevance": f"accepted_{student_intent}_current_frame"}
+    previous_tokens = normalized_text_tokens(capture_meta_dict(previous_image_row.get("capture_meta")))
+    if len(current_tokens) < QA_MIN_TEXT_FOR_CONTEXT:
+        return {
+            **quality,
+            "eligible": False,
+            "reason": "weak_followup_frame",
+            "detail": "追问抓拍文字线索不足，已沿用上一轮上下文",
+            "relevance": "rejected_weak_followup_frame",
+            "previous_text_tokens": previous_tokens[:12],
+        }
+    if len(previous_tokens) < 2:
+        return {**quality, "relevance": "accepted_insufficient_previous_ocr_for_overlap"}
+    overlap = qa_token_overlap_score(current_tokens, previous_tokens)
+    if overlap < 0.12:
+        return {
+            **quality,
+            "eligible": False,
+            "reason": "unrelated_followup_frame",
+            "detail": f"追问画面与上一张学习画面文字线索不匹配 overlap={overlap:.2f}",
+            "relevance": "rejected_followup_token_mismatch",
+            "previous_text_tokens": previous_tokens[:12],
+        }
+    return {**quality, "relevance": "accepted_followup_overlap", "overlap": overlap}
+
+
+def qa_should_soft_accept_first_frame(quality: dict, *, question: str, trigger: str, context: dict, student_intent: str = "") -> bool:
+    if quality.get("eligible") is True:
+        return False
+    if student_intent in QA_VISUAL_REVIEW_INTENTS:
+        return False
+    if not qa_current_frame_was_submitted(context):
+        return False
+    if not qa_is_first_or_new_problem_turn(trigger, context, question):
+        return False
+    frame_quality = meta_dict(context or {}, "qa_frame_quality", "qaFrameQuality", "frame_quality", "frameQuality")
+    if meta_bool(frame_quality, "has_study_material", "hasStudyMaterial", "material_visible", "materialVisible") is False:
+        return False
+    reasons = {str(reason) for reason in meta_list(frame_quality, "reasons", "quality_reasons", "qualityReasons") if str(reason).strip()}
+    if {"no_material", "phone_away"} & reasons:
+        return False
+    reason = str(quality.get("reason") or "")
+    if reason in {"no_study_material", "client_rejected", "image_metrics_low", "unknown"}:
+        return False
+    tokens = [str(token) for token in quality.get("text_tokens") or [] if str(token).strip()]
+    if len(tokens) >= QA_MIN_TEXT_WITH_RECTANGLE_FOR_CONTEXT:
+        return True
+    if meta_bool(frame_quality, "has_study_material", "hasStudyMaterial", "material_visible", "materialVisible") is not True:
+        return False
+    detail = str(quality.get("detail") or "")
+    return any(marker in detail for marker in ("文字", "题目", "结构", "学习材料", "课本", "试卷", "屏幕"))
+
+
+def qa_context_rejected_from_meta(meta: dict) -> bool:
+    if meta_bool(meta, "qa_context_rejected", "qaContextRejected") is True:
+        return True
+    quality = qa_frame_quality_from_meta(meta)
+    if quality.get("eligible") is False:
+        return True
+    qa_quality = meta_dict(meta, "qa_frame_quality", "qaFrameQuality", "frame_quality", "frameQuality")
+    if meta_bool(qa_quality, "qa_context_rejected", "qaContextRejected") is True:
+        return True
+    return False
+
+
+def update_qa_image_context_verdict(image_id: str | None, quality: dict, *, accepted: bool) -> None:
+    if not image_id:
+        return
+    with connect() as conn:
+        row = conn.execute("SELECT capture_meta FROM images WHERE id=?", (image_id,)).fetchone()
+        if not row:
+            return
+        meta = capture_meta_dict(row["capture_meta"])
+        meta["qa_context_accepted"] = bool(accepted)
+        meta["qa_context_rejected"] = not bool(accepted)
+        meta["qa_context_verdict"] = "accepted" if accepted else "rejected"
+        meta["qa_context_rejected_reason"] = "" if accepted else str(quality.get("reason") or "unknown")
+        meta["qa_context_rejected_detail"] = "" if accepted else str(quality.get("detail") or "")
+        if quality:
+            merged_quality = dict(meta_dict(meta, "qa_frame_quality", "qaFrameQuality"))
+            merged_quality.update(quality)
+            merged_quality["qa_context_eligible"] = bool(accepted)
+            meta["qa_frame_quality"] = merged_quality
+        conn.execute("UPDATE images SET capture_meta=? WHERE id=?", (meta_string(meta), image_id))
+
+
+def qa_prompt_context(context: dict, *, current_image_rejected: bool) -> dict:
+    prompt_context = dict(context or {})
+    if current_image_rejected:
+        for key in ("qa_frame_quality", "qaFrameQuality", "frame_quality", "frameQuality"):
+            prompt_context.pop(key, None)
+        prompt_context["current_image_rejected"] = True
+        prompt_context["current_image_note"] = "The newly captured QA frame was rejected before prompt construction; do not use its OCR or visual metadata."
+    return prompt_context
+
+
+def dynamic_strategy_context(
+    session: dict,
+    context: dict,
+    *,
+    question: str,
+    trigger_type: str,
+    image_row: dict | None,
+    image_context_mode: str,
+) -> str:
+    client_dynamic = context.get("dynamic_strategy") if isinstance(context.get("dynamic_strategy"), dict) else {}
+    strategy_context = context.get("strategy_context") if isinstance(context.get("strategy_context"), dict) else {}
+    observation = context.get("observation_context") if isinstance(context.get("observation_context"), dict) else {}
+    frame_quality = context.get("qa_frame_quality") if isinstance(context.get("qa_frame_quality"), dict) else {}
+    memory_candidates = context.get("memory_digest_candidates") or context.get("long_term_memory_candidates") or []
+    if not isinstance(memory_candidates, list):
+        memory_candidates = []
+    formed_memories = important_memory_events(5)
+    lines = [
+        f"本轮触发：{trigger_type}；turn={context.get('turn') or client_dynamic.get('turn') or 'unknown'}；intent={context.get('student_intent') or 'unknown'}",
+        f"用户当前问题：{truncate_text(question, 180)}",
+        f"偏好：场景={context.get('learning_mode_title') or strategy_context.get('learning_mode_title') or '未指定'}；回答方式={context.get('coach_depth_title') or strategy_context.get('coach_depth_title') or '未指定'}",
+        f"当前画面：mode={image_context_mode}；selected_image_id={(image_row or {}).get('id') or context.get('selected_image_id') or 'none'}；submitted={context.get('current_frame_submitted')}",
+        f"画面质量：eligible={frame_quality.get('qa_context_eligible') or frame_quality.get('eligible')}；study_material={frame_quality.get('has_study_material')}；summary={truncate_text(frame_quality.get('signal_summary') or frame_quality.get('message') or '', 180)}",
+        f"观察状态：active={observation.get('is_active') or context.get('is_observing')}；frames={observation.get('buffered_frame_count') or 0}；state={observation.get('upload_state') or ''}",
+    ]
+    if context.get("student_goal") or session.get("student_goal"):
+        lines.append(f"本轮目标：{truncate_text(context.get('student_goal') or session.get('student_goal') or '', 240)}")
+    if context.get("carried_history_context"):
+        lines.append(f"历史上下文：{truncate_text(context.get('carried_history_context'), 360)}")
+    if context.get("review_context"):
+        lines.append(f"复习上下文：{truncate_text(context.get('review_context'), 360)}")
+    if formed_memories:
+        lines.append(
+            "重点形成记忆："
+            + "；".join(truncate_text(event.get("text"), 150) for event in formed_memories)
+        )
+    if memory_candidates:
+        lines.append("记忆整理候选：" + "；".join(truncate_text(item, 120) for item in memory_candidates[:4]))
+    if client_dynamic:
+        lines.append(f"客户端动态策略：{truncate_text(json_dumps(client_dynamic), 700)}")
+    lines.append("执行：综合本轮偏好、当前画面、当前回合、观察状态、历史上下文和记忆整理；优先回答用户当前问题，不让旧上下文覆盖新问题。")
+    return truncate_text("\n".join(lines), 1800)
+
+
+def qa_rejected_client_frame_quality(context: dict) -> dict | None:
+    quality = qa_frame_quality_from_meta(context or {})
+    if quality.get("eligible") is False:
+        return quality
+    return None
+
+
+def short_hash(value: str) -> str:
+    if not value:
+        return ""
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
+
+
+def text_tokens_hash(tokens: list[str]) -> str:
+    return short_hash("\n".join(sorted(tokens)))
+
+
+def visual_sample_from_meta(meta: dict) -> list[int]:
+    values = meta_list(meta, "visual_sample", "visualSample", "fingerprint_values", "fingerprintValues")
+    sample: list[int] = []
+    for value in values[:1024]:
+        try:
+            sample.append(max(0, min(255, int(value))))
+        except (TypeError, ValueError):
+            continue
+    return sample
+
+
+def parse_visual_sample(raw: str | None) -> list[int]:
+    text = (raw or "").strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    sample: list[int] = []
+    for value in data[:1024]:
+        try:
+            sample.append(max(0, min(255, int(value))))
+        except (TypeError, ValueError):
+            continue
+    return sample
+
+
+def visual_hash_from_sample(sample: list[int]) -> str:
+    if not sample:
+        return ""
+    mean = sum(sample) / len(sample)
+    bits = "".join("1" if value >= mean else "0" for value in sample)
+    if not bits:
+        return ""
+    return f"{int(bits, 2):0{(len(bits) + 3) // 4}x}"
+
+
+def visual_hash_from_meta(meta: dict) -> str:
+    explicit = meta_text(meta, "visual_hash", "visualHash", "fingerprint_hash", "fingerprintHash")
+    if explicit:
+        return explicit[:256]
+    return visual_hash_from_sample(visual_sample_from_meta(meta))
+
+
+def fingerprint_distance(values: list[int], other: list[int]) -> float | None:
+    if not values or not other or len(values) != len(other):
+        return None
+    mean = sum(values) / len(values)
+    other_mean = sum(other) / len(other)
+    total = sum(abs((lhs - mean) - (rhs - other_mean)) for lhs, rhs in zip(values, other))
+    return total / len(values)
+
+
+def text_token_distance(tokens: list[str], other: list[str]) -> float | None:
+    if not tokens or not other:
+        return None
+    lhs = set(tokens)
+    rhs = set(other)
+    union = lhs | rhs
+    if not union:
+        return None
+    return 1.0 - (len(lhs & rhs) / len(union))
+
+
+def visual_hash_distance(lhs: str, rhs: str) -> int | None:
+    if not lhs or not rhs or len(lhs) != len(rhs):
+        return None
+    try:
+        return (int(lhs, 16) ^ int(rhs, 16)).bit_count()
+    except ValueError:
+        return None
+
+
+def best_previous_observation(session_id: str, visual_hash: str, visual_sample: list[int], text_tokens: list[str]) -> dict | None:
+    if not (visual_hash or visual_sample or text_tokens):
+        return None
+    with connect() as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT image_id, visual_hash, visual_sample, text_tokens, sequence_index, captured_at, novelty_status
+                FROM session_observations
+                WHERE session_id=? AND novelty_status IN ('novel', 'duplicate', 'unknown')
+                ORDER BY sequence_index DESC, created_at DESC
+                LIMIT ?
+                """,
+                (session_id, OBSERVATION_LOOKBACK_LIMIT),
+            )
+        ]
+    best: dict | None = None
+    for row in rows:
+        previous_sample = parse_visual_sample(row.get("visual_sample"))
+        previous_tokens = []
+        try:
+            parsed_tokens = json.loads(row.get("text_tokens") or "[]")
+            if isinstance(parsed_tokens, list):
+                previous_tokens = [normalize_text_token(token) for token in parsed_tokens if normalize_text_token(token)]
+        except json.JSONDecodeError:
+            previous_tokens = []
+        sample_distance = fingerprint_distance(visual_sample, previous_sample)
+        token_distance = text_token_distance(text_tokens, previous_tokens)
+        hash_distance = visual_hash_distance(visual_hash, row.get("visual_hash") or "")
+        exact_hash = bool(visual_hash and visual_hash == row.get("visual_hash"))
+        duplicate = exact_hash
+        if sample_distance is not None:
+            duplicate = duplicate or sample_distance <= VISUAL_DUPLICATE_DISTANCE
+            duplicate = duplicate or (
+                sample_distance <= VISUAL_TEXT_DUPLICATE_DISTANCE
+                and (token_distance is None or token_distance <= TEXT_DUPLICATE_DISTANCE)
+            )
+        elif hash_distance is not None:
+            duplicate = duplicate or hash_distance <= 6
+        if token_distance is not None and token_distance <= 0.08 and exact_hash:
+            duplicate = True
+        if not duplicate:
+            continue
+        score = min(
+            sample_distance if sample_distance is not None else 999,
+            float(hash_distance) if hash_distance is not None else 999,
+            0 if exact_hash else 999,
+        )
+        candidate = {
+            "image_id": row.get("image_id") or "",
+            "visual_distance": sample_distance,
+            "text_distance": token_distance,
+            "score": score,
+        }
+        if best is None or candidate["score"] < best["score"]:
+            best = candidate
+    return best
+
+
+def observation_from_meta(session_id: str, batch_id: str | None, image_id: str, captured_at: str, sequence_index: int, meta: dict) -> dict:
+    text_tokens = normalized_text_tokens(meta)
+    visual_sample = visual_sample_from_meta(meta)
+    visual_hash = visual_hash_from_meta(meta)
+    text_hash = meta_text(meta, "text_hash", "textHash") or text_tokens_hash(text_tokens)
+    duplicate_of = meta_text(meta, "duplicate_of_image_id", "duplicateOfImageId", "duplicate_of", "duplicateOf")
+    client_novelty = meta_text(meta, "novelty_status", "noveltyStatus")
+    visual_distance = meta_float(meta, "visual_distance", "visualDistance")
+    text_distance = meta_float(meta, "text_distance", "textDistance")
+    image_verdict = meta_dict(meta, "image_content_verdict", "imageContentVerdict")
+    content_valid = meta_bool(meta, "image_content_valid", "imageContentValid")
+    if content_valid is None and image_verdict:
+        content_valid = meta_bool(image_verdict, "valid")
+    if content_valid is False:
+        novelty_status = "invalid"
+        duplicate_of = ""
+    elif duplicate_of:
+        novelty_status = "duplicate"
+    else:
+        previous = best_previous_observation(session_id, visual_hash, visual_sample, text_tokens)
+        if previous:
+            duplicate_of = previous.get("image_id") or ""
+            visual_distance = previous.get("visual_distance")
+            text_distance = previous.get("text_distance")
+            novelty_status = "duplicate"
+        elif client_novelty in {"novel", "duplicate", "unknown"}:
+            novelty_status = client_novelty
+        else:
+            novelty_status = "novel" if (visual_hash or text_tokens or visual_sample) else "unknown"
+    return {
+        "id": uuid.uuid4().hex,
+        "session_id": session_id,
+        "batch_id": batch_id,
+        "image_id": image_id,
+        "captured_at": captured_at,
+        "sequence_index": sequence_index,
+        "visual_hash": visual_hash,
+        "visual_sample": json_dumps(visual_sample) if visual_sample else "",
+        "text_hash": text_hash,
+        "text_tokens": json_dumps(text_tokens),
+        "signal_summary": meta_text(meta, "signal_summary", "signalSummary"),
+        "novelty_status": novelty_status,
+        "duplicate_of_image_id": duplicate_of,
+        "image_content_valid": content_valid,
+        "discard_reason": meta_text(meta, "discard_reason", "discardReason")
+        or meta_text(image_verdict, "reason"),
+        "discard_detail": meta_text(meta, "discard_detail", "discardDetail")
+        or meta_text(image_verdict, "detail"),
+        "visual_distance": visual_distance,
+        "text_distance": text_distance,
+        "created_at": utc_now(),
+    }
+
+
+def insert_observation(observation: dict) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO session_observations(
+                id, session_id, batch_id, image_id, captured_at, sequence_index,
+                visual_hash, visual_sample, text_hash, text_tokens, signal_summary,
+                novelty_status, duplicate_of_image_id, visual_distance, text_distance, created_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                observation["id"],
+                observation["session_id"],
+                observation["batch_id"],
+                observation["image_id"],
+                observation["captured_at"],
+                observation["sequence_index"],
+                observation["visual_hash"],
+                observation["visual_sample"],
+                observation["text_hash"],
+                observation["text_tokens"],
+                observation["signal_summary"],
+                observation["novelty_status"],
+                observation["duplicate_of_image_id"],
+                observation["visual_distance"],
+                observation["text_distance"],
+                observation["created_at"],
+            ),
+        )
+
+
+def parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "未知"
+    seconds = max(0, seconds)
+    if seconds < 60:
+        return f"{seconds:.0f} 秒"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{minutes:.1f} 分钟"
+    hours = minutes / 60
+    return f"{hours:.1f} 小时"
+
+
+def parse_date_or_datetime(value: str | None) -> datetime | None:
+    return parse_datetime(value)
+
+
+def normalize_mistake_status(value: object, *, default: str = "suspected") -> str:
+    status = str(value or default).strip()
+    status = MISTAKE_STATUS_ALIASES.get(status, status)
+    if status not in MISTAKE_STATUS_VALUES:
+        raise HTTPException(422, f"invalid mistake status: {status}")
+    return status
+
+
+def normalize_review_state(value: object, *, default: str = "new") -> str:
+    state = str(value or default).strip()
+    state = MISTAKE_REVIEW_STATE_ALIASES.get(state, state)
+    if state not in MISTAKE_REVIEW_STATE_VALUES:
+        raise HTTPException(422, f"invalid review state: {state}")
+    return state
+
+
+def review_due_at_for(status: str, review_state: str, base_time: datetime | None = None) -> str:
+    status = MISTAKE_STATUS_ALIASES.get(status, status)
+    review_state = MISTAKE_REVIEW_STATE_ALIASES.get(review_state, review_state)
+    if status in {"ignored", "mastered"} or review_state in {"ignored", "mastered"}:
+        return ""
+    base = base_time or datetime.now(timezone.utc)
+    key = status if status == "corrected" else review_state
+    days = REVIEW_SCHEDULE_DAYS.get(key, 1)
+    return (base + timedelta(days=days)).isoformat()
+
+
+def review_due_sort_value(value: str | None) -> str:
+    return value or "9999-12-31T23:59:59+00:00"
+
+
+def normalize_review_event_result(value: object) -> str:
+    result = str(value or "").strip().lower()
+    result = REVIEW_EVENT_ALIASES.get(result, result)
+    if result not in REVIEW_EVENT_RESULTS:
+        raise HTTPException(422, f"invalid review result: {result}")
+    return result
+
+
+def optional_int(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        raise HTTPException(422, "invalid integer value")
+
+
+def optional_float(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(422, "invalid numeric value")
+
+
+def mistake_row_to_dict(row) -> dict:
+    item = dict(row)
+    item["knowledge_points"] = json_list(item.get("knowledge_points"))
+    item["source_image_ids"] = json_list(item.get("source_image_ids"))
+    item["source_image_details"] = json_list_of_dicts(item.get("source_image_details"))
+    return item
+
+
+def student_presence_status(meta: dict, fallback_text: str = "") -> str:
+    if meta_bool(meta, "has_device_interaction_presence", "hasDeviceInteractionPresence", "user_operation_presence", "userOperationPresence") is True:
+        return "present"
+    device_presence = meta.get("device_interaction_presence") or meta.get("deviceInteractionPresence")
+    if isinstance(device_presence, dict) and meta_bool(device_presence, "present", "is_present", "isPresent") is True:
+        return "present"
+
+    explicit = meta_text(
+        meta,
+        "student_presence_status",
+        "studentPresenceStatus",
+        "student_presence",
+        "studentPresence",
+        "presence_status",
+        "presenceStatus",
+    ).strip().lower()
+    explicit_present = {
+        "present",
+        "visible",
+        "detected",
+        "student_present",
+        "person_present",
+        "human_present",
+        "hand_visible",
+        "active",
+    }
+    explicit_absent = {
+        "absent",
+        "not_present",
+        "not_detected",
+        "no_student",
+        "no_person",
+        "no_human",
+        "empty",
+        "none",
+    }
+    if explicit in explicit_present:
+        return "present"
+    if explicit in explicit_absent:
+        return "absent"
+
+    has_presence = meta_bool(meta, "has_student_presence", "hasStudentPresence", "student_present", "studentPresent")
+    if has_presence is True:
+        return "present"
+
+    counts = [
+        meta_int(meta, "hand_count", "handCount", "hands"),
+        meta_int(meta, "face_count", "faceCount", "faces"),
+        meta_int(meta, "body_count", "bodyCount", "bodies", "person_count", "personCount"),
+    ]
+    if any((count or 0) > 0 for count in counts):
+        return "present"
+
+    text = " ".join(
+        part
+        for part in (
+            meta_text(meta, "presence_summary", "presenceSummary"),
+            meta_text(meta, "activity_summary", "activitySummary"),
+            meta_text(meta, "action_summary", "actionSummary"),
+            meta_text(meta, "signal_summary", "signalSummary"),
+            fallback_text,
+        )
+        if part
+    ).lower()
+    strong_present_terms = (
+        "左手",
+        "右手",
+        "手指",
+        "手掌",
+        "握笔",
+        "持笔",
+        "笔尖",
+        "书写",
+        "正在写",
+        "人体",
+        "人脸",
+        "身体",
+        "头部",
+        "hand",
+        "face",
+        "body",
+        "person",
+        "human",
+        "writing",
+    )
+    if any(term in text for term in strong_present_terms):
+        return "present"
+    absent_terms = (
+        "未检测到学生",
+        "未检测到人",
+        "未见学生",
+        "未见人体",
+        "未见手",
+        "无人",
+        "没人",
+        "学生不在",
+        "不在场",
+        "no student",
+        "no person",
+        "not detected",
+        "not present",
+        "absent",
+    )
+    if any(term in text for term in absent_terms):
+        return "absent"
+    return "unknown"
+
+
+def presence_label(status: str) -> str:
+    if status == "present":
+        return "有学生/手/笔证据"
+    if status == "absent":
+        return "未检测到学生/疑似不在场"
+    return "在场未识别"
+
+
+def meta_activity_summary(meta: dict, fallback_text: str = "") -> str:
+    device_presence = meta.get("device_interaction_presence") or meta.get("deviceInteractionPresence")
+    if isinstance(device_presence, dict) and meta_bool(device_presence, "present", "is_present", "isPresent") is True:
+        summary = meta_text(device_presence, "summary", "detail", "reason")
+        operation = meta_text(device_presence, "operation", "kind")
+        if summary:
+            return truncate_text(summary, 120)
+        if operation:
+            return truncate_text(f"用户操作手机：{operation}，证明用户在场", 120)
+        return "用户刚操作过手机，证明用户在场"
+    for key in (
+        "activity_summary",
+        "activitySummary",
+        "action_summary",
+        "actionSummary",
+        "presence_summary",
+        "presenceSummary",
+        "signal_summary",
+        "signalSummary",
+    ):
+        value = meta.get(key)
+        if value not in (None, ""):
+            return truncate_text(value, 120)
+    return truncate_text(fallback_text, 120) if fallback_text else "无"
+
+
+def build_time_weight_summary(session: dict, images: list[dict]) -> str:
+    ordered = sorted(images, key=image_sort_key)
+    if not ordered:
+        return "时间权重摘要：无抓拍图片，无法判断学生是否在场或活动持续时长。"
+
+    finish = parse_datetime(session.get("finished_at"))
+    totals = {"present": 0.0, "absent": 0.0, "unknown": 0.0}
+    intervals: list[dict] = []
+    for index, row in enumerate(ordered):
+        current = parse_datetime(row.get("captured_at")) or parse_datetime(row.get("created_at"))
+        next_time = None
+        next_label = "下一张"
+        if index + 1 < len(ordered):
+            next_row = ordered[index + 1]
+            next_time = parse_datetime(next_row.get("captured_at")) or parse_datetime(next_row.get("created_at"))
+        elif finish:
+            next_time = finish
+            next_label = "结束"
+        seconds = None
+        if current and next_time and next_time >= current:
+            seconds = (next_time - current).total_seconds()
+        meta = capture_meta_dict(row.get("capture_meta"))
+        fallback_signal = row.get("signal_summary") or ""
+        status = student_presence_status(meta, fallback_signal)
+        is_tail = index + 1 == len(ordered) and bool(finish)
+        tail_has_weak_followup = is_tail and status == "present" and seconds is not None and seconds > 15
+        if tail_has_weak_followup:
+            status = "unknown"
+        if seconds is not None:
+            totals[status] = totals.get(status, 0.0) + seconds
+        hints = []
+        if row.get("page_hint"):
+            hints.append(f"page={row.get('page_hint')}")
+        if row.get("question_hint"):
+            hints.append(f"question={row.get('question_hint')}")
+        intervals.append(
+            {
+                "sequence_index": row.get("sequence_index") or 0,
+                "seconds": seconds,
+                "status": status,
+                "next_label": next_label,
+                "activity": (
+                    meta_activity_summary(meta, fallback_signal) + "；尾段无后续画面，不能确认持续在场"
+                    if tail_has_weak_followup
+                    else meta_activity_summary(meta, fallback_signal)
+                ),
+                "hints": "，".join(hints) if hints else "页/题未识别",
+                "is_tail": is_tail,
+            }
+        )
+
+    top_intervals = sorted(
+        [item for item in intervals if item["seconds"] is not None],
+        key=lambda item: item["seconds"] or 0,
+        reverse=True,
+    )[:6]
+    longest_lines = []
+    for item in top_intervals:
+        tail_note = "；最后一张到结束，无后续画面证据" if item["is_tail"] else ""
+        longest_lines.append(
+            (
+                f"sequence={item['sequence_index']} 到{item['next_label']}：{format_duration(item['seconds'])}，"
+                f"{presence_label(item['status'])}，{item['hints']}，活动线索={item['activity']}{tail_note}"
+            )
+        )
+    if not longest_lines:
+        longest_lines.append("无可计算间隔。")
+    tail_gap = "未知"
+    if intervals and intervals[-1]["is_tail"]:
+        tail_gap = format_duration(intervals[-1]["seconds"])
+    total_observed = sum(totals.values())
+    uncertain_seconds = totals.get("absent", 0.0) + totals.get("unknown", 0.0)
+    uncertain_ratio = uncertain_seconds / total_observed if total_observed > 0 else 0
+    quality_note = "在场证据充足，可按主要动作段估算。"
+    if uncertain_ratio >= 0.5:
+        quality_note = "疑似不在场/在场未识别时段占比较高，题目耗时只能低置信度估计。"
+    elif uncertain_ratio >= 0.25:
+        quality_note = "存在较多在场未识别时段，题目耗时需标注疑似。"
+    return (
+        "时间权重摘要：报告主次必须按相邻抓拍间隔和画面动作累计，不要把拍到的题目平均分配到总时长；"
+        "用户操作手机本身是强在场证据；有学生/手/笔/书写证据的时段优先；视觉未检测到学生只能说明画面未确认，不能单独判定学生离开；无后续画面证据的时段不能自动算作题目耗时。\n"
+        f"- 有学生/手/笔证据时长：{format_duration(totals.get('present'))}；"
+        f"未检测到学生/疑似不在场时长：{format_duration(totals.get('absent'))}；"
+        f"在场未识别时长：{format_duration(totals.get('unknown'))}；"
+        f"最后一张到结束无新增画面：{tail_gap}；数据质量提示：{quality_note}\n"
+        "- 最长观察间隔（按持续时间降序）：\n"
+        + "\n".join(f"  {index + 1}. {line}" for index, line in enumerate(longest_lines))
+    )
+
+
+async def save_upload(
+    upload: UploadFile,
+    session_id: str,
+    kind: str,
+    batch_id: str | None = None,
+    *,
+    page_hint: str = "",
+    question_hint: str = "",
+    captured_at: str | None = None,
+    sequence_index: int = 0,
+    capture_meta: dict | None = None,
+) -> tuple[str, str, dict]:
     settings = get_settings()
     ext = Path(upload.filename or "capture.jpg").suffix.lower() or ".jpg"
     image_id = uuid.uuid4().hex
     filename = f"{session_id}_{batch_id or 'single'}_{image_id}{ext}"
     target = settings.data_dir / "images" / filename
+    captured_at = captured_at or utc_now()
     with target.open("wb") as out:
         shutil.copyfileobj(upload.file, out)
+    capture_meta = capture_meta_with_image_verdict(capture_meta or {}, image_content_verdict(capture_meta or {}, filename))
+    try:
+        create_thumbnail(target, thumbnail_path_for(filename))
+    except Exception as exc:
+        emit_log(f"生成缩略图失败：{exc}", session_id=session_id, level="warning")
     with connect() as conn:
         conn.execute(
             """
-            INSERT INTO images(id, session_id, batch_id, kind, filename, original_name, created_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO images(
+                id, session_id, batch_id, kind, filename, original_name,
+                page_hint, question_hint, captured_at, sequence_index, capture_meta, created_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (image_id, session_id, batch_id, kind, filename, upload.filename or "", utc_now()),
+            (
+                image_id,
+                session_id,
+                batch_id,
+                kind,
+                filename,
+                upload.filename or "",
+                page_hint,
+                question_hint,
+                captured_at,
+                sequence_index,
+                meta_string(capture_meta or {}),
+                utc_now(),
+            ),
         )
-    return image_id, filename
+    observation = observation_from_meta(session_id, batch_id, image_id, captured_at, sequence_index, capture_meta or {})
+    insert_observation(observation)
+    observation["capture_meta"] = meta_string(capture_meta or {})
+    return image_id, filename, observation
 
 
-async def run_analysis(analysis_id: str, session_id: str, batch_id: str | None, prompt: str, filenames: list[str], summarize: bool = False) -> None:
+def build_batch_prompt(environment: str, image_rows: list[dict], previous_context: str = "", strategy_context: str = "") -> str:
+    capture_lines = "\n".join(
+        (
+            f"{index + 1}. sequence_index={row['sequence_index']}，captured_at={row['captured_at'] or '未知'}，"
+            f"filename={row['filename']}，client_meta={row['capture_meta'] or '{}'}"
+        )
+        for index, row in enumerate(image_rows)
+    )
+    return prompts.render_prompt(
+        "batch_analysis",
+        image_count=len(image_rows),
+        environment=(environment or "未提供") + ("\n" + strategy_context if strategy_context else ""),
+        capture_lines=capture_lines,
+        previous_context=previous_context or "无此前批次记录。",
+    )
+
+
+def duplicate_batch_content(image_rows: list[dict]) -> str:
+    lines = [
+        (
+            f"{index + 1}. sequence_index={row.get('sequence_index')}，captured_at={row.get('captured_at') or '未知'}，"
+            f"与已保存关键画面重复，duplicate_of={row.get('duplicate_of_image_id') or '未知'}，"
+            f"signal={row.get('signal_summary') or '无'}"
+        )
+        for index, row in enumerate(image_rows)
+    ]
+    return (
+        "本批次没有新增关键画面，未调用视觉大模型。\n"
+        "后端已把这些帧作为重复观察写入时间线，可用于估算停留时长，但不会重复记录题目/知识点。\n"
+        + "\n".join(lines)
+    )
+
+
+def skipped_batch_content(image_rows: list[dict]) -> str:
+    invalid_rows = [row for row in image_rows if row.get("novelty_status") == "invalid"]
+    duplicate_rows = [row for row in image_rows if row.get("novelty_status") == "duplicate"]
+    lines: list[str] = []
+    for row in invalid_rows:
+        lines.append(
+            f"- sequence_index={row.get('sequence_index')}，captured_at={row.get('captured_at') or '未知'}，"
+            f"无相关学习画面，reason={row.get('discard_reason') or 'invalid_image'}，"
+            f"detail={row.get('discard_detail') or '画面无相关'}"
+        )
+    for row in duplicate_rows:
+        lines.append(
+            f"- sequence_index={row.get('sequence_index')}，captured_at={row.get('captured_at') or '未知'}，"
+            f"重复观察，duplicate_of={row.get('duplicate_of_image_id') or '未知'}，"
+            f"signal={row.get('signal_summary') or '无'}"
+        )
+    if invalid_rows and not duplicate_rows:
+        head = "本批次画面无相关学习内容，已自动忽略，未调用视觉大模型。"
+    elif invalid_rows:
+        head = "本批次没有新增可解析学习画面：无相关画面已忽略，重复画面只写入时间线，未调用视觉大模型。"
+    else:
+        return duplicate_batch_content(image_rows)
+    return head + ("\n" + "\n".join(lines) if lines else "")
+
+
+def image_row_has_valid_content(row: dict) -> bool:
+    if row.get("novelty_status") == "invalid":
+        return False
+    meta = capture_meta_dict(row.get("capture_meta"))
+    verdict = meta_dict(meta, "image_content_verdict", "imageContentVerdict")
+    valid = meta_bool(meta, "image_content_valid", "imageContentValid")
+    if valid is None and verdict:
+        valid = meta_bool(verdict, "valid")
+    return valid is not False
+
+
+def image_sort_key(row: dict) -> tuple[int, datetime, str]:
+    parsed = parse_datetime(row.get("captured_at")) or parse_datetime(row.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc)
+    return (int(row.get("sequence_index") or 0), parsed, row.get("id") or "")
+
+
+def report_time_bounds(session: dict, images: list[dict]) -> tuple[datetime | None, datetime | None, float | None]:
+    times = [parsed for row in images if (parsed := (parse_datetime(row.get("captured_at")) or parse_datetime(row.get("created_at"))))]
+    if not times:
+        return None, parse_datetime(session.get("finished_at")), None
+    start = min(times)
+    fallback_end = max(times)
+    finish = parse_datetime(session.get("finished_at"))
+    end = finish if finish and finish >= fallback_end else fallback_end
+    return start, end, (end - start).total_seconds()
+
+
+def build_timeline_lines(session: dict, images: list[dict]) -> list[str]:
+    ordered = sorted(images, key=image_sort_key)
+    finish = parse_datetime(session.get("finished_at"))
+    lines: list[str] = []
+    for index, row in enumerate(ordered):
+        current = parse_datetime(row.get("captured_at")) or parse_datetime(row.get("created_at"))
+        next_time = None
+        if index + 1 < len(ordered):
+            next_row = ordered[index + 1]
+            next_time = parse_datetime(next_row.get("captured_at")) or parse_datetime(next_row.get("created_at"))
+        elif finish:
+            next_time = finish
+        seconds_to_next = None
+        if current and next_time and next_time >= current:
+            seconds_to_next = (next_time - current).total_seconds()
+        hints = []
+        if row.get("page_hint"):
+            hints.append(f"page_hint={row.get('page_hint')}")
+        if row.get("question_hint"):
+            hints.append(f"question_hint={row.get('question_hint')}")
+        lines.append(
+            (
+                f"{index + 1}. sequence_index={row.get('sequence_index') or 0}，"
+                f"captured_at={row.get('captured_at') or row.get('created_at') or '未知'}，"
+                f"到下一张/结束间隔={format_duration(seconds_to_next)}，"
+                f"batch={row.get('batch_id') or 'single'}，"
+                f"{'，'.join(hints) + '，' if hints else ''}"
+                f"capture_meta={compact_capture_meta(row.get('capture_meta'))}"
+            )
+        )
+    return lines
+
+
+def representative_indices(count: int) -> list[int]:
+    if count <= 0:
+        return []
+    edge_count = min(10, count)
+    indexes = [*range(edge_count), *range(max(edge_count, count - edge_count), count)]
+    if count > edge_count * 2:
+        sample_count = min(12, count - edge_count * 2)
+        indexes.extend(round(step * (count - 1) / (sample_count + 1)) for step in range(1, sample_count + 1))
+    seen = set()
+    ordered: list[int] = []
+    for index in indexes:
+        if 0 <= index < count and index not in seen:
+            ordered.append(index)
+            seen.add(index)
+    return ordered
+
+
+def render_limited_lines(lines: list[str], max_chars: int, omitted_unit: str) -> tuple[str, bool]:
+    full = "\n".join(lines)
+    if len(full) <= max_chars:
+        return full, False
+    selected = sorted(representative_indices(len(lines)))
+    while selected:
+        rendered = render_selected_lines(lines, selected, omitted_unit)
+        if len(rendered) <= max_chars:
+            return rendered, True
+        middle = len(selected) // 2
+        selected.pop(middle)
+    return truncate_text(full, max_chars), True
+
+
+def render_selected_lines(lines: list[str], selected: list[int], omitted_unit: str) -> str:
+    parts: list[str] = []
+    previous = -1
+    for index in selected:
+        omitted = index - previous - 1
+        if omitted > 0:
+            parts.append(f"... 已省略 {omitted} {omitted_unit}，保留代表性开头/中段/结尾 ...")
+        parts.append(lines[index])
+        previous = index
+    trailing = len(lines) - previous - 1
+    if trailing > 0:
+        parts.append(f"... 已省略 {trailing} {omitted_unit}，保留代表性开头/中段/结尾 ...")
+    return "\n".join(parts)
+
+
+def build_limited_batch_notes(analyses: list[dict], max_chars: int) -> tuple[str, bool]:
+    rows = [row for row in analyses if row["scope"] != "final"]
+    if not rows:
+        return "暂无批次视觉分析内容。", False
+    per_note_limit = max(
+        FINAL_REPORT_ANALYSIS_MIN_CHARS,
+        min(FINAL_REPORT_ANALYSIS_MAX_CHARS, max_chars // max(len(rows), 1) - 80),
+    )
+    note_truncated = any(len((row["content"] or "无内容").strip()) > per_note_limit for row in rows)
+    notes = [
+        (
+            f"【{index + 1}. {row['scope']} / {row['status']} / batch={row['batch_id'] or '无'} / created_at={row['created_at']}】\n"
+            f"{truncate_text(row['content'] or '无内容', per_note_limit)}"
+        )
+        for index, row in enumerate(rows)
+    ]
+    rendered, notes_compressed = render_limited_lines(notes, max_chars, "条批次分析")
+    return rendered, note_truncated or notes_compressed
+
+
+def normalize_for_dedupe(text: str) -> str:
+    return " ".join(text.split()).lower()
+
+
+def dedupe_analyses(analyses: list[dict]) -> tuple[list[dict], int]:
+    rows = [row for row in analyses if row["scope"] != "final" and row.get("status") == "done" and (row.get("content") or "").strip()]
+    seen: set[str] = set()
+    unique: list[dict] = []
+    duplicate_count = 0
+    for row in rows:
+        normalized = normalize_for_dedupe(row.get("content") or "")
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+        if digest in seen:
+            duplicate_count += 1
+            continue
+        seen.add(digest)
+        unique.append(row)
+    return unique, duplicate_count
+
+
+def important_analysis_lines(text: str, max_chars: int) -> str:
+    source = (text or "").strip()
+    if not source:
+        return "无内容"
+    keywords = (
+        "页",
+        "题",
+        "题目",
+        "题干",
+        "答案",
+        "手写",
+        "算式",
+        "草稿",
+        "订正",
+        "作答",
+        "学习科目",
+        "学习方式",
+        "人体",
+        "手",
+        "头",
+        "身体",
+        "笔",
+        "书写",
+        "停留",
+        "耗时",
+        "时间",
+        "变化",
+        "翻页",
+        "未识别",
+        "疑似",
+    )
+    lines = [line.strip() for line in source.splitlines() if line.strip()]
+    selected: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        normalized = normalize_for_dedupe(line)
+        if normalized in seen:
+            continue
+        if any(keyword in line for keyword in keywords):
+            selected.append(line)
+            seen.add(normalized)
+    if not selected:
+        selected = lines[:8]
+    extracted = "\n".join(selected)
+    if len(extracted) < min(max_chars, len(source)) // 3:
+        fallback = render_selected_lines(lines, representative_indices(len(lines)), "行分析内容")
+        extracted = f"{extracted}\n{fallback}" if extracted else fallback
+    return truncate_text(extracted, max_chars)
+
+
+def final_report_evidence_stats(images: list[dict], analyses: list[dict]) -> dict:
+    non_final = [row for row in analyses if row["scope"] != "final"]
+    done_non_final = [row for row in non_final if row.get("status") == "done"]
+    raw_analysis_chars = sum(len(row.get("content") or "") for row in non_final)
+    raw_prompt_chars = sum(len(row.get("prompt") or "") for row in non_final)
+    raw_capture_meta_chars = sum(len(row.get("capture_meta") or "") for row in images)
+    unique_done, duplicate_count = dedupe_analyses(analyses)
+    return {
+        "image_count": len(images),
+        "analysis_count": len(non_final),
+        "done_analysis_count": len(done_non_final),
+        "unique_done_analysis_count": len(unique_done),
+        "duplicate_done_analysis_count": duplicate_count,
+        "raw_analysis_chars": raw_analysis_chars,
+        "raw_prompt_chars": raw_prompt_chars,
+        "raw_capture_meta_chars": raw_capture_meta_chars,
+        "raw_evidence_chars": raw_analysis_chars + raw_capture_meta_chars,
+    }
+
+
+def should_distill_final_evidence(images: list[dict], analyses: list[dict]) -> bool:
+    stats = final_report_evidence_stats(images, analyses)
+    return (
+        stats["raw_evidence_chars"] > FINAL_REPORT_DISTILL_TRIGGER_CHARS
+        or stats["done_analysis_count"] > FINAL_REPORT_DISTILL_TRIGGER_ANALYSES
+        or stats["image_count"] > 120
+    )
+
+
+def build_evidence_note(row: dict, index: int, per_note_limit: int) -> str:
+    content = important_analysis_lines(row.get("content") or "无内容", per_note_limit)
+    return (
+        f"【{index}. {row['scope']} / {row['status']} / batch={row['batch_id'] or '无'} / created_at={row['created_at']}】\n"
+        f"{content}"
+    )
+
+
+def build_previous_batch_context(session_id: str, exclude_batch_id: str | None = None) -> str:
+    with connect() as conn:
+        params: list = [session_id]
+        batch_filter = ""
+        if exclude_batch_id:
+            batch_filter = "AND COALESCE(batch_id, '') != ?"
+            params.append(exclude_batch_id)
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT scope, status, batch_id, content, created_at
+                FROM analyses
+                WHERE session_id=? AND scope='batch' AND status='done' AND content != ''
+                {batch_filter}
+                ORDER BY created_at DESC
+                LIMIT {BATCH_PREVIOUS_ANALYSIS_LIMIT}
+                """,
+                params,
+            )
+        ]
+    if not rows:
+        return "无此前批次记录。"
+    notes = [build_evidence_note(row, index + 1, 900) for index, row in enumerate(reversed(rows))]
+    rendered = "\n\n".join(notes)
+    return truncate_text(rendered, BATCH_PREVIOUS_CONTEXT_LIMIT)
+
+
+def clean_learning_line(line: str) -> str:
+    cleaned = re.sub(r"^\s*[-*•\d.、\)\]]+\s*", "", line.strip())
+    cleaned = cleaned.strip("# ：:;；\t ")
+    return truncate_text(cleaned, LEARNING_ITEM_CONTENT_LIMIT)
+
+
+def content_after_label(line: str) -> str:
+    parts = re.split(r"[：:]", line, maxsplit=1)
+    if len(parts) == 2 and 2 <= len(parts[1].strip()):
+        return parts[1].strip()
+    return line
+
+
+def learning_item_type_for_line(line: str) -> str | None:
+    text = line.strip()
+    if not text:
+        return None
+    if any(keyword in text for keyword in ("知识点", "考点", "易错点", "概念", "公式", "方法")):
+        return "knowledge"
+    if any(keyword in text for keyword in ("板块", "章节", "单元", "页面", "页码", "材料", "练习册", "试卷")):
+        return "section"
+    if any(keyword in text for keyword in ("题目", "题号", "题干", "问题", "第")) and any(keyword in text for keyword in ("题", "页", "问")):
+        return "question"
+    if any(keyword in text for keyword in ("答案", "作答", "手写", "算式", "草稿", "订正", "空白", "未作答")):
+        return "answer"
+    return None
+
+
+def title_for_learning_item(content: str) -> str:
+    one_line = " ".join(content.split())
+    one_line = re.sub(r"^[一二三四五六七八九十0-9]+[.、]\s*", "", one_line)
+    return truncate_text(one_line, LEARNING_ITEM_TITLE_LIMIT)
+
+
+def normalize_learning_content(content: str) -> str:
+    normalized = normalize_for_dedupe(content)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized
+
+
+def extract_learning_items(content: str) -> list[dict]:
+    items: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    current_type: str | None = None
+    context_subject = extract_subject_from_text(content)
+    for raw_line in (content or "").splitlines():
+        line = clean_learning_line(raw_line)
+        if not line:
+            continue
+        inferred_type = learning_item_type_for_line(line)
+        if inferred_type:
+            current_type = inferred_type
+        item_type = inferred_type or current_type
+        if item_type not in {"question", "section", "knowledge", "answer"}:
+            continue
+        candidate = clean_learning_line(content_after_label(line))
+        if not candidate or len(candidate) < 4:
+            continue
+        if candidate in {"未识别", "未知", "无", "无内容", "无可分析内容"}:
+            continue
+        if "未识别" in candidate and len(candidate) < 12:
+            continue
+        normalized = normalize_learning_content(candidate)
+        if len(normalized) < 4:
+            continue
+        key = (item_type, normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(
+            enrich_asset_fields_from_text(
+                {
+                    "item_type": item_type,
+                    "title": title_for_learning_item(candidate),
+                    "content": candidate,
+                    "content_hash": short_hash(normalized),
+                },
+                f"{line}\n{content}",
+                context_subject,
+            )
+        )
+        if len(items) >= 80:
+            break
+    return items
+
+
+def mistake_status_for_text(text: str) -> str | None:
+    source = text or ""
+    if any(keyword in source for keyword in ("错题", "错误", "错因", "做错", "算错", "答案错误", "不正确")):
+        return "suspected"
+    if any(keyword in source for keyword in ("空白", "未作答", "不会", "未完成")):
+        return "incomplete"
+    return None
+
+
+def extract_mistake_items(content: str, learning_items: list[dict] | None = None) -> list[dict]:
+    items: list[dict] = []
+    seen: set[str] = set()
+    knowledge_lines = [item["content"] for item in (learning_items or []) if item.get("item_type") == "knowledge"]
+    context_subject = extract_subject_from_text(content)
+    recent_question = ""
+    recent_answer = ""
+    recent_expected = ""
+    for raw_line in (content or "").splitlines():
+        line = clean_learning_line(raw_line)
+        if not line:
+            continue
+        item_type = learning_item_type_for_line(line)
+        body = clean_learning_line(content_after_label(line))
+        status = mistake_status_for_text(line)
+        if item_type == "question" and body and not status:
+            recent_question = body
+        if item_type == "answer" and body and not status:
+            recent_answer = body
+        expected = extract_named_detail(line, ("参考答案", "正确答案", "标准答案", "应为"), ASSET_FIELD_LIMIT)
+        if expected:
+            recent_expected = expected
+        if not status:
+            continue
+        title_source = recent_question or body or line
+        digest = short_hash(normalize_learning_content(f"{title_source}\n{line}"))
+        if digest in seen:
+            continue
+        seen.add(digest)
+        error_reason = truncate_text(
+            extract_named_detail(line, ("错因", "错误原因", "疑似错因"), MISTAKE_REASON_LIMIT) or body or line,
+            MISTAKE_REASON_LIMIT,
+        )
+        correction = extract_named_detail(line, ("订正", "改正", "订正痕迹", "修正"), ASSET_SOURCE_SUMMARY_LIMIT)
+        next_action = extract_named_detail(line, ("下一步", "建议", "帮助建议", "下一步帮助建议"), ASSET_SOURCE_SUMMARY_LIMIT)
+        mistake = enrich_asset_fields_from_text(
+            {
+                "title": title_for_learning_item(title_source),
+                "question_text": recent_question,
+                "student_answer": recent_answer if item_type != "question" else "",
+                "expected_answer": recent_expected,
+                "error_reason": error_reason,
+                "knowledge_points": knowledge_lines[:8],
+                "status": status,
+                "evidence": line,
+                "error_type": extract_error_type(line),
+                "correction": correction,
+                "next_action": next_action,
+                "content_hash": digest,
+            },
+            f"{line}\n{recent_question}\n{recent_answer}\n{content}",
+            context_subject,
+        )
+        items.append(mistake)
+        if len(items) >= 40:
+            break
+    return items
+
+
+def json_list(raw: str | None) -> list[str]:
+    try:
+        data = json.loads(raw or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(item) for item in data if str(item)]
+
+
+def json_list_of_dicts(raw: str | None) -> list[dict]:
+    try:
+        data = json.loads(raw or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    result: list[dict] = []
+    for item in data:
+        if isinstance(item, dict):
+            result.append(dict(item))
+    return result
+
+
+def clean_asset_field(value: object, max_chars: int = ASSET_FIELD_LIMIT) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    if text in {"未知", "未识别", "无", "暂无", "不确定"}:
+        return ""
+    return truncate_text(text, max_chars)
+
+
+def split_inline_fields(text: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    parts = [part.strip() for part in re.split(r"[；;，,]\s*", text or "") if part.strip()]
+    for part in parts:
+        nested = re.match(r"[^=：:]{1,24}[：:]\s*(.+[=：:].*)", part)
+        if nested:
+            part = nested.group(1).strip()
+        match = re.match(r"([^=：:]{1,20})[=：:]\s*(.+)", part)
+        if not match:
+            continue
+        key = match.group(1).strip()
+        value = clean_asset_field(match.group(2).strip())
+        if value:
+            fields[key] = value
+    return fields
+
+
+def extract_subject_from_text(text: str) -> str:
+    source = text or ""
+    for key, value in split_inline_fields(source).items():
+        if key in {"科目", "学科", "学习科目"}:
+            return value
+    match = re.search(r"(?:科目|学科|学习科目)\s*[=：:]\s*([^，,；;\n]+)", source)
+    if match:
+        return clean_asset_field(match.group(1))
+    subjects = ("数学", "语文", "英语", "物理", "化学", "生物", "科学", "历史", "地理", "政治", "道法", "信息技术")
+    for subject in subjects:
+        if subject in source:
+            return subject
+    if re.search(r"\d+\s*[+\-×xX*/÷=]\s*\d+", source) or any(
+        keyword in source for keyword in ("加法", "减法", "乘法", "除法", "进位", "退位", "方程", "几何", "计算")
+    ):
+        return "数学"
+    if re.search(r"[A-Za-z]{2,}", source) and any(keyword in source for keyword in ("单词", "句子", "语法", "翻译", "阅读理解")):
+        return "英语"
+    if any(keyword in source for keyword in ("拼音", "作文", "阅读", "课文", "生字", "修辞", "古诗")):
+        return "语文"
+    return ""
+
+
+def extract_page_ref(text: str) -> str:
+    source = text or ""
+    for key, value in split_inline_fields(source).items():
+        if key in {"页码", "页面", "页", "page", "page_hint"}:
+            return value
+    patterns = [
+        r"第\s*([一二三四五六七八九十百千万\d]+)\s*页",
+        r"页码\s*[=：:]\s*([^，,；;\n]+)",
+        r"页面\s*[=：:]\s*([^，,；;\n]+)",
+        r"page[_\s-]*hint\s*[=：:]\s*([^，,；;\n]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, source, flags=re.IGNORECASE)
+        if match:
+            value = match.group(1).strip()
+            if pattern.startswith("第"):
+                value = f"第 {value} 页"
+            return clean_asset_field(value)
+    return ""
+
+
+def extract_question_ref(text: str) -> str:
+    source = text or ""
+    for key, value in split_inline_fields(source).items():
+        if key in {"题号", "题", "问题", "question", "question_hint"}:
+            return value
+    patterns = [
+        r"第\s*([一二三四五六七八九十百千万\d]+)\s*(?:题|问|小题)",
+        r"题号\s*[=：:]\s*([^，,；;\n]+)",
+        r"question[_\s-]*hint\s*[=：:]\s*([^，,；;\n]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, source, flags=re.IGNORECASE)
+        if match:
+            value = match.group(1).strip()
+            if pattern.startswith("第"):
+                value = f"第 {value} 题"
+            return clean_asset_field(value)
+    return ""
+
+
+def compose_location_ref(page_ref: str, question_ref: str, fallback: str = "") -> str:
+    parts = [part for part in (clean_asset_field(page_ref), clean_asset_field(question_ref)) if part]
+    if parts:
+        return truncate_text(" ".join(parts), ASSET_FIELD_LIMIT)
+    source = fallback or ""
+    page = extract_page_ref(source)
+    question = extract_question_ref(source)
+    parts = [part for part in (page, question) if part]
+    if parts:
+        return truncate_text(" ".join(parts), ASSET_FIELD_LIMIT)
+    return ""
+
+
+def extract_error_type(text: str) -> str:
+    source = text or ""
+    for key, value in split_inline_fields(source).items():
+        if key in {"错误类型", "错因类型", "类型"}:
+            return value
+    checks = [
+        ("计算错误", ("算错", "计算错误", "计算", "进位", "退位")),
+        ("审题错误", ("审题", "看错", "题意", "条件漏看")),
+        ("概念不清", ("概念", "公式", "定义", "知识点不熟")),
+        ("步骤遗漏", ("步骤", "漏步", "过程", "推导")),
+        ("书写/抄写错误", ("抄错", "写错", "书写", "符号")),
+        ("未完成", ("空白", "未作答", "未完成", "不会")),
+        ("订正痕迹", ("订正", "改正", "划掉", "擦掉")),
+    ]
+    for label, keywords in checks:
+        if any(keyword in source for keyword in keywords):
+            return label
+    return ""
+
+
+def extract_named_detail(text: str, labels: tuple[str, ...], max_chars: int = ASSET_SOURCE_SUMMARY_LIMIT) -> str:
+    source = text or ""
+    for key, value in split_inline_fields(source).items():
+        if key in labels:
+            return truncate_text(value, max_chars)
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    match = re.search(rf"(?:{label_pattern})\s*[=：:]\s*([^。\n；;]+)", source)
+    if match:
+        return truncate_text(match.group(1).strip(), max_chars)
+    return ""
+
+
+def merge_text_value(existing: str, incoming: str, max_chars: int = ASSET_FIELD_LIMIT) -> str:
+    old = str(existing or "").strip()
+    new = str(incoming or "").strip()
+    if not new:
+        return truncate_text(old, max_chars)
+    if not old:
+        return truncate_text(new, max_chars)
+    if new in old:
+        return truncate_text(old, max_chars)
+    if old in new:
+        return truncate_text(new, max_chars)
+    if len(new) > len(old) and old in {"未知", "未识别"}:
+        return truncate_text(new, max_chars)
+    return truncate_text(old, max_chars)
+
+
+def merge_json_lists(existing_raw: str | None, incoming: list[str]) -> list[str]:
+    return list(dict.fromkeys([*json_list(existing_raw), *(incoming or [])]))
+
+
+def merge_source_details(existing_raw: str | None, incoming: list[dict]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for detail in [*json_list_of_dicts(existing_raw), *(incoming or [])]:
+        image_id = str(detail.get("image_id") or detail.get("id") or "")
+        key = image_id or json_dumps(detail)
+        if not key:
+            continue
+        previous = merged.get(key, {})
+        next_detail = {**previous, **{k: v for k, v in detail.items() if v not in (None, "", [])}}
+        merged[key] = next_detail
+    return list(merged.values())
+
+
+def merge_mistake_status(existing: str, incoming: str) -> str:
+    priority = {
+        "suspected": 1,
+        "incomplete": 2,
+        "confirmed": 3,
+        "corrected": 4,
+        "mastered": 5,
+        "ignored": 5,
+    }
+    old = existing or "suspected"
+    new = incoming or old
+    return new if priority.get(new, 0) > priority.get(old, 0) else old
+
+
+def source_image_details_from_rows(images: list[dict]) -> list[dict]:
+    details: list[dict] = []
+    for row in images:
+        filename = row.get("filename") or ""
+        image_id = row.get("id") or row.get("image_id") or ""
+        details.append(
+            {
+                "image_id": image_id,
+                "filename": filename,
+                "thumbnail_url": f"/api/images/{filename}/thumbnail" if filename else "",
+                "image_url": f"/images/{filename}" if filename else "",
+                "captured_at": row.get("captured_at") or "",
+                "sequence_index": int(row.get("sequence_index") or 0),
+                "page_hint": row.get("page_hint") or "",
+                "question_hint": row.get("question_hint") or "",
+            }
+        )
+    return details
+
+
+def source_summary_from_images(images: list[dict]) -> str:
+    if not images:
+        return ""
+    first = images[0]
+    last = images[-1]
+    first_seq = int(first.get("sequence_index") or 0)
+    last_seq = int(last.get("sequence_index") or first_seq)
+    pages = list(dict.fromkeys(clean_asset_field(row.get("page_hint")) for row in images if clean_asset_field(row.get("page_hint"))))
+    questions = list(dict.fromkeys(clean_asset_field(row.get("question_hint")) for row in images if clean_asset_field(row.get("question_hint"))))
+    parts = [
+        f"{len(images)} 张图",
+        f"seq {first_seq}-{last_seq}",
+        f"{first.get('captured_at') or '未知'} → {last.get('captured_at') or first.get('captured_at') or '未知'}",
+    ]
+    if pages:
+        parts.append("页码提示=" + "、".join(pages[:4]))
+    if questions:
+        parts.append("题号提示=" + "、".join(questions[:4]))
+    return truncate_text("；".join(parts), ASSET_SOURCE_SUMMARY_LIMIT)
+
+
+def source_refs_from_images(images: list[dict]) -> dict:
+    pages = list(dict.fromkeys(clean_asset_field(row.get("page_hint")) for row in images if clean_asset_field(row.get("page_hint"))))
+    questions = list(dict.fromkeys(clean_asset_field(row.get("question_hint")) for row in images if clean_asset_field(row.get("question_hint"))))
+    page_ref = "、".join(pages[:4])
+    question_ref = "、".join(questions[:4])
+    return {
+        "page_ref": truncate_text(page_ref, ASSET_FIELD_LIMIT),
+        "question_ref": truncate_text(question_ref, ASSET_FIELD_LIMIT),
+        "location_ref": compose_location_ref(page_ref, question_ref),
+    }
+
+
+def enrich_asset_fields_from_text(item: dict, text: str, fallback_subject: str = "") -> dict:
+    combined = "\n".join(str(part or "") for part in (text, item.get("content"), item.get("title"), item.get("question_text"), item.get("error_reason")))
+    subject = item.get("subject") or extract_subject_from_text(combined) or fallback_subject
+    page_ref = item.get("page_ref") or extract_page_ref(combined)
+    question_ref = item.get("question_ref") or extract_question_ref(combined)
+    location_ref = item.get("location_ref") or compose_location_ref(page_ref, question_ref, combined)
+    next_item = dict(item)
+    next_item["subject"] = clean_asset_field(subject)
+    next_item["page_ref"] = clean_asset_field(page_ref)
+    next_item["question_ref"] = clean_asset_field(question_ref)
+    next_item["location_ref"] = clean_asset_field(location_ref)
+    return next_item
+
+
+def clean_user_text(value: object, max_chars: int = SESSION_GOAL_CHAR_LIMIT) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    return truncate_text(text, max_chars)
+
+
+def clean_string_list(value: object, *, limit: int = 8, max_chars: int = ASSET_FIELD_LIMIT) -> list[str]:
+    if isinstance(value, str):
+        raw_items = [part.strip() for part in re.split(r"[；;、,\n]", value)]
+    elif isinstance(value, list):
+        raw_items = [str(part or "").strip() for part in value]
+    else:
+        raw_items = []
+    items: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        clean = clean_user_text(raw, max_chars)
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        items.append(clean)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def infer_need_tags_from_text(text: str) -> list[str]:
+    source = (text or "").lower()
+    checks = [
+        ("mistake_book", ("错题", "错因", "错误", "订正", "不会", "做错", "错在哪里")),
+        ("knowledge_points", ("知识点", "考点", "概念", "公式", "方法", "板块")),
+        ("step_check", ("步骤", "过程", "算式", "推导", "解法", "检查")),
+        ("answer_check", ("答案", "对不对", "批改", "核对", "正确", "错误")),
+        ("explain", ("讲解", "解释", "教我", "为什么", "思路")),
+        ("report", ("报告", "总结", "复盘", "学习记录", "家长")),
+        ("coach_hint", ("先提示", "提示优先", "先给提示", "不要直接给答案", "别直接给答案", "启发", "引导", "先想", "自己试")),
+        ("coach_step", ("一步步", "分步", "逐步", "慢慢讲", "带着做", "拆步骤")),
+        ("coach_check_only", ("只检查", "只核对", "不代做", "只告诉对错", "批改模式", "检查答案")),
+        ("coach_full", ("完整讲解", "完整解析", "讲透", "详细讲解")),
+        ("review_plan", ("复习", "错题复习", "巩固", "再练", "回顾", "掌握")),
+    ]
+    tags: list[str] = []
+    for tag, keywords in checks:
+        if any(keyword in source for keyword in keywords):
+            tags.append(tag)
+    return tags
+
+
+def merge_tags(*groups: list[str]) -> list[str]:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for group in groups:
+        for tag in group:
+            if tag and tag not in seen:
+                seen.add(tag)
+                merged.append(tag)
+    return merged
+
+
+def infer_needs_from_analysis(content: str, existing_tags: list[str] | None = None) -> list[str]:
+    tags = infer_need_tags_from_text(content)
+    text = content or ""
+    if any(keyword in text for keyword in ("未识别", "看不清", "模糊", "反光")):
+        tags.append("capture_quality")
+    if any(keyword in text for keyword in ("草稿", "订正", "改成", "擦除", "划掉")):
+        tags.append("revision_trace")
+    return merge_tags(existing_tags or [], tags)
+
+
+def tag_label(tag: str) -> str:
+    labels = {
+        "mistake_book": "整理错题本",
+        "knowledge_points": "提炼知识点",
+        "step_check": "检查步骤/过程",
+        "answer_check": "核对答案",
+        "explain": "生成讲解",
+        "report": "生成学习报告",
+        "coach_hint": "学习教练：先提示",
+        "coach_step": "学习教练：分步讲",
+        "coach_check_only": "学习教练：只检查不代做",
+        "coach_full": "学习教练：完整讲解",
+        "review_plan": "安排复习巩固",
+        "capture_quality": "提醒补拍不清晰内容",
+        "revision_trace": "关注订正/草稿变化",
+    }
+    return labels.get(tag, tag)
+
+
+def session_strategy(session: dict | None) -> dict:
+    if not session:
+        return {"student_goal": "", "assistant_focus": "", "inferred_needs": [], "report_style": ""}
+    return {
+        "student_goal": session.get("student_goal") or "",
+        "assistant_focus": session.get("assistant_focus") or "",
+        "inferred_needs": json_list(session.get("inferred_needs") or "[]"),
+        "report_style": session.get("report_style") or "",
+    }
+
+
+COACH_SCENE_CANDIDATES: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("answer_check", ("answer_check", "学习场景=检查", "检查答案", "只检查", "批改", "核对"), "学习场景=检查答案：先判断对/错/不清楚，再给一条可执行订正步骤。"),
+    ("review", ("review", "学习场景=复习", "复习", "错题复习", "巩固", "再练"), "学习场景=复习错题：优先回顾错因、知识点和相似题迁移，不只重复原答案。"),
+    ("homework", ("homework", "学习场景=写作业", "写作业", "学习过程", "连拍", "练习册"), "学习场景=写作业记录：持续观察读题、书写、停顿和订正，少打断，多记录关键变化。"),
+    ("concept", ("concept", "学习场景=讲知识点", "讲知识点", "知识点", "概念", "公式"), "学习场景=讲知识点：先用学生画面里的题做例子，再提炼概念和易错点。"),
+    ("single_problem", ("single_problem", "学习场景=拍题", "拍题", "拍一道题", "单题", "题目解析"), "学习场景=拍一道题：先识别题目、学生答案和卡点，再回答当前问题。"),
+)
+COACH_STYLE_CANDIDATES: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("check_only", ("check_only", "回答方式=只检查", "只检查", "只核对", "不代做", "只告诉对错", "coach_check_only"), "回答方式=只检查：只判断当前答案/过程是否正确，必要时给一个订正方向，不展开代做。"),
+    ("hint_first", ("hint_first", "回答方式=先提示", "先提示", "提示优先", "不要直接给答案", "别直接给答案", "先想", "自己试", "coach_hint"), "回答方式=先提示：默认不直接代做，先给 1-2 个关键提示和学生可以先试的一小步。"),
+    ("step_by_step", ("step_by_step", "回答方式=分步讲", "一步步", "分步", "逐步", "带着做", "coach_step"), "回答方式=分步讲：把推理拆成短步骤，每步说明为什么这样做。"),
+    ("full_explain", ("full_explain", "回答方式=完整讲", "完整讲解", "完整解析", "讲透", "coach_full"), "回答方式=完整讲解：学生明确需要时给完整解法、结论和一个巩固动作。"),
+)
+
+
+def strategy_priority_sources(strategy: dict) -> list[tuple[str, str]]:
+    return [
+        ("assistant_focus", str(strategy.get("assistant_focus") or "")),
+        ("report_style", str(strategy.get("report_style") or "")),
+        ("student_goal", str(strategy.get("student_goal") or "")),
+        ("inferred_needs", " ".join(str(tag or "") for tag in strategy.get("inferred_needs") or [])),
+    ]
+
+
+def pick_coach_preference(strategy: dict, candidates: tuple[tuple[str, tuple[str, ...], str], ...]) -> tuple[str, str, str]:
+    for source_name, source_text in strategy_priority_sources(strategy):
+        source = source_text.lower()
+        if not source:
+            continue
+        for key, tokens, line in candidates:
+            if any(token in source for token in tokens):
+                return key, line, source_name
+    return "", "", ""
+
+
+def coach_preference_lines(strategy: dict) -> list[str]:
+    lines: list[str] = []
+    scene_key, scene_line, scene_source = pick_coach_preference(strategy, COACH_SCENE_CANDIDATES)
+    style_key, style_line, style_source = pick_coach_preference(strategy, COACH_STYLE_CANDIDATES)
+    if scene_line:
+        lines.append(scene_line)
+    if style_line:
+        lines.append(style_line)
+    if scene_key or style_key:
+        lines.append(
+            "偏好优先级=assistant_focus > report_style > student_goal > inferred_needs；"
+            f"当前生效场景={scene_key or '未指定'}({scene_source or 'none'})；"
+            f"当前生效回答方式={style_key or '未指定'}({style_source or 'none'})。"
+        )
+    return lines
+
+
+def build_strategy_context(strategy: dict) -> str:
+    lines: list[str] = []
+    if strategy.get("student_goal"):
+        lines.append(f"学生/用户本回合要求：{strategy['student_goal']}")
+    if strategy.get("assistant_focus"):
+        lines.append(f"当前智能体关注策略：{strategy['assistant_focus']}")
+    needs = strategy.get("inferred_needs") or []
+    if needs:
+        lines.append("系统已推断的帮助需求：" + "、".join(tag_label(tag) for tag in needs))
+    if strategy.get("report_style"):
+        lines.append(f"报告风格要求：{strategy['report_style']}")
+    coach_lines = coach_preference_lines(strategy)
+    if coach_lines:
+        lines.append("学习教练偏好：\n" + "\n".join(f"- {line}" for line in coach_lines))
+    if not lines:
+        lines.append("学生暂未输入明确要求；请根据画面动态判断是否需要错题本、知识点、步骤检查、答案核对或报告总结。")
+    lines.append(
+        "动态执行规则：本批识别要优先服务上述要求；若画面显示学生在订正、反复停留、答案疑似错误或题干清晰，"
+        "请主动补充错题本候选、知识点、错误原因和下一步帮助建议。写错题本候选时尽量使用短字段："
+        "科目=...；页码=...；题号=...；学生答案=...；参考答案=...；错因=...；错误类型=...；订正=...；下一步=...。"
+    )
+    lines.append(
+        "学习教练执行规则：优先促进学生自己完成；除非学生明确要求完整答案或场景需要核对结论，"
+        "默认先给提示、指出卡点、给一个可立即执行的小任务。检查类请求先说对/错/不清楚，再给下一步订正。"
+        "面向家长的总结请用三句话说清：学了什么、卡在哪里、下一次怎么复习。"
+    )
+    return truncate_text("\n".join(lines), ASSISTANT_FOCUS_CHAR_LIMIT)
+
+
+def update_session_needs(session_id: str, new_tags: list[str], focus_note: str = "") -> list[str]:
+    with connect() as conn:
+        row = conn.execute("SELECT inferred_needs, assistant_focus FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if not row:
+            return []
+        merged = merge_tags(json_list(row["inferred_needs"]), new_tags)
+        current_focus = row["assistant_focus"] or ""
+        focus = current_focus
+        if focus_note and focus_note not in current_focus:
+            focus = truncate_text((current_focus + "\n" + focus_note).strip(), ASSISTANT_FOCUS_CHAR_LIMIT)
+        conn.execute(
+            "UPDATE sessions SET inferred_needs=?, assistant_focus=?, updated_at=? WHERE id=?",
+            (json_dumps(merged), focus, utc_now(), session_id),
+        )
+    return merged
+
+
+def record_report_event(session_id: str, event_type: str, title: str, content: str, analysis_id: str | None = None) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO report_events(session_id, analysis_id, event_type, title, content, created_at)
+            VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, analysis_id, event_type, title, truncate_text(content, REPORT_PROCESS_CHAR_LIMIT), utc_now()),
+        )
+
+
+def visualization_dir() -> Path:
+    path = get_settings().data_dir / "visualizations"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def visualization_file_path(filename: str) -> Path:
+    if Path(filename).name != filename or not filename.endswith(".html"):
+        raise HTTPException(400, "invalid visualization filename")
+    base = visualization_dir().resolve()
+    path = (base / filename).resolve()
+    if not path.is_relative_to(base):
+        raise HTTPException(400, "invalid visualization filename")
+    if not path.is_file():
+        raise HTTPException(404, "visualization not found")
+    return path
+
+
+def teaching_visualization_keywords() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    return (
+        (
+            "solid_geometry",
+            (
+                "立体几何",
+                "空间几何",
+                "空间想象",
+                "空间思维",
+                "三视图",
+                "截面",
+                "正方体",
+                "长方体",
+                "棱锥",
+                "棱柱",
+                "圆柱",
+                "圆锥",
+                "球",
+                "线面角",
+                "二面角",
+                "异面直线",
+                "点到平面",
+                "面面垂直",
+                "线面垂直",
+                "体积",
+                "表面积",
+                "solid geometry",
+                "dihedral",
+                "line-plane",
+            ),
+        ),
+        (
+            "analytic_geometry",
+            (
+                "解析几何",
+                "圆锥曲线",
+                "椭圆",
+                "双曲线",
+                "抛物线",
+                "焦点",
+                "准线",
+                "弦长",
+                "轨迹",
+                "斜率",
+                "离心率",
+                "数量积",
+                "定点",
+                "定值",
+                "切线",
+                "analytic geometry",
+                "conic",
+                "ellipse",
+                "hyperbola",
+                "parabola",
+                "locus",
+            ),
+        ),
+        (
+            "geometry_or_spatial",
+            (
+                "几何",
+                "图形",
+                "图像",
+                "坐标系",
+                "向量",
+                "平面直角坐标系",
+                "函数图像",
+                "旋转",
+                "平移",
+                "相似",
+                "全等",
+                "角度",
+                "面积",
+                "可视化",
+                "滑块",
+                "动态演示",
+                "交互",
+                "geometry",
+                "visualize",
+                "interactive",
+            ),
+        ),
+    )
+
+
+def teaching_visualization_candidate(text: str) -> dict:
+    normalized = (text or "").lower()
+    hits: list[str] = []
+    topic_type = ""
+    for candidate_type, keywords in teaching_visualization_keywords():
+        matched = [keyword for keyword in keywords if keyword.lower() in normalized]
+        if matched:
+            hits.extend(matched[:5])
+            if not topic_type or candidate_type in {"solid_geometry", "analytic_geometry"}:
+                topic_type = candidate_type
+    if not hits:
+        return {"eligible": False, "topic_type": "", "reason": ""}
+    topic_label = {
+        "solid_geometry": "立体几何/空间思维",
+        "analytic_geometry": "解析几何/圆锥曲线",
+        "geometry_or_spatial": "几何/图形可视化",
+    }.get(topic_type or "geometry_or_spatial", "几何/图形可视化")
+    return {
+        "eligible": True,
+        "topic_type": topic_type or "geometry_or_spatial",
+        "reason": f"{topic_label}：{', '.join(dict.fromkeys(hits[:6]))}",
+    }
+
+
+def strip_code_fence(text: str) -> str:
+    stripped = (text or "").strip()
+    fence = re.match(r"^```(?:html)?\s*(.*?)\s*```$", stripped, flags=re.IGNORECASE | re.DOTALL)
+    return fence.group(1).strip() if fence else stripped
+
+
+def extract_html_document(text: str) -> str:
+    stripped = strip_code_fence(text)
+    match = re.search(r"<!doctype html\b.*?</html>", stripped, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return match.group(0).strip()
+    match = re.search(r"<html\b.*?</html>", stripped, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return "<!doctype html>\n" + match.group(0).strip()
+    if "<body" in stripped.lower() or "<main" in stripped.lower():
+        return "<!doctype html>\n<html lang=\"zh-CN\">\n<head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>可视化讲解</title></head>\n<body>\n" + stripped + "\n</body>\n</html>"
+    raise ValueError("model did not return an HTML document")
+
+
+def sanitize_teaching_html(html_text: str) -> str:
+    document = extract_html_document(html_text)
+    document = re.sub(r"<script\b[^>]*\bsrc\s*=\s*(['\"])(?!https://cdn\.jsdelivr\.net/|https://unpkg\.com/).*?</script>", "", document, flags=re.IGNORECASE | re.DOTALL)
+    document = re.sub(r"\s+on[a-z]+\s*=\s*(['\"]).*?\1", "", document, flags=re.IGNORECASE | re.DOTALL)
+    document = re.sub(r"\s+href\s*=\s*(['\"])\s*javascript:.*?\1", " href=\"#\"", document, flags=re.IGNORECASE | re.DOTALL)
+    document = re.sub(r"\s+src\s*=\s*(['\"])\s*javascript:.*?\1", "", document, flags=re.IGNORECASE | re.DOTALL)
+    document = re.sub(r"<meta[^>]+http-equiv\s*=\s*(['\"]?)refresh\1[^>]*>", "", document, flags=re.IGNORECASE)
+    if "<!doctype html" not in document[:80].lower():
+        document = "<!doctype html>\n" + document
+    if "<meta charset" not in document.lower():
+        document = document.replace("<head>", '<head>\n<meta charset="utf-8">', 1)
+    if "viewport" not in document.lower():
+        document = document.replace("<head>", '<head>\n<meta name="viewport" content="width=device-width, initial-scale=1">', 1)
+    if len(document) > TEACHING_VISUALIZATION_HTML_CHAR_LIMIT:
+        raise ValueError("generated HTML is too large")
+    return document
+
+
+def visualization_row_to_dict(row: dict) -> dict:
+    item = dict(row)
+    filename = item.get("html_filename") or ""
+    item["url"] = f"/visualizations/{filename}" if filename else ""
+    item["can_open"] = bool(filename and (visualization_dir() / filename).is_file())
+    return item
+
+
+def visualizations_for_sources(source_pairs: list[tuple[str, str]]) -> dict[tuple[str, str], dict]:
+    pairs = [(source_type, source_id) for source_type, source_id in source_pairs if source_type and source_id]
+    if not pairs:
+        return {}
+    clauses = " OR ".join("(source_type=? AND source_id=?)" for _ in pairs)
+    params: list[object] = []
+    for source_type, source_id in pairs:
+        params.extend([source_type, source_id])
+    with connect() as conn:
+        rows = [dict(row) for row in conn.execute(f"SELECT * FROM teaching_visualizations WHERE {clauses}", params)]
+    return {(row["source_type"], row["source_id"]): visualization_row_to_dict(row) for row in rows}
+
+
+def latest_visualization_for_source(source_type: str, source_id: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM teaching_visualizations
+            WHERE source_type=? AND source_id=?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (source_type, source_id),
+        ).fetchone()
+    return visualization_row_to_dict(dict(row)) if row else None
+
+
+def attach_visualization_metadata(items: list[dict], source_type: str, *, text_keys: tuple[str, ...]) -> list[dict]:
+    existing = visualizations_for_sources([(source_type, str(item.get("id") or "")) for item in items])
+    for item in items:
+        source_id = str(item.get("id") or "")
+        source_text = "\n".join(str(item.get(key) or "") for key in text_keys)
+        candidate = teaching_visualization_candidate(source_text)
+        item["visualization_candidate"] = bool(candidate["eligible"])
+        item["visualization_topic_type"] = candidate["topic_type"]
+        item["visualization_reason"] = candidate["reason"]
+        item["visualization"] = existing.get((source_type, source_id))
+    return items
+
+
+def visualization_title_from_source(source_type: str, source: dict, topic_type: str) -> str:
+    if source_type == "qa_event":
+        title = source.get("question") or source.get("answer") or "互动教学可视化"
+    elif source_type == "analysis":
+        title = source.get("content") or "解析可视化"
+    else:
+        title = source.get("title") or source.get("text") or "互动教学可视化"
+    title = re.sub(r"\s+", " ", str(title or "")).strip()
+    title = re.sub(r"[#*_`<>]", "", title)
+    if len(title) > 36:
+        title = title[:34].rstrip() + "..."
+    prefix = {
+        "solid_geometry": "立体几何",
+        "analytic_geometry": "解析几何",
+        "geometry_or_spatial": "可视化讲解",
+    }.get(topic_type, "可视化讲解")
+    return f"{prefix}：{title}" if title else prefix
+
+
+def build_teaching_visualization_prompt(
+    *,
+    source_type: str,
+    source: dict,
+    source_text: str,
+    topic_type: str,
+    title: str,
+    extra_instruction: str = "",
+) -> str:
+    edulab_mode = {
+        "solid_geometry": (
+            "Use the edulab edu-solid-geometry spirit: a self-contained lesson page with formulas/steps on the left "
+            "and an interactive Three.js 3D model on the right. Include rotation, zoom, step highlights, camera/reset controls, "
+            "and sliders when parameters can vary."
+        ),
+        "analytic_geometry": (
+            "Use the edulab edu-analytic-geometry spirit: a self-contained lesson page with KaTeX formulas, a 2D Canvas board, "
+            "sliders for parameters, real-time readouts, trace/point/line overlays, and range or invariant indicators."
+        ),
+        "geometry_or_spatial": (
+            "Use the edulab teaching-page spirit: make the abstract geometry or spatial reasoning visible with Canvas/SVG/Three.js, "
+            "formula cards, step controls, and sliders or rotation where useful."
+        ),
+    }.get(topic_type, "Create an interactive teaching visualization page.")
+    return truncate_text(
+        f"""
+You are generating an interactive HTML teaching artifact for 知进伴学.
+The user wants edulab-style output when geometry, spatial reasoning, or visual math appears.
+Use the configured OpenAI-compatible model as the generator; return only a complete HTML document.
+
+Source type: {source_type}
+Topic type: {topic_type}
+Page title: {title}
+
+edulab direction:
+{edulab_mode}
+
+Content to visualize:
+{truncate_text(source_text, TEACHING_VISUALIZATION_SOURCE_CHAR_LIMIT)}
+
+Extra instruction from user or UI:
+{extra_instruction or "无"}
+
+Hard requirements:
+- Output exactly one complete self-contained HTML document, starting with <!doctype html>. No Markdown fences, no explanation outside HTML.
+- Chinese UI copy by default.
+- Make it useful as a teaching page: problem statement, known conditions, formula area, step-by-step explanation, answer/check area, and an interactive visualization.
+- Include controls a student expects: step buttons, reset button, at least one slider when a parameter or viewpoint can vary, and 3D drag/rotation for solid geometry.
+- For solid geometry or spatial-thinking content, use Three.js from https://cdn.jsdelivr.net when needed. For 2D geometry, Canvas/SVG is fine. For formulas, use KaTeX or MathJax CDN if helpful.
+- Do not rely on network except CDN libraries from jsdelivr or unpkg. Do not call APIs. Do not use forms or external links.
+- Keep the page robust if the exact problem is partially unclear: state visible assumptions and let the visualization teach the method rather than inventing unsupported facts.
+- Keep CSS restrained and app-like: compact panels, clear contrast, no marketing hero, no decorative gradient orbs.
+- All JavaScript must be inline and safe to run inside an iframe.
+- Do not use inline event-handler attributes such as onclick/oninput/onchange; attach listeners from the inline script instead.
+- Avoid auto-playing audio/video, alerts, prompts, or popups.
+""".strip(),
+        TEACHING_VISUALIZATION_PROMPT_CHAR_LIMIT,
+    )
+
+
+def teaching_visualization_source(source_type: str, source_id: str, *, session_id: str = "", text: str = "", title: str = "") -> tuple[dict, str]:
+    if source_type == "qa_event":
+        with connect() as conn:
+            row = conn.execute("SELECT * FROM qa_events WHERE id=?", (source_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "qa event not found")
+        source = qa_event_row_to_dict(dict(row))
+        if session_id and source.get("session_id") != session_id:
+            raise HTTPException(404, "qa event not found in session")
+        source_text = "\n".join(
+            [
+                f"学生问题：{source.get('question') or ''}",
+                f"AI 回答：{source.get('answer') or ''}",
+                f"触发方式：{source.get('trigger_type') or ''}",
+                f"图像上下文：{source.get('image_context_mode') or ''}",
+            ]
+        )
+        return source, source_text
+    if source_type == "analysis":
+        with connect() as conn:
+            row = conn.execute("SELECT * FROM analyses WHERE id=?", (source_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "analysis not found")
+        source = dict(row)
+        if session_id and source.get("session_id") != session_id:
+            raise HTTPException(404, "analysis not found in session")
+        source_text = "\n".join(
+            [
+                f"解析范围：{source.get('scope') or ''}",
+                f"解析内容：{source.get('content') or ''}",
+            ]
+        )
+        return source, source_text
+    if source_type == "custom":
+        source = {"id": source_id, "session_id": session_id, "title": title, "text": text}
+        return source, text
+    raise HTTPException(422, "unsupported visualization source_type")
+
+
+def ensure_visualization_session(session_id: str, title: str = "") -> str:
+    session_id = clean_user_text(session_id, 120) or uuid.uuid4().hex
+    now = utc_now()
+    with connect() as conn:
+        row = conn.execute("SELECT id FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if not row:
+            conn.execute(
+                """
+                INSERT INTO sessions(
+                    id, device_id, mode, title, status, created_at, updated_at,
+                    student_goal, assistant_focus, inferred_needs, report_style
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, '', '', '[]', '')
+                """,
+                (
+                    session_id,
+                    "visualization",
+                    "custom_visualization",
+                    title or "教学可视化",
+                    "active",
+                    now,
+                    now,
+                ),
+            )
+    return session_id
+
+
+def write_teaching_visualization_html(visualization_id: str, html_text: str) -> str:
+    filename = f"{visualization_id}.html"
+    target = visualization_dir() / filename
+    temp = target.with_name(f".{filename}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(html_text, encoding="utf-8")
+        temp.replace(target)
+    finally:
+        if temp.exists():
+            temp.unlink()
+    return filename
+
+
+async def generate_teaching_visualization(
+    *,
+    source_type: str,
+    source_id: str,
+    session_id: str = "",
+    source_text: str = "",
+    title: str = "",
+    force: bool = False,
+    extra_instruction: str = "",
+) -> dict:
+    if source_type not in TEACHING_VISUALIZATION_SOURCE_TYPES:
+        raise HTTPException(422, "unsupported visualization source_type")
+    existing = latest_visualization_for_source(source_type, source_id)
+    if existing and existing.get("status") == "ready" and existing.get("can_open") and not force:
+        return existing
+
+    source, resolved_text = teaching_visualization_source(source_type, source_id, session_id=session_id, text=source_text, title=title)
+    resolved_session_id = str(source.get("session_id") or session_id or "")
+    content = source_text or resolved_text
+    candidate = teaching_visualization_candidate(content + "\n" + extra_instruction)
+    if not candidate["eligible"] and not force:
+        raise HTTPException(422, "source is not a geometry or spatial visualization candidate")
+    topic_type = candidate["topic_type"] or "geometry_or_spatial"
+    resolved_title = title or visualization_title_from_source(source_type, source, topic_type)
+    prompt = build_teaching_visualization_prompt(
+        source_type=source_type,
+        source=source,
+        source_text=content,
+        topic_type=topic_type,
+        title=resolved_title,
+        extra_instruction=extra_instruction,
+    )
+    visualization_id = existing.get("id") if existing else uuid.uuid4().hex
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO teaching_visualizations(
+                id, session_id, source_type, source_id, status, title, topic_type,
+                trigger_reason, prompt, html_filename, error, created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, 'running', ?, ?, ?, ?, '', '', ?, ?)
+            ON CONFLICT(source_type, source_id) DO UPDATE SET
+                status='running',
+                session_id=excluded.session_id,
+                title=excluded.title,
+                topic_type=excluded.topic_type,
+                trigger_reason=excluded.trigger_reason,
+                prompt=excluded.prompt,
+                error='',
+                updated_at=excluded.updated_at
+            """,
+            (
+                visualization_id,
+                resolved_session_id,
+                source_type,
+                source_id,
+                resolved_title,
+                topic_type,
+                candidate["reason"],
+                prompt,
+                now,
+                now,
+            ),
+        )
+        row = conn.execute("SELECT id FROM teaching_visualizations WHERE source_type=? AND source_id=?", (source_type, source_id)).fetchone()
+        if row:
+            visualization_id = row["id"]
+    try:
+        settings = effective_llm_settings_for_session(resolved_session_id or None)
+        raw_html = await run_with_llm_gate(
+            f"teaching_visualization:{source_type}:{source_id[:8]}",
+            resolved_session_id or None,
+            lambda: llm.analyze_text(settings, prompt, max_tokens=TEACHING_VISUALIZATION_MAX_TOKENS),
+            priority=LLM_PRIORITY_REALTIME,
+        )
+        clean_html = sanitize_teaching_html(raw_html)
+        html_filename = write_teaching_visualization_html(visualization_id, clean_html)
+        status = "ready"
+        error = ""
+    except Exception as exc:
+        html_filename = ""
+        status = "failed"
+        error = llm.format_llm_error(exc) if not isinstance(exc, ValueError) else str(exc)
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE teaching_visualizations
+            SET status=?, html_filename=?, error=?, updated_at=?
+            WHERE id=?
+            """,
+            (status, html_filename, truncate_text(error, 1200), utc_now(), visualization_id),
+        )
+        row = conn.execute("SELECT * FROM teaching_visualizations WHERE id=?", (visualization_id,)).fetchone()
+    result = visualization_row_to_dict(dict(row)) if row else {}
+    if status == "failed":
+        emit_log(
+            f"教学可视化生成失败：source={source_type}/{source_id} error={truncate_text(error, 180)}",
+            session_id=resolved_session_id or None,
+            source="visualization",
+            level="error",
+        )
+    else:
+        emit_log(
+            f"教学可视化生成完成：source={source_type}/{source_id} url={result.get('url')}",
+            session_id=resolved_session_id or None,
+            source="visualization",
+        )
+    return result
+
+
+def asset_document_payload(asset_kind: str, row: dict) -> dict:
+    if asset_kind == "learning":
+        lines = [
+            f"类型：{row.get('item_type') or 'learning'}",
+            f"标题：{row.get('title') or ''}",
+            f"内容：{row.get('content') or ''}",
+            f"科目：{row.get('subject') or ''}",
+            f"位置：{row.get('location_ref') or ''}",
+            f"页码：{row.get('page_ref') or ''}",
+            f"题号：{row.get('question_ref') or ''}",
+            f"来源：{row.get('source_summary') or ''}",
+        ]
+    else:
+        knowledge_points = json_list(row.get("knowledge_points"))
+        lines = [
+            f"类型：错题本候选",
+            f"标题：{row.get('title') or ''}",
+            f"状态：{row.get('status') or ''}",
+            f"复习状态：{row.get('review_state') or ''}",
+            f"下次复习：{row.get('next_review_at') or ''}",
+            f"科目：{row.get('subject') or ''}",
+            f"位置：{row.get('location_ref') or ''}",
+            f"页码：{row.get('page_ref') or ''}",
+            f"题号：{row.get('question_ref') or ''}",
+            f"题目：{row.get('question_text') or ''}",
+            f"学生答案：{row.get('student_answer') or ''}",
+            f"参考答案：{row.get('expected_answer') or ''}",
+            f"错在哪里：{row.get('error_reason') or row.get('evidence') or ''}",
+            f"错误类型：{row.get('error_type') or ''}",
+            f"订正：{row.get('correction') or ''}",
+            f"下一步：{row.get('next_action') or ''}",
+            f"知识点：{'、'.join(knowledge_points)}",
+            f"证据：{row.get('evidence') or ''}",
+            f"来源：{row.get('source_summary') or ''}",
+        ]
+    body = truncate_text("\n".join(line for line in lines if not line.endswith("：")), ASSET_DOCUMENT_BODY_LIMIT)
+    search_text = normalize_learning_content(body)
+    return {
+        "subject": row.get("subject") or "",
+        "page_ref": row.get("page_ref") or "",
+        "question_ref": row.get("question_ref") or "",
+        "location_ref": row.get("location_ref") or "",
+        "title": row.get("title") or "",
+        "body": body,
+        "search_text": search_text,
+        "source_image_ids": row.get("source_image_ids") or "[]",
+        "source_image_details": row.get("source_image_details") or "[]",
+        "first_seen_at": row.get("first_seen_at") or "",
+        "last_seen_at": row.get("last_seen_at") or "",
+    }
+
+
+def sync_asset_document(conn, asset_kind: str, asset_id: str) -> None:
+    if asset_kind == "learning":
+        row = conn.execute("SELECT * FROM learning_items WHERE id=?", (asset_id,)).fetchone()
+    elif asset_kind == "mistake":
+        row = conn.execute("SELECT * FROM mistake_items WHERE id=?", (asset_id,)).fetchone()
+    else:
+        return
+    if not row:
+        return
+    data = dict(row)
+    payload = asset_document_payload(asset_kind, data)
+    now = utc_now()
+    document_id = f"{asset_kind}:{asset_id}"
+    conn.execute(
+        """
+        INSERT INTO asset_documents(
+            id, session_id, asset_kind, asset_id, subject, page_ref, question_ref,
+            location_ref, title, body, search_text, source_image_ids, source_image_details,
+            first_seen_at, last_seen_at, created_at, updated_at
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(asset_kind, asset_id) DO UPDATE SET
+            subject=excluded.subject,
+            page_ref=excluded.page_ref,
+            question_ref=excluded.question_ref,
+            location_ref=excluded.location_ref,
+            title=excluded.title,
+            body=excluded.body,
+            search_text=excluded.search_text,
+            source_image_ids=excluded.source_image_ids,
+            source_image_details=excluded.source_image_details,
+            first_seen_at=excluded.first_seen_at,
+            last_seen_at=excluded.last_seen_at,
+            updated_at=excluded.updated_at
+        """,
+        (
+            document_id,
+            data["session_id"],
+            asset_kind,
+            asset_id,
+            payload["subject"],
+            payload["page_ref"],
+            payload["question_ref"],
+            payload["location_ref"],
+            payload["title"],
+            payload["body"],
+            payload["search_text"],
+            payload["source_image_ids"],
+            payload["source_image_details"],
+            payload["first_seen_at"],
+            payload["last_seen_at"],
+            data.get("created_at") or now,
+            now,
+        ),
+    )
+
+
+def backfill_asset_documents(limit: int = 1200) -> dict:
+    with connect() as conn:
+        backfill_asset_source_details(conn, "learning_items", "learning")
+        backfill_asset_source_details(conn, "mistake_items", "mistake")
+        learning_ids = [
+            row["id"]
+            for row in conn.execute(
+                """
+                SELECT li.id
+                FROM learning_items li
+                LEFT JOIN asset_documents ad ON ad.asset_kind='learning' AND ad.asset_id=li.id
+                WHERE ad.id IS NULL
+                ORDER BY li.created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+        ]
+        remaining = max(0, limit - len(learning_ids))
+        mistake_ids = [
+            row["id"]
+            for row in conn.execute(
+                """
+                SELECT mi.id
+                FROM mistake_items mi
+                LEFT JOIN asset_documents ad ON ad.asset_kind='mistake' AND ad.asset_id=mi.id
+                WHERE ad.id IS NULL
+                ORDER BY mi.created_at DESC
+                LIMIT ?
+                """,
+                (remaining,),
+            )
+        ]
+        for asset_id in learning_ids:
+            sync_asset_document(conn, "learning", asset_id)
+        for asset_id in mistake_ids:
+            sync_asset_document(conn, "mistake", asset_id)
+    return {"learning": len(learning_ids), "mistake": len(mistake_ids)}
+
+
+def backfill_asset_source_details(conn, table: str, asset_kind: str, limit: int = 400) -> int:
+    rows = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT id, source_image_ids, source_image_details, source_summary, page_ref, question_ref, location_ref
+            FROM {table}
+            WHERE source_image_ids != '[]'
+              AND (source_image_details = '[]' OR source_image_details = '' OR source_summary = '')
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+    ]
+    updated = 0
+    for row in rows:
+        image_ids = json_list(row.get("source_image_ids"))
+        if not image_ids:
+            continue
+        placeholders = ", ".join("?" for _ in image_ids)
+        images = [
+            dict(image)
+            for image in conn.execute(
+                f"""
+                SELECT id, filename, page_hint, question_hint, captured_at, sequence_index
+                FROM images
+                WHERE id IN ({placeholders})
+                ORDER BY sequence_index, captured_at, created_at
+                """,
+                image_ids,
+            )
+        ]
+        if not images:
+            continue
+        details = source_image_details_from_rows(images)
+        summary = row.get("source_summary") or source_summary_from_images(images)
+        refs = source_refs_from_images(images)
+        page_ref = row.get("page_ref") or refs["page_ref"]
+        question_ref = row.get("question_ref") or refs["question_ref"]
+        location_ref = row.get("location_ref") or refs["location_ref"]
+        conn.execute(
+            f"""
+            UPDATE {table}
+            SET source_image_details=?, source_summary=?, page_ref=?, question_ref=?, location_ref=?, updated_at=?
+            WHERE id=?
+            """,
+            (json_dumps(details), summary, page_ref, question_ref, location_ref, utc_now(), row["id"]),
+        )
+        sync_asset_document(conn, asset_kind, row["id"])
+        updated += 1
+    return updated
+
+
+def upsert_learning_item(conn, item: dict, source: dict) -> str:
+    now = utc_now()
+    existing = conn.execute(
+        """
+        SELECT *
+        FROM learning_items
+        WHERE session_id=? AND item_type=? AND content_hash=?
+        """,
+        (source["session_id"], item["item_type"], item["content_hash"]),
+    ).fetchone()
+    source_image_ids = list(dict.fromkeys(source.get("source_image_ids") or []))
+    source_image_details = source.get("source_image_details") or []
+    source_summary = source.get("source_summary") or ""
+    if existing:
+        existing_ids = json_list(existing["source_image_ids"])
+        merged_ids = list(dict.fromkeys([*existing_ids, *source_image_ids]))
+        merged_details = merge_source_details(existing["source_image_details"], source_image_details)
+        content = existing["content"]
+        title = existing["title"]
+        if len(item["content"]) > len(content):
+            content = item["content"]
+            title = item["title"]
+        subject = merge_text_value(existing["subject"], item.get("subject", ""))
+        page_ref = merge_text_value(existing["page_ref"], item.get("page_ref", ""))
+        question_ref = merge_text_value(existing["question_ref"], item.get("question_ref", ""))
+        location_ref = merge_text_value(existing["location_ref"], item.get("location_ref", "") or compose_location_ref(page_ref, question_ref, item.get("content", "")))
+        summary = merge_text_value(existing["source_summary"], source_summary, ASSET_SOURCE_SUMMARY_LIMIT)
+        conn.execute(
+            """
+            UPDATE learning_items
+            SET batch_id=?, analysis_id=?, title=?, content=?, subject=?, page_ref=?,
+                question_ref=?, location_ref=?, source_summary=?, source_image_details=?, last_seen_at=?,
+                last_sequence_index=?, source_image_ids=?, evidence_count=evidence_count + 1,
+                confidence=?, updated_at=?
+            WHERE id=?
+            """,
+            (
+                source.get("batch_id"),
+                source.get("analysis_id"),
+                title,
+                content,
+                subject,
+                page_ref,
+                question_ref,
+                location_ref,
+                summary,
+                json_dumps(merged_details),
+                source.get("last_seen_at") or existing["last_seen_at"],
+                source.get("last_sequence_index") or existing["last_sequence_index"],
+                json_dumps(merged_ids),
+                source.get("confidence", "llm"),
+                now,
+                existing["id"],
+            ),
+        )
+        sync_asset_document(conn, "learning", existing["id"])
+        return existing["id"]
+    item_id = uuid.uuid4().hex
+    conn.execute(
+        """
+        INSERT INTO learning_items(
+            id, session_id, batch_id, analysis_id, item_type, title, content,
+            subject, page_ref, question_ref, location_ref, source_summary, source_image_details, content_hash,
+            first_seen_at, last_seen_at, first_sequence_index, last_sequence_index,
+            source_image_ids, evidence_count, confidence, created_at, updated_at
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            item_id,
+            source["session_id"],
+            source.get("batch_id"),
+            source.get("analysis_id"),
+            item["item_type"],
+            item["title"],
+            item["content"],
+            item.get("subject", ""),
+            item.get("page_ref", ""),
+            item.get("question_ref", ""),
+            item.get("location_ref", ""),
+            source_summary,
+            json_dumps(source_image_details),
+            item["content_hash"],
+            source.get("first_seen_at") or now,
+            source.get("last_seen_at") or source.get("first_seen_at") or now,
+            source.get("first_sequence_index") or 0,
+            source.get("last_sequence_index") or source.get("first_sequence_index") or 0,
+            json_dumps(source_image_ids),
+            1,
+            source.get("confidence", "llm"),
+            now,
+            now,
+        ),
+    )
+    sync_asset_document(conn, "learning", item_id)
+    return item_id
+
+
+def upsert_mistake_item(conn, item: dict, source: dict, learning_item_id: str | None = None) -> str:
+    now = utc_now()
+    existing = conn.execute(
+        "SELECT * FROM mistake_items WHERE session_id=? AND content_hash=?",
+        (source["session_id"], item["content_hash"]),
+    ).fetchone()
+    source_image_ids = list(dict.fromkeys(source.get("source_image_ids") or []))
+    source_image_details = source.get("source_image_details") or []
+    source_summary = source.get("source_summary") or ""
+    if existing:
+        merged_ids = list(dict.fromkeys([*json_list(existing["source_image_ids"]), *source_image_ids]))
+        merged_details = merge_source_details(existing["source_image_details"], source_image_details)
+        question_text = merge_text_value(existing["question_text"], item.get("question_text", ""), LEARNING_ITEM_CONTENT_LIMIT)
+        student_answer = merge_text_value(existing["student_answer"], item.get("student_answer", ""), LEARNING_ITEM_CONTENT_LIMIT)
+        expected_answer = merge_text_value(existing["expected_answer"], item.get("expected_answer", ""), LEARNING_ITEM_CONTENT_LIMIT)
+        error_reason = merge_text_value(existing["error_reason"], item.get("error_reason", ""), MISTAKE_REASON_LIMIT)
+        evidence = merge_text_value(existing["evidence"], item.get("evidence", ""), MISTAKE_REASON_LIMIT)
+        conn.execute(
+            """
+            UPDATE mistake_items
+            SET learning_item_id=COALESCE(?, learning_item_id), batch_id=?, analysis_id=?,
+                title=?, question_text=?, student_answer=?, expected_answer=?,
+                error_reason=?, knowledge_points=?, subject=?, page_ref=?, question_ref=?,
+                location_ref=?, error_type=?, correction=?, next_action=?, source_summary=?,
+                source_image_details=?, status=?,
+                review_state=CASE
+                    WHEN review_state IN ('mastered', 'ignored') THEN review_state
+                    WHEN status IN ('ignored', 'mastered') THEN review_state
+                    WHEN review_state='' THEN 'queued'
+                    ELSE review_state
+                END,
+                next_review_at=CASE
+                    WHEN status IN ('ignored', 'mastered') OR review_state IN ('mastered', 'ignored') THEN next_review_at
+                    WHEN next_review_at='' THEN ?
+                    ELSE next_review_at
+                END,
+                evidence=?, source_image_ids=?, last_seen_at=?, updated_at=?
+            WHERE id=?
+            """,
+            (
+                learning_item_id,
+                source.get("batch_id"),
+                source.get("analysis_id"),
+                merge_text_value(existing["title"], item.get("title", "")),
+                question_text,
+                student_answer,
+                expected_answer,
+                error_reason,
+                json_dumps(merge_json_lists(existing["knowledge_points"], item.get("knowledge_points") or [])),
+                merge_text_value(existing["subject"], item.get("subject", "")),
+                merge_text_value(existing["page_ref"], item.get("page_ref", "")),
+                merge_text_value(existing["question_ref"], item.get("question_ref", "")),
+                merge_text_value(existing["location_ref"], item.get("location_ref", "")),
+                merge_text_value(existing["error_type"], item.get("error_type", "")),
+                merge_text_value(existing["correction"], item.get("correction", ""), ASSET_SOURCE_SUMMARY_LIMIT),
+                merge_text_value(existing["next_action"], item.get("next_action", ""), ASSET_SOURCE_SUMMARY_LIMIT),
+                merge_text_value(existing["source_summary"], source_summary, ASSET_SOURCE_SUMMARY_LIMIT),
+                json_dumps(merged_details),
+                merge_mistake_status(existing["status"], item.get("status", "suspected")),
+                review_due_at_for(merge_mistake_status(existing["status"], item.get("status", "suspected")), existing["review_state"] or "queued"),
+                evidence,
+                json_dumps(merged_ids),
+                source.get("last_seen_at") or existing["last_seen_at"],
+                now,
+                existing["id"],
+            ),
+        )
+        sync_asset_document(conn, "mistake", existing["id"])
+        return existing["id"]
+    mistake_id = uuid.uuid4().hex
+    conn.execute(
+        """
+        INSERT INTO mistake_items(
+            id, session_id, learning_item_id, batch_id, analysis_id, title,
+            question_text, student_answer, expected_answer, error_reason,
+            knowledge_points, subject, page_ref, question_ref, location_ref,
+            error_type, correction, next_action, source_summary, source_image_details,
+            status, review_state, next_review_at, evidence, source_image_ids,
+            first_seen_at, last_seen_at, content_hash, created_at, updated_at
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            mistake_id,
+            source["session_id"],
+            learning_item_id,
+            source.get("batch_id"),
+            source.get("analysis_id"),
+            item["title"],
+            item.get("question_text", ""),
+            item.get("student_answer", ""),
+            item.get("expected_answer", ""),
+            item.get("error_reason", ""),
+            json_dumps(item.get("knowledge_points") or []),
+            item.get("subject", ""),
+            item.get("page_ref", ""),
+            item.get("question_ref", ""),
+            item.get("location_ref", ""),
+            item.get("error_type", ""),
+            item.get("correction", ""),
+            item.get("next_action", ""),
+            source_summary,
+            json_dumps(source_image_details),
+            item.get("status", "suspected"),
+            "queued",
+            review_due_at_for(item.get("status", "suspected"), "queued"),
+            item.get("evidence", ""),
+            json_dumps(source_image_ids),
+            source.get("first_seen_at") or now,
+            source.get("last_seen_at") or source.get("first_seen_at") or now,
+            item["content_hash"],
+            now,
+            now,
+        ),
+    )
+    sync_asset_document(conn, "mistake", mistake_id)
+    return mistake_id
+
+
+def build_manual_mistake_item(body: dict) -> dict:
+    question = clean_user_text(
+        body.get("question_text") or body.get("question") or body.get("user_question"),
+        LEARNING_ITEM_CONTENT_LIMIT,
+    )
+    answer = clean_user_text(body.get("answer") or body.get("assistant_answer"), LEARNING_ITEM_CONTENT_LIMIT)
+    student_answer = clean_user_text(body.get("student_answer"), LEARNING_ITEM_CONTENT_LIMIT)
+    expected_answer = clean_user_text(body.get("expected_answer"), LEARNING_ITEM_CONTENT_LIMIT)
+    error_reason = clean_user_text(
+        body.get("error_reason") or body.get("reason") or "用户从本轮 AI 回答手动加入错题本",
+        MISTAKE_REASON_LIMIT,
+    )
+    correction = clean_user_text(body.get("correction") or answer, ASSET_SOURCE_SUMMARY_LIMIT)
+    next_action = clean_user_text(
+        body.get("next_action") or "复习时先复述错因，再做一道相似题。",
+        ASSET_SOURCE_SUMMARY_LIMIT,
+    )
+    title = clean_user_text(body.get("title") or question or answer or "手动加入错题", LEARNING_ITEM_TITLE_LIMIT)
+    if not question and not answer:
+        raise HTTPException(422, "question or answer is required")
+    knowledge_points = clean_string_list(body.get("knowledge_points"))
+    content_seed = "\n".join(
+        part
+        for part in (
+            title,
+            question,
+            student_answer,
+            expected_answer,
+            error_reason,
+            correction,
+        )
+        if part
+    )
+    item = enrich_asset_fields_from_text(
+        {
+            "title": title_for_learning_item(title),
+            "question_text": question,
+            "student_answer": student_answer,
+            "expected_answer": expected_answer,
+            "error_reason": error_reason,
+            "knowledge_points": knowledge_points,
+            "status": normalize_mistake_status(body.get("status"), default="confirmed"),
+            "evidence": clean_user_text(body.get("evidence") or answer or question, MISTAKE_REASON_LIMIT),
+            "error_type": clean_user_text(body.get("error_type"), ASSET_FIELD_LIMIT),
+            "correction": correction,
+            "next_action": next_action,
+            "content_hash": short_hash(normalize_learning_content(content_seed)),
+        },
+        content_seed,
+        clean_user_text(body.get("subject"), ASSET_FIELD_LIMIT),
+    )
+    return item
+
+
+def create_manual_mistake_item(session_id: str, body: dict) -> dict:
+    init_db()
+    with connect() as conn:
+        session = conn.execute("SELECT id FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if not session:
+            raise HTTPException(404, "session not found")
+        source = {
+            "session_id": session_id,
+            "source_image_ids": clean_string_list(body.get("source_image_ids"), limit=20, max_chars=80),
+            "source_image_details": [],
+            "source_summary": clean_user_text(body.get("source_summary") or "来自问答手动加入错题本", ASSET_SOURCE_SUMMARY_LIMIT),
+            "confidence": "manual",
+            "first_seen_at": utc_now(),
+            "last_seen_at": utc_now(),
+        }
+        mistake_id = upsert_mistake_item(conn, build_manual_mistake_item(body), source)
+        row = conn.execute("SELECT * FROM mistake_items WHERE id=?", (mistake_id,)).fetchone()
+    if not row:
+        raise HTTPException(500, "mistake not stored")
+    return mistake_row_to_dict(row)
+
+
+def source_images_for_analysis(session_id: str, batch_id: str | None, filenames: list[str]) -> list[dict]:
+    with connect() as conn:
+        if filenames:
+            placeholders = ", ".join("?" for _ in filenames)
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    f"""
+                    SELECT id, filename, page_hint, question_hint, captured_at, sequence_index
+                    FROM images
+                    WHERE session_id=? AND filename IN ({placeholders})
+                    ORDER BY sequence_index, captured_at, created_at
+                    """,
+                    [session_id, *filenames],
+                )
+            ]
+        elif batch_id:
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT id, filename, page_hint, question_hint, captured_at, sequence_index
+                    FROM images
+                    WHERE session_id=? AND batch_id=?
+                    ORDER BY sequence_index, captured_at, created_at
+                    """,
+                    (session_id, batch_id),
+                )
+            ]
+        else:
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT id, filename, page_hint, question_hint, captured_at, sequence_index
+                    FROM images
+                    WHERE session_id=? AND batch_id IS NULL
+                    ORDER BY sequence_index, captured_at, created_at
+                    """,
+                    (session_id,),
+                )
+            ]
+    return rows
+
+
+def store_learning_items_from_analysis(
+    session_id: str,
+    batch_id: str | None,
+    analysis_id: str,
+    content: str,
+    filenames: list[str],
+) -> dict:
+    items = extract_learning_items(content)
+    mistakes = extract_mistake_items(content, items)
+    if not items and not mistakes:
+        return {"learning_item_count": 0, "mistake_item_count": 0}
+    images = source_images_for_analysis(session_id, batch_id, filenames)
+    source_image_ids = [row["id"] for row in images]
+    source_image_details = source_image_details_from_rows(images)
+    source_summary = source_summary_from_images(images)
+    first = images[0] if images else {}
+    last = images[-1] if images else first
+    source = {
+        "session_id": session_id,
+        "batch_id": batch_id,
+        "analysis_id": analysis_id,
+        "source_image_ids": source_image_ids,
+        "source_image_details": source_image_details,
+        "source_summary": source_summary,
+        "first_seen_at": first.get("captured_at") or utc_now(),
+        "last_seen_at": last.get("captured_at") or first.get("captured_at") or utc_now(),
+        "first_sequence_index": int(first.get("sequence_index") or 0),
+        "last_sequence_index": int(last.get("sequence_index") or first.get("sequence_index") or 0),
+        "confidence": "llm",
+    }
+    learning_ids: list[str] = []
+    with connect() as conn:
+        for item in items:
+            learning_ids.append(upsert_learning_item(conn, item, source))
+        related_learning_id = learning_ids[0] if learning_ids else None
+        for mistake in mistakes:
+            upsert_mistake_item(conn, mistake, source, related_learning_id)
+    return {"learning_item_count": len(items), "mistake_item_count": len(mistakes)}
+
+
+def build_learning_items_context(session_id: str, max_chars: int = 2200) -> str:
+    with connect() as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT item_type, title, first_seen_at, last_seen_at, evidence_count
+                FROM learning_items
+                WHERE session_id=?
+                ORDER BY first_sequence_index, first_seen_at, created_at
+                LIMIT 80
+                """,
+                (session_id,),
+            )
+        ]
+    if not rows:
+        return ""
+    labels = {"question": "题目", "section": "板块", "knowledge": "知识点", "answer": "作答"}
+    lines = [
+        (
+            f"{index + 1}. {labels.get(row['item_type'], row['item_type'])}：{row['title']} "
+            f"（first={row['first_seen_at'] or '未知'}，last={row['last_seen_at'] or '未知'}，证据={row['evidence_count']}）"
+        )
+        for index, row in enumerate(rows)
+    ]
+    return truncate_text("\n".join(lines), max_chars)
+
+
+def learning_items_for_session(session_id: str, limit: int = 120) -> list[dict]:
+    with connect() as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT id, session_id, batch_id, analysis_id, item_type, title, content,
+                       subject, page_ref, question_ref, location_ref, source_summary,
+                       source_image_details,
+                       first_seen_at, last_seen_at, first_sequence_index, last_sequence_index,
+                       source_image_ids, evidence_count, confidence, created_at, updated_at
+                FROM learning_items
+                WHERE session_id=?
+                ORDER BY first_sequence_index, first_seen_at, created_at
+                LIMIT ?
+                """,
+                (session_id, limit),
+            )
+        ]
+    for row in rows:
+        row["source_image_ids"] = json_list(row.get("source_image_ids"))
+        row["source_image_details"] = json_list_of_dicts(row.get("source_image_details"))
+    return rows
+
+
+def mistake_items_for_session(session_id: str, limit: int = 120) -> list[dict]:
+    with connect() as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT id, session_id, learning_item_id, batch_id, analysis_id, title,
+                       question_text, student_answer, expected_answer, error_reason,
+                       knowledge_points, subject, page_ref, question_ref, location_ref,
+                       error_type, correction, next_action, source_summary, source_image_details,
+                       status, review_state, next_review_at, last_reviewed_at, review_count,
+                       review_note, confirmed_at, ignored_at, corrected_at, mastered_at,
+                       evidence, source_image_ids,
+                       first_seen_at, last_seen_at, created_at, updated_at
+                FROM mistake_items
+                WHERE session_id=?
+                ORDER BY first_seen_at, created_at
+                LIMIT ?
+                """,
+                (session_id, limit),
+            )
+        ]
+    return [mistake_row_to_dict(row) for row in rows]
+
+
+def report_events_for_session(session_id: str, limit: int = 120) -> list[dict]:
+    with connect() as conn:
+        return [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT id, session_id, analysis_id, event_type, title, content, created_at
+                FROM report_events
+                WHERE session_id=?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            )
+        ]
+
+
+QA_SECTION_ALIASES = {
+    "题号": "题目",
+    "题目": "题目",
+    "问题": "题目",
+    "已知": "关键条件",
+    "条件": "关键条件",
+    "关键条件": "关键条件",
+    "学生答案": "学生答案",
+    "作答": "学生答案",
+    "检查结果": "检查结果",
+    "结果": "检查结果",
+    "正确计算": "解题步骤",
+    "计算": "解题步骤",
+    "解法": "解题步骤",
+    "思路": "解题思路",
+    "解题思路": "解题思路",
+    "步骤": "解题步骤",
+    "过程": "解题步骤",
+    "错因": "错因提醒",
+    "错误原因": "错因提醒",
+    "订正": "订正建议",
+    "改正": "订正建议",
+    "结论": "结论",
+    "答案": "结论",
+    "先想一想": "先想一想",
+    "先试一下": "先想一想",
+    "提示": "先想一想",
+    "下一步小任务": "下一步小任务",
+    "小任务": "下一步小任务",
+    "追问建议": "追问建议",
+    "可以追问": "追问建议",
+    "下一步": "追问建议",
+}
+QA_SECTION_CLASS = {
+    "题目": "topic",
+    "关键条件": "facts",
+    "学生答案": "student",
+    "检查结果": "check",
+    "解题思路": "idea",
+    "解题步骤": "steps",
+    "错因提醒": "warning",
+    "订正建议": "fix",
+    "结论": "result",
+    "先想一想": "idea",
+    "下一步小任务": "follow",
+    "追问建议": "follow",
+}
+QA_SECTION_ORDER = [
+    "题目",
+    "关键条件",
+    "先想一想",
+    "学生答案",
+    "检查结果",
+    "解题思路",
+    "解题步骤",
+    "错因提醒",
+    "订正建议",
+    "结论",
+    "下一步小任务",
+    "追问建议",
+]
+QA_SECTION_PATTERN = re.compile(r"^\s*(?:#{1,4}\s*)?(?:[-*]\s*)?([A-Za-z\u4e00-\u9fff]{2,12})[：:]\s*(.*)$")
+QA_NUMBERED_PATTERN = re.compile(r"^\s*(?:\d+[\.、)]|[（(]\d+[）)]|[-*])\s*(.+)$")
+
+
+def normalize_qa_section_title(raw: str) -> str:
+    title = re.sub(r"\s+", "", raw or "").strip("#:-： ")
+    return QA_SECTION_ALIASES.get(title, title if title in QA_SECTION_CLASS else "")
+
+
+def linkify_escaped_text(escaped_text: str) -> str:
+    pattern = re.compile(r"(https?://[^\s<]+)")
+    return pattern.sub(lambda match: f'<a href="{match.group(1)}" target="_blank" rel="noopener">{match.group(1)}</a>', escaped_text)
+
+
+def inline_qa_markup(text: object) -> str:
+    escaped = html.escape(str(text or "").strip())
+    escaped = re.sub(r"(\d+(?:\.\d+)?)\s*([+\-×x*/÷=])\s*(\d+(?:\.\d+)?)", r'<span class="qa-math">\1 \2 \3</span>', escaped)
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+    return linkify_escaped_text(escaped)
+
+
+def qa_answer_html(answer: str) -> str:
+    text = (answer or "").strip()
+    if not text:
+        return ""
+    sections: dict[str, list[str]] = {}
+    loose: list[str] = []
+    current = ""
+    for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = QA_SECTION_PATTERN.match(line)
+        if match:
+            title = normalize_qa_section_title(match.group(1))
+            if title:
+                current = title
+                remainder = match.group(2).strip()
+                if remainder:
+                    sections.setdefault(current, []).append(remainder)
+                continue
+        numbered = QA_NUMBERED_PATTERN.match(line)
+        if current and numbered:
+            sections.setdefault(current, []).append(numbered.group(1).strip())
+            continue
+        if current:
+            sections.setdefault(current, []).append(line)
+        else:
+            loose.append(line)
+
+    if loose and not sections:
+        sections["解题步骤"] = loose
+    elif loose:
+        sections.setdefault("解题思路", []).extend(loose)
+
+    parts = ['<div class="qa-rich-answer">']
+    for title in QA_SECTION_ORDER:
+        lines = [line for line in sections.get(title, []) if str(line).strip()]
+        if not lines:
+            continue
+        class_name = QA_SECTION_CLASS.get(title, "plain")
+        parts.append(f'<section class="qa-card-section qa-{class_name}">')
+        parts.append(f"<h4>{html.escape(title)}</h4>")
+        if len(lines) == 1:
+            parts.append(f"<p>{inline_qa_markup(lines[0])}</p>")
+        else:
+            parts.append("<ol>")
+            for line in lines:
+                parts.append(f"<li>{inline_qa_markup(line)}</li>")
+            parts.append("</ol>")
+        parts.append("</section>")
+
+    extra_titles = [title for title in sections if title not in QA_SECTION_ORDER]
+    for title in extra_titles:
+        lines = [line for line in sections.get(title, []) if str(line).strip()]
+        if not lines:
+            continue
+        parts.append('<section class="qa-card-section qa-plain">')
+        parts.append(f"<h4>{html.escape(title)}</h4>")
+        parts.append("<ol>" if len(lines) > 1 else "")
+        for line in lines:
+            tag = "li" if len(lines) > 1 else "p"
+            parts.append(f"<{tag}>{inline_qa_markup(line)}</{tag}>")
+        parts.append("</ol>" if len(lines) > 1 else "")
+        parts.append("</section>")
+
+    parts.append("</div>")
+    return truncate_text("".join(parts), QA_HTML_CHAR_LIMIT)
+
+
+def qa_event_row_to_dict(row: dict) -> dict:
+    item = dict(row)
+    for key in ("focus", "context", "gesture"):
+        raw = item.get(key)
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                parsed = {"raw": raw} if raw else {}
+            item[key] = parsed
+    context = item.get("context") if isinstance(item.get("context"), dict) else {}
+    item["used_image_context"] = bool(context.get("used_image_context")) if context else bool(item.get("image_filename"))
+    item["image_context_mode"] = str(context.get("image_context_mode") or "")
+    item["selected_image_id"] = str(context.get("selected_image_id") or item.get("image_id") or "")
+    item["selected_image_filename"] = str(context.get("selected_image_filename") or item.get("image_filename") or "")
+    item["uploaded_image_id"] = str(context.get("uploaded_image_id") or "")
+    item["uploaded_image_filename"] = str(context.get("uploaded_image_filename") or "")
+    item["current_image_rejected"] = bool(context.get("current_image_rejected")) if context else False
+    item["rejected_image_id"] = str(context.get("rejected_image_id") or "")
+    item["rejected_image_filename"] = str(context.get("rejected_image_filename") or "")
+    item["answer_html"] = qa_answer_html(item.get("answer") or "")
+    return item
+
+
+def qa_answer_is_unhelpful_image_failure(answer: str) -> bool:
+    text = re.sub(r"\s+", "", answer or "")
+    if not text:
+        return False
+    image_failure_terms = (
+        "未识别",
+        "没识别",
+        "无法识别",
+        "没有识别",
+        "看不清",
+        "没看清",
+        "无法看清",
+        "无法确认图片",
+        "图片不清楚",
+        "照片不清楚",
+        "拍摄清晰",
+        "清晰题目",
+        "清晰的题目",
+        "有效题目",
+        "无有效题目",
+        "有效输入",
+        "无有效输入",
+        "输入具体问题",
+        "上传题目",
+        "上传图片",
+        "上传清晰",
+        "等待有效输入",
+        "重新拍",
+        "重拍",
+        "移到镜头",
+        "对准",
+    )
+    return any(term in text for term in image_failure_terms)
+
+
+def qa_safe_followup_fallback_answer(question: str) -> str:
+    return (
+        "解题思路：我们接着刚才那题讲。\n"
+        "步骤：先把上一轮已经确定的条件放在一起，再解释你追问的那一步为什么成立，最后写成一句结论。\n"
+        "结论：你可以继续问具体哪一步。"
+    )
+
+
+def qa_events_for_session(session_id: str, limit: int = 60) -> list[dict]:
+    with connect() as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT qa_events.*, images.filename AS image_filename
+                FROM qa_events
+                LEFT JOIN images ON images.id = qa_events.image_id
+                WHERE qa_events.session_id=?
+                ORDER BY qa_events.created_at DESC, qa_events.id DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            )
+        ]
+    items = [qa_event_row_to_dict(row) for row in rows]
+    return attach_visualization_metadata(items, "qa_event", text_keys=("question", "answer"))
+
+
+def memory_event_row_to_dict(row: dict) -> dict:
+    item = dict(row)
+    item["payload"] = parse_json_object(item.get("payload"))
+    return item
+
+
+def memory_events(limit: int = 80, account_id: str = "") -> list[dict]:
+    account_id = account_id or get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    with connect() as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM memory_events
+                WHERE account_id=?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (account_id, limit),
+            )
+        ]
+    return [memory_event_row_to_dict(row) for row in rows]
+
+
+def important_memory_events(limit: int = 8, account_id: str = "") -> list[dict]:
+    account_id = account_id or get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    with connect() as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM memory_events
+                WHERE account_id=? AND message_type IN ('formed_memory', 'mistake_memory', 'explicit_memory')
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (account_id, limit),
+            )
+        ]
+    return [memory_event_row_to_dict(row) for row in rows]
+
+
+def memory_profile(scope: str = "global", account_id: str = "") -> dict:
+    account_id = account_id or get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM memory_profiles WHERE account_id=? AND scope=?", (account_id, scope)).fetchone()
+    if not row:
+        return {"account_id": account_id, "scope": scope, "profile": "", "source_count": 0, "latest_event_at": "", "updated_at": ""}
+    return dict(row)
+
+
+def fallback_memory_profile(existing_profile: str, events: list[dict]) -> str:
+    recent_lines = []
+    for event in events[-12:]:
+        text = truncate_text(event.get("text"), 80)
+        if text:
+            recent_lines.append(f"- {text}")
+    parts = []
+    if existing_profile:
+        parts.append("已有画像：\n" + truncate_text(existing_profile, 1400))
+    if recent_lines:
+        parts.append("最近输入摘要：\n" + "\n".join(recent_lines))
+    parts.append("整理建议：继续根据用户的提问方式、学科卡点、偏好反馈和常见错误更新画像。")
+    return truncate_text("\n\n".join(parts), MEMORY_PROFILE_CHAR_LIMIT)
+
+
+def build_memory_consolidation_prompt(existing_profile: str, events: list[dict]) -> str:
+    event_lines = []
+    for event in events:
+        event_lines.append(
+            (
+                f"- {event.get('created_at')} "
+                f"[{event.get('message_type') or event.get('source') or 'user'}] "
+                f"{truncate_text(event.get('text'), 180)}"
+            )
+        )
+    return f"""
+你是学习陪伴 App 的记忆整理器。请把最近用户发出的语音转文字和纯文字信息，整理成可持续更新的用户画像。
+
+要求：
+- 只记录对后续学习陪伴有帮助的信息：学习目标、常见科目、表达习惯、偏好、易错点、需要避免的回答方式。
+- 不要重复逐条抄录原话；要合并归纳。
+- 如果证据不足，写“暂未形成稳定判断”。
+- 输出中文，结构紧凑，适合下次问答作为上下文候选。
+
+已有画像：
+{existing_profile or "暂无"}
+
+最近用户输入：
+{chr(10).join(event_lines) if event_lines else "暂无"}
+""".strip()
+
+
+async def run_memory_consolidation(*, task_id: str | None = None, account_id: str = "") -> dict:
+    account_id = account_id or get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    events = list(reversed(memory_events(MEMORY_PROFILE_RECENT_EVENT_LIMIT, account_id=account_id)))
+    if not events:
+        return memory_profile(account_id=account_id)
+    existing = memory_profile(account_id=account_id)
+    prompt = build_memory_consolidation_prompt(existing.get("profile") or "", events)
+    settings = effective_llm_settings(account_id)
+    try:
+        profile_text = await run_with_llm_gate(
+            f"memory_consolidation:{task_id or 'manual'}",
+            None,
+            lambda: llm.analyze_text(settings, prompt, max_tokens=900),
+            priority=LLM_PRIORITY_BACKGROUND,
+            account_id=account_id,
+        )
+        profile_text = truncate_text(profile_text, MEMORY_PROFILE_CHAR_LIMIT)
+    except Exception as exc:
+        profile_text = fallback_memory_profile(existing.get("profile") or "", events)
+        emit_log(f"记忆整理 LLM 失败，使用本地摘要：{truncate_text(str(exc), 180)}", level="warning", source="memory")
+    latest_event_at = max((str(event.get("created_at") or "") for event in events), default="")
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO memory_profiles(account_id, scope, profile, source_count, latest_event_at, updated_at)
+            VALUES(?, 'global', ?, ?, ?, ?)
+            ON CONFLICT(account_id, scope) DO UPDATE SET
+                profile=excluded.profile,
+                source_count=excluded.source_count,
+                latest_event_at=excluded.latest_event_at,
+                updated_at=excluded.updated_at
+            """,
+            (account_id, profile_text, len(events), latest_event_at, now),
+        )
+    emit_log(f"记忆整理完成：{len(events)} 条输入", level="info", source="memory")
+    return memory_profile(account_id=account_id)
+
+
+def record_memory_event(
+    *,
+    session_id: str,
+    account_id: str = "",
+    qa_event_id: str,
+    source: str,
+    message_type: str,
+    text: str,
+    payload: dict | None = None,
+) -> dict | None:
+    clean_text = clean_user_text(text, MEMORY_EVENT_TEXT_LIMIT)
+    if len(clean_text) < 2:
+        return None
+    event_id = uuid.uuid4().hex
+    now = utc_now()
+    if not account_id:
+        with connect() as conn:
+            session = conn.execute("SELECT account_id FROM sessions WHERE id=?", (session_id,)).fetchone()
+        account_id = session["account_id"] if session and session["account_id"] else (get_settings().default_account_id or DEFAULT_ACCOUNT_ID)
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO memory_events(id, account_id, session_id, qa_event_id, source, message_type, text, payload, created_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                account_id,
+                session_id,
+                qa_event_id,
+                truncate_text(source, 80),
+                truncate_text(message_type, 80),
+                clean_text,
+                json_dumps(payload or {}),
+                now,
+            ),
+        )
+        row = conn.execute("SELECT * FROM memory_events WHERE id=?", (event_id,)).fetchone()
+    schedule_memory_consolidation_if_due(account_id=account_id)
+    return memory_event_row_to_dict(dict(row)) if row else None
+
+
+def parse_json_object(raw: str | None) -> dict:
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {"raw": truncate_text(text, 1200)}
+    return data if isinstance(data, dict) else {"value": data}
+
+
+def require_control_token(request: Request, body: dict | None = None) -> None:
+    expected = get_settings().control_token.strip()
+    if not expected:
+        return
+    provided = (request.headers.get("X-PAI-Control-Token") or "").strip()
+    if not provided and body:
+        provided = str(body.get("control_token") or body.get("controlToken") or "").strip()
+    if provided != expected:
+        raise HTTPException(401, "control token required")
+
+
+def online_cutoff_iso() -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=DEVICE_CONTROL_ONLINE_SECONDS)).isoformat()
+
+
+def compact_device_state(state: dict) -> dict:
+    allowed = {
+        "app",
+        "platform",
+        "session_id",
+        "session_title",
+        "student_goal",
+        "mode_title",
+        "upload_state",
+        "is_bursting",
+        "is_observing",
+        "is_listening",
+        "is_thinking",
+        "is_speaking",
+        "qa_state",
+        "qa_answer",
+        "recognized_text",
+        "strategy_sync_state",
+        "updated_at",
+    }
+    compact: dict[str, object] = {}
+    for key, value in state.items():
+        if key not in allowed:
+            continue
+        if isinstance(value, str):
+            compact[key] = truncate_text(value, 800)
+        elif isinstance(value, (bool, int, float)) or value is None:
+            compact[key] = value
+    return compact
+
+
+def control_command_row_to_dict(row: dict) -> dict:
+    item = dict(row)
+    item["payload"] = parse_json_object(item.get("payload"))
+    return item
+
+
+def device_state_row_to_dict(row: dict, now: datetime | None = None) -> dict:
+    item = dict(row)
+    item["state"] = parse_json_object(item.get("state"))
+    last_seen = parse_datetime(item.get("last_seen_at"))
+    current = now or datetime.now(timezone.utc)
+    item["online"] = bool(last_seen and (current - last_seen).total_seconds() <= DEVICE_CONTROL_ONLINE_SECONDS)
+    item["stale_seconds"] = round((current - last_seen).total_seconds(), 1) if last_seen else None
+    return item
+
+
+def expire_old_control_commands(conn, now: str) -> None:
+    conn.execute(
+        """
+        UPDATE control_commands
+        SET status='expired', acknowledged_at=CASE WHEN acknowledged_at='' THEN ? ELSE acknowledged_at END,
+            error=CASE WHEN error='' THEN 'command expired before delivery' ELSE error END
+        WHERE status IN ('pending', 'delivered') AND expires_at < ?
+        """,
+        (now, now),
+    )
+
+
+def latest_device_state(conn, *, account_id: str = "", device_id: str = "", session_id: str = "", online_only: bool = False) -> dict | None:
+    filters: list[str] = []
+    params: list[object] = []
+    if account_id:
+        filters.append("account_id=?")
+        params.append(account_id)
+    if device_id:
+        filters.append("device_id=?")
+        params.append(device_id)
+    if session_id:
+        filters.append("session_id=?")
+        params.append(session_id)
+    if online_only:
+        filters.append("last_seen_at >= ?")
+        params.append(online_cutoff_iso())
+    where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
+    row = conn.execute(
+        f"""
+        SELECT *
+        FROM device_states
+        {where_sql}
+        ORDER BY last_seen_at DESC
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def select_commands_for_device(conn, *, device_id: str, session_id: str, limit: int, now: str, account_id: str = "") -> list[dict]:
+    filters = ["status='pending'", "expires_at >= ?"]
+    params: list[object] = [now]
+    if account_id:
+        filters.append("account_id=?")
+        params.append(account_id)
+    route_filters = ["device_id=?"]
+    route_params: list[object] = [device_id]
+    if session_id:
+        route_filters.append("(session_id=? AND device_id='')")
+        route_params.append(session_id)
+    route_filters.append("(device_id='' AND session_id='')")
+    where_sql = " AND ".join(filters) + f" AND ({' OR '.join(route_filters)})"
+    rows = [
+        dict(row)
+        for row in conn.execute(
+            f"""
+            SELECT *
+            FROM control_commands
+            WHERE {where_sql}
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            [*params, *route_params, limit],
+        )
+    ]
+    if rows:
+        ids = [row["id"] for row in rows]
+        placeholders = ", ".join("?" for _ in ids)
+        conn.execute(
+            f"""
+            UPDATE control_commands
+            SET status='delivered', delivered_at=?
+            WHERE id IN ({placeholders}) AND status='pending'
+            """,
+            [now, *ids],
+        )
+    return rows
+
+
+def recent_qa_context(session_id: str, limit: int = QA_RECENT_EVENT_LIMIT) -> str:
+    events = [
+        event
+        for event in reversed(qa_events_for_session(session_id, limit + 3))
+        if event.get("status") != "running" or event.get("answer")
+    ][-limit:]
+    if not events:
+        return "No prior QA turns in this learning session."
+    lines = []
+    for index, event in enumerate(events, start=1):
+        context = event.get("context") if isinstance(event.get("context"), dict) else {}
+        intent = context.get("student_intent") or context.get("studentIntent") or "unknown"
+        lines.append(
+            (
+                f"{index}. trigger={event.get('trigger_type') or 'unknown'} "
+                f"intent={intent} "
+                f"status={event.get('status') or 'unknown'} "
+                f"image_id={event.get('image_id') or ''} "
+                f"question={truncate_text(event.get('question'), 260)} "
+                f"answer={truncate_text(event.get('answer'), 420)}"
+            )
+        )
+    return "\n".join(lines)
+
+
+def recent_analysis_context(session_id: str, limit: int = QA_RECENT_ANALYSIS_LIMIT) -> str:
+    with connect() as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT scope, status, content, created_at
+                FROM analyses
+                WHERE session_id=? AND scope != 'final'
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            )
+        ]
+    if not rows:
+        return "No previous visual analysis yet."
+    lines = []
+    for index, row in enumerate(rows, start=1):
+        lines.append(
+            (
+                f"{index}. scope={row.get('scope')} status={row.get('status')} "
+                f"created_at={row.get('created_at')}\n"
+                f"{truncate_text(row.get('content'), 1400)}"
+            )
+        )
+    return "\n\n".join(lines)
+
+
+def compact_learning_context(session_id: str) -> str:
+    learning = learning_items_for_session(session_id, QA_CONTEXT_ITEM_LIMIT)
+    mistakes = mistake_items_for_session(session_id, QA_CONTEXT_ITEM_LIMIT)
+    formed_memories = important_memory_events(6)
+    sections: list[str] = []
+    if learning:
+        sections.append(
+            "Learning items:\n"
+            + "\n".join(
+                f"- {item.get('item_type')}: {truncate_text(item.get('title') or item.get('content'), 220)}"
+                for item in learning[:QA_CONTEXT_ITEM_LIMIT]
+            )
+        )
+    if mistakes:
+        sections.append(
+            "Mistake items:\n"
+            + "\n".join(
+                (
+                    f"- {truncate_text(item.get('title') or item.get('question_text'), 180)} "
+                    f"status={item.get('status')} reason={truncate_text(item.get('error_reason'), 220)}"
+                )
+                for item in mistakes[:QA_CONTEXT_ITEM_LIMIT]
+            )
+            )
+    if formed_memories:
+        sections.append(
+            "Important formed memories:\n"
+            + "\n".join(
+                (
+                    f"- [{event.get('message_type') or 'formed_memory'}] "
+                    f"{truncate_text(event.get('text'), 260)}"
+                )
+                for event in formed_memories
+            )
+        )
+    return "\n\n".join(sections) if sections else "No structured learning or mistake items yet."
+
+
+def latest_session_image_for_qa(session_id: str, *, exclude_image_id: str | None = None) -> dict | None:
+    filters = ["session_id=?", "kind IN ('burst', 'single', 'qa')"]
+    params: list[object] = [session_id]
+    if exclude_image_id:
+        filters.append("id<>?")
+        params.append(exclude_image_id)
+    where_sql = " AND ".join(filters)
+    with connect() as conn:
+        cursor = conn.execute(
+            f"""
+            SELECT *
+            FROM images
+            WHERE {where_sql}
+            ORDER BY sequence_index DESC, captured_at DESC, created_at DESC
+            LIMIT 30
+            """,
+            params,
+        )
+        rows = [dict(row) for row in cursor]
+    for row in rows:
+        if row.get("kind") == "qa" and qa_context_rejected_from_meta(capture_meta_dict(row.get("capture_meta"))):
+            continue
+        return row
+    return None
+
+
+def build_qa_prompt(
+    session: dict,
+    *,
+    question: str,
+    trigger_type: str,
+    focus: dict,
+    context: dict,
+    gesture: dict,
+    image_row: dict | None,
+    image_context_mode: str = "text_only",
+) -> str:
+    strategy = build_strategy_context(session_strategy(session))
+    dynamic_strategy = dynamic_strategy_context(
+        session,
+        context,
+        question=question,
+        trigger_type=trigger_type,
+        image_row=image_row,
+        image_context_mode=image_context_mode,
+    )
+    image_note = "No current frame was uploaded for this turn."
+    if image_row:
+        if image_context_mode == "current_frame":
+            label = "Current frame"
+        elif image_context_mode in {"fallback_after_rejected_current_frame", "ignored_current_frame_fallback"}:
+            label = "Fallback recent session frame; the newly captured QA frame was rejected as not relevant/clear enough"
+        else:
+            label = "Recent session frame"
+        image_note = (
+            f"{label}: image_id={image_row.get('id')} filename={image_row.get('filename')} "
+            f"context_mode={image_context_mode} "
+            f"captured_at={image_row.get('captured_at')} sequence_index={image_row.get('sequence_index')} "
+            f"meta={compact_capture_meta(image_row.get('capture_meta'), 600)}"
+        )
+    prompt = f"""
+You are the real-time learning assistant in an iOS study camera app.
+Answer in Chinese unless the student clearly asks for another language.
+Use the current camera frame when provided, the session context, and the student's question.
+Be concise, but include enough reasoning steps for a student to continue solving.
+If the student asks to check mistakes, compare the visible work, point out likely wrong parts, and give the next correction step.
+If the referenced problem is ambiguous, say what you can infer and ask for a short clarification.
+Format the answer as short labeled lines so the UI can render it as a study card. Use these labels when relevant:
+题目：...
+关键条件：...
+先想一想：...
+学生答案：...
+检查结果：...
+解题思路：...
+步骤：...
+错因：...
+订正：...
+结论：...
+下一步小任务：...
+下一步：
+1. 举一反三：...
+2. 总结知识点：...
+3. 按用户偏好：...
+追问建议：...
+
+Plain-text math formatting rules:
+- Write student answers, formulas, and units as ordinary readable text, not Markdown or LaTeX.
+- Never wrap math in dollar signs. Do not output $...$, $$...$$, \\(...\\), or \\[...\\].
+- Do not use LaTeX commands such as \\times, \\div, \\frac, \\sqrt, or cm^2 in visible answers.
+- Prefer symbols and Chinese units directly, for example: 学生答案：10×6÷2=30平方厘米.
+- If copying the student's handwritten work, preserve the math meaning but normalize display characters, for example ×, ÷, =, 平方厘米.
+
+Session:
+- id={session.get('id')}
+- title={session.get('title')}
+- status={session.get('status')}
+- student_goal={session.get('student_goal') or ''}
+
+Strategy:
+{strategy}
+
+Dynamic strategy:
+{dynamic_strategy}
+
+Current trigger:
+- trigger_type={trigger_type}
+- focus={json_dumps(focus)}
+- gesture={json_dumps(gesture)}
+- client_context={json_dumps(context)}
+- inferred_student_intent={context.get('student_intent') or 'unknown'}
+{image_note}
+
+Recent QA turns:
+{recent_qa_context(session.get('id') or '')}
+
+Recent visual analyses:
+{recent_analysis_context(session.get('id') or '')}
+
+Structured learning context:
+{compact_learning_context(session.get('id') or '')}
+
+Structured context assets from client:
+{json_dumps((context or {}).get('structured_context_assets') or [])}
+
+Context asset use policy:
+{json_dumps((context or {}).get('context_use_policy') or {})}
+
+Student question:
+{question}
+
+Answer quality rules:
+- Treat the current frame as the primary source when context_mode=current_frame.
+- Before using old assets, classify this turn as one of: answer_check, new_problem_explain, mistake_review, knowledge_summary, transfer_practice, or followup. Use that intent to choose assets.
+- Use context assets by priority: current/anchor frame and current question first; active review mistake next; related mistakes and knowledge points next; formed memories/user profile last for personalization.
+- Mistake assets are for review, error diagnosis, and warning about similar traps. Do not force an unrelated mistake into the answer.
+- Knowledge assets are for explaining concepts, summarizing key points, and generating similar practice. Do not let them override visible work.
+- Memory assets are for preferences, recurring patterns, and recent goals. Never use memory as proof of the current correct answer.
+- If you rely on an asset, mention it naturally in Chinese in one short phrase, for example: “结合你之前常错的单位换算...”.
+- When Strategy includes 当前生效回答方式 or 当前生效场景, treat that as the only active coach preference even if inferred_needs lists other possible tags.
+- Follow the learning coach preference in Strategy and client_context. If the preference is hint_first, lead with 先想一想 and avoid giving the final answer until the student asks or checking requires it.
+- If the preference is check_only, do not solve the whole problem. Say whether the visible answer/process is correct, wrong, or unclear, then give one correction direction.
+- If the preference is step_by_step or full_explain, still keep steps compact and end with one actionable 下一步小任务.
+- Unless the student only needs a yes/no check, include either 先想一想 or 下一步小任务 so the answer creates a next learning action.
+- Every answer must end with 下一步 containing exactly three short options: 举一反三, 总结知识点, and 按用户偏好. Keep each option clickable-style and actionable in one line.
+- If inferred_student_intent is correction_check, answer as a same-dialogue correction review: compare the student's latest visible work with the prior QA context, decide whether the revision is now correct, and give one precise next correction if needed.
+- If inferred_student_intent is answer_check or visual_check, inspect the provided/current frame first and report what is correct, wrong, or unclear. Keep it connected to the referenced prior problem when the wording says "again", "this", "here", "changed", "改完", "再看看", or similar.
+- If context says current_image_rejected=true or context_mode is fallback/text-only, silently ignore the new capture. Do not say the image was not recognized; answer the student's spoken follow-up from recent QA turns, prior valid image context, and structured learning context.
+- For math, independently recompute the visible expression before speaking the final answer. Check the final numeric result at least two ways when possible.
+- When using decomposition or carrying, do not add the original whole number again after adding its decomposed parts.
+- Only ask the student to move or retake the material when there is no prior context to answer from. During follow-up, prefer continuing the explanation from prior context.
+- If you mention a student's answer is wrong, state the correct answer and one short correction step.
+- Keep each label compact. Prefer one idea per line. Avoid long Markdown paragraphs and avoid Markdown tables.
+- Especially in 学生答案、步骤、结论, use plain text math only; no Markdown math, no LaTeX, no dollar signs.
+
+Return only the answer that should be spoken by TTS. Do not mention internal IDs unless useful for debugging.
+""".strip()
+    return truncate_text(prompt, QA_PROMPT_CHAR_LIMIT)
+
+
+def insert_qa_event(
+    session_id: str,
+    *,
+    image_id: str | None,
+    source: str,
+    trigger_type: str,
+    question: str,
+    focus: dict,
+    context: dict,
+    gesture: dict,
+) -> dict:
+    event_id = uuid.uuid4().hex
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO qa_events(
+                id, session_id, image_id, source, trigger_type, question,
+                focus, context, gesture, status, created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                session_id,
+                image_id,
+                source,
+                trigger_type,
+                question,
+                json_dumps(focus),
+                json_dumps(context),
+                json_dumps(gesture),
+                "running",
+                now,
+                now,
+            ),
+        )
+    return qa_events_for_session(session_id, 1)[0]
+
+
+def update_qa_event(event_id: str, *, status: str, answer: str = "", tts_status: str = "", interrupted_at: str = "") -> dict:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE qa_events
+            SET status=?, answer=?, tts_status=?, interrupted_at=?, updated_at=?
+            WHERE id=?
+            """,
+            (status, truncate_text(answer, QA_ANSWER_CHAR_LIMIT), tts_status, interrupted_at, now, event_id),
+        )
+        row = conn.execute(
+            """
+            SELECT qa_events.*, images.filename AS image_filename
+            FROM qa_events
+            LEFT JOIN images ON images.id = qa_events.image_id
+            WHERE qa_events.id=?
+            """,
+            (event_id,),
+        ).fetchone()
+    if not row:
+        return {}
+    item = qa_event_row_to_dict(dict(row))
+    return attach_visualization_metadata([item], "qa_event", text_keys=("question", "answer"))[0]
+
+
+def global_learning_column_items(page_size: int, account_id: str = "") -> tuple[list[dict], int, list[dict], int]:
+    account_id = account_id or get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    with connect() as conn:
+        learning_total = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM learning_items li
+            LEFT JOIN sessions ON sessions.id = li.session_id
+            WHERE sessions.account_id=?
+            """,
+            (account_id,),
+        ).fetchone()["count"]
+        mistake_total = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM mistake_items mi
+            LEFT JOIN sessions ON sessions.id = mi.session_id
+            WHERE sessions.account_id=?
+            """,
+            (account_id,),
+        ).fetchone()["count"]
+        learning_items = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT li.id, li.session_id, li.batch_id, li.analysis_id, li.item_type,
+                       li.title, li.content, li.subject, li.page_ref, li.question_ref,
+                       li.location_ref, li.source_summary, li.source_image_details,
+                       li.first_seen_at, li.last_seen_at, li.first_sequence_index,
+                       li.last_sequence_index, li.evidence_count, li.confidence,
+                       li.created_at, li.updated_at, sessions.title AS session_title,
+                       sessions.status AS session_status
+                FROM learning_items li
+                LEFT JOIN sessions ON sessions.id = li.session_id
+                WHERE sessions.account_id=?
+                ORDER BY li.last_seen_at DESC, li.updated_at DESC, li.id DESC
+                LIMIT ?
+                """,
+                (account_id, page_size),
+            )
+        ]
+        mistake_items = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT mi.id, mi.session_id, mi.learning_item_id, mi.batch_id, mi.analysis_id,
+                       mi.title, mi.question_text, mi.student_answer, mi.expected_answer,
+                       mi.error_reason, mi.knowledge_points, mi.subject, mi.page_ref,
+                       mi.question_ref, mi.location_ref, mi.error_type, mi.correction,
+                       mi.next_action, mi.source_summary, mi.source_image_details,
+                       mi.status, mi.review_state, mi.next_review_at, mi.last_reviewed_at,
+                       mi.review_count, mi.review_note, mi.confirmed_at, mi.ignored_at,
+                       mi.corrected_at, mi.mastered_at, mi.evidence, mi.first_seen_at, mi.last_seen_at,
+                       mi.created_at, mi.updated_at, sessions.title AS session_title,
+                       sessions.status AS session_status
+                FROM mistake_items mi
+                LEFT JOIN sessions ON sessions.id = mi.session_id
+                WHERE sessions.account_id=?
+                ORDER BY mi.last_seen_at DESC, mi.updated_at DESC, mi.id DESC
+                LIMIT ?
+                """,
+                (account_id, page_size),
+            )
+        ]
+    for row in learning_items:
+        row["source_image_details"] = json_list_of_dicts(row.get("source_image_details"))[:2]
+    for row in mistake_items:
+        row["knowledge_points"] = json_list(row.get("knowledge_points"))
+        row["source_image_details"] = json_list_of_dicts(row.get("source_image_details"))[:2]
+    return learning_items, learning_total, mistake_items, mistake_total
+
+
+def normalize_asset_page(page: int) -> int:
+    return max(1, int(page or 1))
+
+
+def normalize_asset_page_size(page_size: int) -> int:
+    return max(1, min(ASSET_PAGE_SIZE_MAX, int(page_size or ASSET_PAGE_SIZE_DEFAULT)))
+
+
+def asset_like_pattern(text: str) -> str:
+    return f"%{text.replace('%', '').replace('_', '').strip()}%"
+
+
+def browse_learning_assets(
+    *,
+    account_id: str = "",
+    session_id: str = "",
+    item_type: str = "",
+    subject: str = "",
+    location: str = "",
+    q: str = "",
+    page: int = 1,
+    page_size: int = ASSET_PAGE_SIZE_DEFAULT,
+) -> dict:
+    account_id = account_id or get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    backfill_asset_documents()
+    page = normalize_asset_page(page)
+    page_size = normalize_asset_page_size(page_size)
+    where = []
+    params: list[object] = []
+    where.append("sessions.account_id = ?")
+    params.append(account_id)
+    if session_id:
+        where.append("li.session_id = ?")
+        params.append(session_id)
+    if item_type:
+        where.append("li.item_type = ?")
+        params.append(item_type)
+    if subject:
+        pattern = asset_like_pattern(subject)
+        where.append("(li.subject LIKE ? OR ad.subject LIKE ?)")
+        params.extend([pattern, pattern])
+    if location:
+        pattern = asset_like_pattern(location)
+        where.append("(li.page_ref LIKE ? OR li.question_ref LIKE ? OR li.location_ref LIKE ? OR ad.location_ref LIKE ?)")
+        params.extend([pattern, pattern, pattern, pattern])
+    if q:
+        pattern = asset_like_pattern(q)
+        where.append(
+            """
+            (
+                li.title LIKE ? OR li.content LIKE ? OR li.subject LIKE ?
+                OR li.page_ref LIKE ? OR li.question_ref LIKE ? OR li.location_ref LIKE ?
+                OR li.source_summary LIKE ? OR ad.body LIKE ? OR ad.search_text LIKE ?
+            )
+            """
+        )
+        params.extend([pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern])
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+    offset = (page - 1) * page_size
+    with connect() as conn:
+        total = conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM learning_items li
+            LEFT JOIN asset_documents ad ON ad.asset_kind='learning' AND ad.asset_id=li.id
+            LEFT JOIN sessions ON sessions.id = li.session_id
+            {where_sql}
+            """,
+            params,
+        ).fetchone()["count"]
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT li.id, li.session_id, li.batch_id, li.analysis_id, li.item_type,
+                       li.title, li.content, li.subject, li.page_ref, li.question_ref,
+                       li.location_ref, li.source_summary, li.source_image_details,
+                       ad.body AS document_body, li.first_seen_at, li.last_seen_at,
+                       li.first_sequence_index, li.last_sequence_index, li.source_image_ids,
+                       li.evidence_count, li.confidence, li.created_at, li.updated_at,
+                       sessions.title AS session_title, sessions.status AS session_status,
+                       sessions.created_at AS session_created_at
+                FROM learning_items li
+                LEFT JOIN asset_documents ad ON ad.asset_kind='learning' AND ad.asset_id=li.id
+                LEFT JOIN sessions ON sessions.id = li.session_id
+                {where_sql}
+                ORDER BY li.last_seen_at DESC, li.updated_at DESC, li.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, page_size, offset],
+            )
+        ]
+    for row in rows:
+        row["source_image_ids"] = json_list(row.get("source_image_ids"))
+        row["source_image_details"] = json_list_of_dicts(row.get("source_image_details"))
+    return {
+        "kind": "learning",
+        "items": rows,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "has_next": offset + len(rows) < total,
+        "has_prev": page > 1,
+    }
+
+
+def browse_mistake_assets(
+    *,
+    account_id: str = "",
+    session_id: str = "",
+    status: str = "",
+    review_state: str = "",
+    error_type: str = "",
+    subject: str = "",
+    location: str = "",
+    q: str = "",
+    page: int = 1,
+    page_size: int = ASSET_PAGE_SIZE_DEFAULT,
+) -> dict:
+    account_id = account_id or get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    backfill_asset_documents()
+    page = normalize_asset_page(page)
+    page_size = normalize_asset_page_size(page_size)
+    where = []
+    params: list[object] = []
+    where.append("sessions.account_id = ?")
+    params.append(account_id)
+    if session_id:
+        where.append("mi.session_id = ?")
+        params.append(session_id)
+    if status:
+        where.append("mi.status = ?")
+        params.append(status)
+    if review_state:
+        where.append("mi.review_state = ?")
+        params.append(review_state)
+    if error_type:
+        pattern = asset_like_pattern(error_type)
+        where.append("mi.error_type LIKE ?")
+        params.append(pattern)
+    if subject:
+        pattern = asset_like_pattern(subject)
+        where.append("(mi.subject LIKE ? OR ad.subject LIKE ?)")
+        params.extend([pattern, pattern])
+    if location:
+        pattern = asset_like_pattern(location)
+        where.append("(mi.page_ref LIKE ? OR mi.question_ref LIKE ? OR mi.location_ref LIKE ? OR ad.location_ref LIKE ?)")
+        params.extend([pattern, pattern, pattern, pattern])
+    if q:
+        pattern = asset_like_pattern(q)
+        where.append(
+            """
+            (
+                mi.title LIKE ? OR mi.question_text LIKE ? OR mi.student_answer LIKE ?
+                OR mi.expected_answer LIKE ? OR mi.error_reason LIKE ? OR mi.evidence LIKE ?
+                OR mi.knowledge_points LIKE ? OR mi.subject LIKE ? OR mi.page_ref LIKE ?
+                OR mi.question_ref LIKE ? OR mi.location_ref LIKE ? OR mi.error_type LIKE ?
+                OR mi.correction LIKE ? OR mi.next_action LIKE ? OR mi.source_summary LIKE ?
+                OR ad.body LIKE ? OR ad.search_text LIKE ?
+            )
+            """
+        )
+        params.extend([pattern] * 17)
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+    offset = (page - 1) * page_size
+    with connect() as conn:
+        total = conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM mistake_items mi
+            LEFT JOIN asset_documents ad ON ad.asset_kind='mistake' AND ad.asset_id=mi.id
+            LEFT JOIN sessions ON sessions.id = mi.session_id
+            {where_sql}
+            """,
+            params,
+        ).fetchone()["count"]
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT mi.id, mi.session_id, mi.learning_item_id, mi.batch_id, mi.analysis_id,
+                       mi.title, mi.question_text, mi.student_answer, mi.expected_answer,
+                       mi.error_reason, mi.knowledge_points, mi.subject, mi.page_ref,
+                       mi.question_ref, mi.location_ref, mi.error_type, mi.correction,
+                       mi.next_action, mi.source_summary, mi.source_image_details,
+                       ad.body AS document_body, mi.status, mi.review_state, mi.next_review_at,
+                       mi.last_reviewed_at, mi.review_count, mi.review_note,
+                       mi.confirmed_at, mi.ignored_at, mi.corrected_at, mi.mastered_at, mi.evidence,
+                       mi.source_image_ids, mi.first_seen_at, mi.last_seen_at,
+                       mi.created_at, mi.updated_at,
+                       sessions.title AS session_title, sessions.status AS session_status,
+                       sessions.created_at AS session_created_at
+                FROM mistake_items mi
+                LEFT JOIN asset_documents ad ON ad.asset_kind='mistake' AND ad.asset_id=mi.id
+                LEFT JOIN sessions ON sessions.id = mi.session_id
+                {where_sql}
+                ORDER BY mi.last_seen_at DESC, mi.updated_at DESC, mi.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, page_size, offset],
+            )
+        ]
+    for row in rows:
+        row["knowledge_points"] = json_list(row.get("knowledge_points"))
+        row["source_image_ids"] = json_list(row.get("source_image_ids"))
+        row["source_image_details"] = json_list_of_dicts(row.get("source_image_details"))
+    return {
+        "kind": "mistake",
+        "items": rows,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "has_next": offset + len(rows) < total,
+        "has_prev": page > 1,
+    }
+
+
+def get_mistake_item(mistake_id: str) -> dict:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT mi.*, sessions.title AS session_title, sessions.status AS session_status,
+                   sessions.created_at AS session_created_at
+            FROM mistake_items mi
+            LEFT JOIN sessions ON sessions.id = mi.session_id
+            WHERE mi.id=?
+            """,
+            (mistake_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "mistake not found")
+    return mistake_row_to_dict(row)
+
+
+def update_mistake_item(mistake_id: str, updates: dict) -> dict:
+    now = utc_now()
+    with connect() as conn:
+        existing = conn.execute("SELECT * FROM mistake_items WHERE id=?", (mistake_id,)).fetchone()
+        if not existing:
+            raise HTTPException(404, "mistake not found")
+        existing_data = dict(existing)
+        status = existing_data["status"]
+        review_state = existing_data["review_state"] or "new"
+        assignments = []
+        params: list[object] = []
+
+        if "status" in updates:
+            status = normalize_mistake_status(updates.get("status"), default=status)
+            assignments.append("status=?")
+            params.append(status)
+            timestamp_column = {
+                "confirmed": "confirmed_at",
+                "ignored": "ignored_at",
+                "corrected": "corrected_at",
+                "mastered": "mastered_at",
+            }.get(status)
+            if timestamp_column and not existing_data.get(timestamp_column):
+                assignments.append(f"{timestamp_column}=?")
+                params.append(now)
+
+        if "review_state" in updates:
+            review_state = normalize_review_state(updates.get("review_state"), default=review_state)
+            assignments.append("review_state=?")
+            params.append(review_state)
+            if review_state == "mastered" and not existing_data.get("mastered_at"):
+                assignments.append("mastered_at=?")
+                params.append(now)
+            if review_state == "ignored" and not existing_data.get("ignored_at"):
+                assignments.append("ignored_at=?")
+                params.append(now)
+
+        if "review_note" in updates:
+            assignments.append("review_note=?")
+            params.append(clean_user_text(updates.get("review_note"), 1200))
+
+        if "correction" in updates:
+            assignments.append("correction=?")
+            params.append(clean_user_text(updates.get("correction"), ASSET_SOURCE_SUMMARY_LIMIT))
+
+        if "next_action" in updates:
+            assignments.append("next_action=?")
+            params.append(clean_user_text(updates.get("next_action"), ASSET_SOURCE_SUMMARY_LIMIT))
+
+        if "error_type" in updates:
+            assignments.append("error_type=?")
+            params.append(clean_asset_field(updates.get("error_type")))
+
+        if status in {"ignored", "mastered"} or review_state in {"ignored", "mastered"}:
+            next_review_at = ""
+        elif "next_review_at" in updates:
+            raw_next = str(updates.get("next_review_at") or "").strip()
+            if raw_next and not parse_date_or_datetime(raw_next):
+                raise HTTPException(422, "invalid next_review_at")
+            next_review_at = raw_next
+        elif status != existing_data["status"] or review_state != existing_data["review_state"]:
+            next_review_at = review_due_at_for(status, review_state)
+        else:
+            next_review_at = existing_data["next_review_at"] or review_due_at_for(status, review_state)
+        assignments.append("next_review_at=?")
+        params.append(next_review_at)
+
+        if updates.get("mark_reviewed") or review_state in {"done", "mastered"} or status in {"corrected", "mastered"}:
+            assignments.append("last_reviewed_at=?")
+            params.append(now)
+            assignments.append("review_count=review_count + 1")
+
+        if not assignments:
+            return mistake_row_to_dict(existing)
+
+        assignments.append("updated_at=?")
+        params.append(now)
+        params.append(mistake_id)
+        conn.execute(f"UPDATE mistake_items SET {', '.join(assignments)} WHERE id=?", params)
+        sync_asset_document(conn, "mistake", mistake_id)
+        row = conn.execute(
+            """
+            SELECT mi.*, sessions.title AS session_title, sessions.status AS session_status,
+                   sessions.created_at AS session_created_at
+            FROM mistake_items mi
+            LEFT JOIN sessions ON sessions.id = mi.session_id
+            WHERE mi.id=?
+            """,
+            (mistake_id,),
+        ).fetchone()
+    return mistake_row_to_dict(row)
+
+
+def review_event_row_to_dict(row) -> dict:
+    item = dict(row)
+    try:
+        payload = json.loads(item.get("payload") or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    item["payload"] = payload if isinstance(payload, dict) else {}
+    return item
+
+
+def list_review_events_for_mistake(mistake_id: str, limit: int = 60) -> dict:
+    limit = max(1, min(200, int(limit or 60)))
+    with connect() as conn:
+        mistake = conn.execute("SELECT id FROM mistake_items WHERE id=?", (mistake_id,)).fetchone()
+        if not mistake:
+            raise HTTPException(404, "mistake not found")
+        rows = [
+            review_event_row_to_dict(row)
+            for row in conn.execute(
+                """
+                SELECT re.*, mi.title AS mistake_title, mi.subject, mi.page_ref, mi.question_ref, mi.error_type
+                FROM review_events re
+                LEFT JOIN mistake_items mi ON mi.id = re.mistake_id
+                WHERE re.mistake_id=?
+                ORDER BY re.reviewed_at DESC, re.created_at DESC
+                LIMIT ?
+                """,
+                (mistake_id, limit),
+            )
+        ]
+    return {"items": rows, "total": len(rows)}
+
+
+def create_review_event(mistake_id: str, body: dict) -> dict:
+    body = body if isinstance(body, dict) else {}
+    result = normalize_review_event_result(body.get("result") or body.get("review_result") or body.get("event_result"))
+    note = clean_user_text(body.get("review_note") or body.get("note"), 1200)
+    source = clean_user_text(body.get("source") or "", 80)
+    event_type = clean_user_text(body.get("event_type") or "review", 80) or "review"
+    duration_seconds = optional_int(body.get("duration_seconds", body.get("durationSeconds")))
+    score = optional_float(body.get("score"))
+    reviewed_at_raw = str(body.get("reviewed_at") or body.get("reviewedAt") or "").strip()
+    reviewed_dt = parse_date_or_datetime(reviewed_at_raw) if reviewed_at_raw else datetime.now(timezone.utc)
+    if reviewed_at_raw and reviewed_dt is None:
+        raise HTTPException(422, "invalid reviewed_at")
+    reviewed_at = (reviewed_dt or datetime.now(timezone.utc)).isoformat()
+    created_at = utc_now()
+    event_id = uuid.uuid4().hex
+
+    payload = {
+        key: value
+        for key, value in body.items()
+        if key
+        not in {
+            "result",
+            "review_result",
+            "event_result",
+            "review_note",
+            "note",
+            "source",
+            "event_type",
+            "duration_seconds",
+            "durationSeconds",
+            "score",
+            "reviewed_at",
+            "reviewedAt",
+        }
+    }
+
+    with connect() as conn:
+        existing = conn.execute("SELECT * FROM mistake_items WHERE id=?", (mistake_id,)).fetchone()
+        if not existing:
+            raise HTTPException(404, "mistake not found")
+        mistake = dict(existing)
+        status = normalize_mistake_status(mistake.get("status"), default="suspected")
+        review_state = normalize_review_state(mistake.get("review_state"), default="new")
+        next_review_at = ""
+        updates = [
+            "last_reviewed_at=?",
+            "review_count=review_count + 1",
+            "review_note=?",
+            "updated_at=?",
+        ]
+        params: list[object] = [reviewed_at, note or mistake.get("review_note") or "", created_at]
+
+        if result == "mastered":
+            status = "mastered"
+            review_state = "mastered"
+            next_review_at = ""
+            updates.extend(["status=?", "review_state=?", "next_review_at=?"])
+            params.extend([status, review_state, next_review_at])
+            if not mistake.get("mastered_at"):
+                updates.append("mastered_at=?")
+                params.append(reviewed_at)
+        elif result == "correct":
+            status = "corrected"
+            review_state = "done"
+            next_review_at = review_due_at_for(status, review_state, reviewed_dt)
+            updates.extend(["status=?", "review_state=?", "next_review_at=?"])
+            params.extend([status, review_state, next_review_at])
+            if not mistake.get("corrected_at"):
+                updates.append("corrected_at=?")
+                params.append(reviewed_at)
+        elif result == "incorrect":
+            status = "confirmed"
+            review_state = "scheduled"
+            next_review_at = review_due_at_for(status, review_state, reviewed_dt)
+            updates.extend(["status=?", "review_state=?", "next_review_at=?"])
+            params.extend([status, review_state, next_review_at])
+            if not mistake.get("confirmed_at"):
+                updates.append("confirmed_at=?")
+                params.append(reviewed_at)
+        elif result == "postpone":
+            if status in {"ignored", "mastered"}:
+                status = "confirmed"
+            review_state = "scheduled"
+            requested_next = str(body.get("next_review_at") or body.get("nextReviewAt") or "").strip()
+            if requested_next:
+                if not parse_date_or_datetime(requested_next):
+                    raise HTTPException(422, "invalid next_review_at")
+                next_review_at = requested_next
+            else:
+                next_review_at = review_due_at_for(status, review_state, reviewed_dt)
+            updates.extend(["status=?", "review_state=?", "next_review_at=?"])
+            params.extend([status, review_state, next_review_at])
+
+        conn.execute(
+            """
+            INSERT INTO review_events(
+                id, mistake_id, session_id, event_type, result, note, source,
+                duration_seconds, score, payload, reviewed_at, created_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                mistake_id,
+                mistake["session_id"],
+                event_type,
+                result,
+                note,
+                source,
+                duration_seconds,
+                score,
+                json_dumps(payload),
+                reviewed_at,
+                created_at,
+            ),
+        )
+        params.append(mistake_id)
+        conn.execute(f"UPDATE mistake_items SET {', '.join(updates)} WHERE id=?", params)
+        sync_asset_document(conn, "mistake", mistake_id)
+        event_row = conn.execute(
+            """
+            SELECT re.*, mi.title AS mistake_title, mi.subject, mi.page_ref, mi.question_ref, mi.error_type
+            FROM review_events re
+            LEFT JOIN mistake_items mi ON mi.id = re.mistake_id
+            WHERE re.id=?
+            """,
+            (event_id,),
+        ).fetchone()
+        mistake_row = conn.execute(
+            """
+            SELECT mi.*, sessions.title AS session_title, sessions.status AS session_status,
+                   sessions.created_at AS session_created_at
+            FROM mistake_items mi
+            LEFT JOIN sessions ON sessions.id = mi.session_id
+            WHERE mi.id=?
+            """,
+            (mistake_id,),
+        ).fetchone()
+    return {"event": review_event_row_to_dict(event_row), "mistake": mistake_row_to_dict(mistake_row)}
+
+
+def review_queue_items(
+    *,
+    account_id: str = "",
+    status: str = "",
+    subject: str = "",
+    page_ref: str = "",
+    question_ref: str = "",
+    item_type: str = "",
+    error_type: str = "",
+    error_reason: str = "",
+    q: str = "",
+    due_only: bool = True,
+    page_size: int = ASSET_PAGE_SIZE_DEFAULT,
+) -> dict:
+    account_id = account_id or get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    now = datetime.now(timezone.utc)
+    page_size = normalize_asset_page_size(page_size)
+    where = [
+        "sessions.account_id=?",
+        "mi.status IN ('suspected', 'incomplete', 'confirmed', 'corrected')",
+        "mi.review_state NOT IN ('mastered', 'ignored')",
+    ]
+    params: list[object] = [account_id]
+    if status:
+        where.append("mi.status=?")
+        params.append(normalize_mistake_status(status))
+    if subject:
+        pattern = asset_like_pattern(subject)
+        where.append("mi.subject LIKE ?")
+        params.append(pattern)
+    if page_ref:
+        pattern = asset_like_pattern(page_ref)
+        where.append("(mi.page_ref LIKE ? OR mi.location_ref LIKE ?)")
+        params.extend([pattern, pattern])
+    if question_ref:
+        pattern = asset_like_pattern(question_ref)
+        where.append("(mi.question_ref LIKE ? OR mi.question_text LIKE ? OR mi.location_ref LIKE ?)")
+        params.extend([pattern, pattern, pattern])
+    if item_type:
+        pattern = asset_like_pattern(item_type)
+        where.append("(mi.question_ref LIKE ? OR mi.question_text LIKE ? OR mi.title LIKE ?)")
+        params.extend([pattern, pattern, pattern])
+    if error_type:
+        pattern = asset_like_pattern(error_type)
+        where.append("mi.error_type LIKE ?")
+        params.append(pattern)
+    if error_reason:
+        pattern = asset_like_pattern(error_reason)
+        where.append("(mi.error_reason LIKE ? OR mi.evidence LIKE ?)")
+        params.extend([pattern, pattern])
+    if q:
+        pattern = asset_like_pattern(q)
+        where.append(
+            """
+            (
+                mi.title LIKE ? OR mi.question_text LIKE ? OR mi.student_answer LIKE ?
+                OR mi.expected_answer LIKE ? OR mi.error_reason LIKE ? OR mi.evidence LIKE ?
+                OR mi.knowledge_points LIKE ? OR mi.subject LIKE ? OR mi.page_ref LIKE ?
+                OR mi.question_ref LIKE ? OR mi.location_ref LIKE ? OR mi.error_type LIKE ?
+                OR mi.correction LIKE ? OR mi.next_action LIKE ?
+            )
+            """
+        )
+        params.extend([pattern] * 14)
+    if due_only:
+        where.append("(mi.next_review_at='' OR mi.next_review_at <= ?)")
+        params.append(now.isoformat())
+    where_sql = "WHERE " + " AND ".join(where)
+    with connect() as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT mi.*, sessions.title AS session_title, sessions.status AS session_status,
+                       sessions.created_at AS session_created_at
+                FROM mistake_items mi
+                LEFT JOIN sessions ON sessions.id = mi.session_id
+                {where_sql}
+                ORDER BY
+                    CASE WHEN mi.next_review_at='' THEN 0 ELSE 1 END,
+                    mi.next_review_at ASC,
+                    mi.last_seen_at DESC,
+                    mi.updated_at DESC
+                LIMIT ?
+                """,
+                [*params, page_size],
+            )
+        ]
+        total = conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM mistake_items mi
+            LEFT JOIN sessions ON sessions.id = mi.session_id
+            {where_sql}
+            """,
+            params,
+        ).fetchone()["count"]
+    items = [mistake_row_to_dict(row) for row in rows]
+    for item in items:
+        due_at = parse_date_or_datetime(item.get("next_review_at"))
+        item["is_due"] = not item.get("next_review_at") or (due_at is not None and due_at <= now)
+    return {"items": items, "total": total, "due_only": due_only, "page_size": page_size}
+
+
+def add_metric(metrics: dict[str, dict], key: str, *, weight: int = 1, **extra) -> None:
+    normalized = str(key or "").strip()
+    if not normalized:
+        return
+    item = metrics.setdefault(normalized, {"label": normalized, "count": 0})
+    item["count"] += weight
+    for extra_key, extra_value in extra.items():
+        if extra_value not in (None, "", []):
+            item.setdefault(extra_key, extra_value)
+
+
+def ranked_metrics(metrics: dict[str, dict], limit: int = 12) -> list[dict]:
+    return sorted(metrics.values(), key=lambda item: (-int(item.get("count") or 0), item.get("label") or ""))[:limit]
+
+
+def student_profile(account_id: str = "") -> dict:
+    account_id = account_id or get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    knowledge_metrics: dict[str, dict] = {}
+    error_metrics: dict[str, dict] = {}
+    subject_metrics: dict[str, dict] = {}
+    with connect() as conn:
+        mistake_rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT mi.*, sessions.title AS session_title, sessions.created_at AS session_created_at
+                FROM mistake_items mi
+                LEFT JOIN sessions ON sessions.id = mi.session_id
+                WHERE sessions.account_id=?
+                ORDER BY mi.updated_at DESC, mi.last_seen_at DESC
+                LIMIT 800
+                """
+                ,
+                (account_id,),
+            )
+        ]
+        learning_rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT li.subject, li.item_type, li.title, li.content, li.evidence_count, li.updated_at
+                FROM learning_items li
+                LEFT JOIN sessions ON sessions.id = li.session_id
+                WHERE sessions.account_id=?
+                ORDER BY li.updated_at DESC
+                LIMIT 800
+                """
+                ,
+                (account_id,),
+            )
+        ]
+        recent_sessions = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT id, title, status, created_at, updated_at, student_goal,
+                       (SELECT COUNT(*) FROM learning_items WHERE learning_items.session_id = sessions.id) AS learning_count,
+                       (SELECT COUNT(*) FROM mistake_items WHERE mistake_items.session_id = sessions.id) AS mistake_count,
+                       (SELECT COUNT(*) FROM mistake_items WHERE mistake_items.session_id = sessions.id AND status IN ('confirmed','corrected','mastered')) AS progressed_mistake_count
+                FROM sessions
+                WHERE account_id=?
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 20
+                """
+                ,
+                (account_id,),
+            )
+        ]
+        recent_review_events = [
+            review_event_row_to_dict(row)
+            for row in conn.execute(
+                """
+                SELECT re.*, mi.title AS mistake_title, mi.question_text, mi.subject,
+                       mi.page_ref, mi.question_ref, mi.error_type
+                FROM review_events re
+                LEFT JOIN mistake_items mi ON mi.id = re.mistake_id
+                LEFT JOIN sessions ON sessions.id = re.session_id
+                WHERE sessions.account_id=?
+                ORDER BY re.reviewed_at DESC, re.created_at DESC
+                LIMIT 30
+                """
+                ,
+                (account_id,),
+            )
+        ]
+        review_result_rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT result, COUNT(*) AS count
+                FROM review_events
+                LEFT JOIN sessions ON sessions.id = review_events.session_id
+                WHERE sessions.account_id=?
+                GROUP BY result
+                """
+                ,
+                (account_id,),
+            )
+        ]
+        review_totals = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                COUNT(DISTINCT mistake_id) AS reviewed_mistakes,
+                AVG(duration_seconds) AS avg_duration_seconds
+            FROM review_events
+            LEFT JOIN sessions ON sessions.id = review_events.session_id
+            WHERE sessions.account_id=?
+            """
+            ,
+            (account_id,),
+        ).fetchone()
+        queue_counts = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN mi.status IN ('suspected','incomplete','confirmed','corrected')
+                          AND mi.review_state NOT IN ('mastered','ignored') THEN 1 ELSE 0 END) AS active_count,
+                SUM(CASE WHEN mi.status IN ('suspected','incomplete','confirmed','corrected')
+                          AND mi.review_state NOT IN ('mastered','ignored')
+                          AND (mi.next_review_at='' OR mi.next_review_at <= ?) THEN 1 ELSE 0 END) AS due_count,
+                SUM(CASE WHEN mi.status='mastered' OR mi.review_state='mastered' THEN 1 ELSE 0 END) AS mastered_count
+            FROM mistake_items mi
+            LEFT JOIN sessions ON sessions.id = mi.session_id
+            WHERE sessions.account_id=?
+            """,
+            (utc_now(), account_id),
+        ).fetchone()
+
+    for row in mistake_rows:
+        is_ignored = row.get("status") == "ignored" or row.get("review_state") == "ignored"
+        is_mastered = row.get("status") == "mastered" or row.get("review_state") == "mastered"
+        if not is_ignored and not is_mastered:
+            weight = max(1, int(row.get("review_count") or 0) + 1)
+            points = json_list(row.get("knowledge_points"))
+            for point in points:
+                for part in re.split(r"[、,，;；\n]+", point):
+                    add_metric(knowledge_metrics, part, weight=weight, subject=row.get("subject"), last_seen_at=row.get("last_seen_at"))
+            if not points:
+                add_metric(knowledge_metrics, row.get("title"), weight=1, subject=row.get("subject"))
+            add_metric(error_metrics, row.get("error_type") or row.get("error_reason"), weight=weight, subject=row.get("subject"))
+        subject = row.get("subject") or "未识别"
+        add_metric(subject_metrics, subject, weight=1)
+        subject_metrics[subject]["mistake_count"] = subject_metrics[subject].get("mistake_count", 0) + 1
+        if row.get("status") in {"corrected", "mastered"}:
+            subject_metrics[subject]["progressed_count"] = subject_metrics[subject].get("progressed_count", 0) + 1
+        if is_ignored:
+            subject_metrics[subject]["ignored_count"] = subject_metrics[subject].get("ignored_count", 0) + 1
+        if is_mastered:
+            subject_metrics[subject]["mastered_count"] = subject_metrics[subject].get("mastered_count", 0) + 1
+
+    for row in learning_rows:
+        subject = row.get("subject") or "未识别"
+        add_metric(subject_metrics, subject, weight=0)
+        subject_metrics[subject]["learning_count"] = subject_metrics[subject].get("learning_count", 0) + 1
+
+    result_counts = {row["result"] or "unknown": int(row["count"] or 0) for row in review_result_rows}
+    total_events = int(review_totals["total"] or 0) if review_totals else 0
+    correct_events = result_counts.get("correct", 0) + result_counts.get("mastered", 0)
+    incorrect_events = result_counts.get("incorrect", 0)
+    review_summary = {
+        "total_events": total_events,
+        "reviewed_mistakes": int(review_totals["reviewed_mistakes"] or 0) if review_totals else 0,
+        "correct_events": correct_events,
+        "incorrect_events": incorrect_events,
+        "postponed_events": result_counts.get("postpone", 0),
+        "mastered_events": result_counts.get("mastered", 0),
+        "active_review_count": int(queue_counts["active_count"] or 0) if queue_counts else 0,
+        "due_review_count": int(queue_counts["due_count"] or 0) if queue_counts else 0,
+        "mastered_mistake_count": int(queue_counts["mastered_count"] or 0) if queue_counts else 0,
+        "correction_efficiency": round(correct_events / total_events, 3) if total_events else 0,
+    }
+    if review_totals and review_totals["avg_duration_seconds"] is not None:
+        review_summary["avg_duration_seconds"] = round(float(review_totals["avg_duration_seconds"]), 1)
+
+    return {
+        "weak_knowledge_points": ranked_metrics(knowledge_metrics),
+        "common_error_types": ranked_metrics(error_metrics),
+        "subject_breakdown": ranked_metrics(subject_metrics),
+        "recent_sessions": recent_sessions,
+        "review_summary": review_summary,
+        "recent_review_events": recent_review_events,
+    }
+
+
+def folder_size_bytes(path: Path, limit: int = 5000) -> int:
+    total = 0
+    scanned = 0
+    if not path.exists():
+        return 0
+    for item in path.rglob("*"):
+        if not item.is_file():
+            continue
+        try:
+            total += item.stat().st_size
+        except OSError:
+            pass
+        scanned += 1
+        if scanned >= limit:
+            break
+    return total
+
+
+def observability_snapshot(account_id: str = "", user_id: str = "") -> dict:
     settings = get_settings()
-    image_paths = [settings.data_dir / "images" / name for name in filenames]
+    account_id = account_id or settings.default_account_id or DEFAULT_ACCOUNT_ID
+    data_dir = settings.data_dir
+    db_file = data_dir / "xue.sqlite3"
+    with connect() as conn:
+        counts = {}
+        for table in ("sessions", "logs", "task_runs", "memory_events", "llm_usage_events"):
+            try:
+                counts[table] = conn.execute(f"SELECT COUNT(*) AS count FROM {table} WHERE account_id=?", (account_id,)).fetchone()["count"]
+            except Exception:
+                counts[table] = 0
+        joined_counts = {
+            "images": "images.session_id = sessions.id",
+            "analyses": "analyses.session_id = sessions.id",
+            "learning_items": "learning_items.session_id = sessions.id",
+            "mistake_items": "mistake_items.session_id = sessions.id",
+            "review_events": "review_events.session_id = sessions.id",
+            "asset_documents": "asset_documents.session_id = sessions.id",
+        }
+        for table, join_condition in joined_counts.items():
+            try:
+                counts[table] = conn.execute(
+                    f"SELECT COUNT(*) AS count FROM {table} LEFT JOIN sessions ON {join_condition} WHERE sessions.account_id=?",
+                    (account_id,),
+                ).fetchone()["count"]
+            except Exception:
+                counts[table] = 0
+        recent_failures = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT analyses.id, analyses.session_id, analyses.scope, analyses.status,
+                       substr(analyses.content, 1, 400) AS content, analyses.updated_at
+                FROM analyses
+                LEFT JOIN sessions ON sessions.id = analyses.session_id
+                WHERE analyses.status='failed' AND sessions.account_id=?
+                ORDER BY analyses.updated_at DESC
+                LIMIT 20
+                """,
+                (account_id,),
+            )
+        ]
+        task_summary = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT status, COUNT(*) AS count FROM task_runs WHERE account_id=? GROUP BY status ORDER BY status",
+                (account_id,),
+            )
+        ]
+    waiting_counts = llm_gate_waiting_counts()
+    active_config = active_model_config(account_id, user_id)
+    active_max_concurrency = normalize_llm_max_concurrency(active_config.get("max_concurrency") or settings.llm_max_concurrency)
+    active_min_interval = normalize_llm_min_interval(
+        active_config.get("min_interval_seconds")
+        if active_config.get("min_interval_seconds") is not None
+        else settings.llm_min_interval_seconds
+    )
+    return {
+        "account_id": account_id,
+        "llm_gate": {
+            "inflight": llm_gate_inflight,
+            "waiting": llm_gate_waiting,
+            "waiting_realtime": waiting_counts["realtime"],
+            "waiting_background": waiting_counts["background"],
+            "inflight_realtime": llm_gate_inflight_realtime,
+            "inflight_background": llm_gate_inflight_background,
+            "last_started_at": llm_gate_last_started_at,
+            "max_concurrency": active_max_concurrency,
+            "min_interval_seconds": active_min_interval,
+            "queue_warn_size": max(1, int(settings.llm_queue_warn_size or 1)),
+            "active_provider": active_config.get("provider"),
+            "active_model": active_config.get("model"),
+            "active_base_url": active_config.get("base_url"),
+        },
+        "llm_usage": llm_usage_snapshot(account_id),
+        "model_health": {
+            "default_base_url": settings.llm_base_url,
+            "active_config": active_config,
+            "busy": llm_gate_inflight >= active_max_concurrency,
+        },
+        "cache": {
+            "redis_url_configured": bool(settings.redis_url),
+            "redis_status": "configured" if settings.redis_url else "not_configured",
+        },
+        "storage": {
+            "data_dir": str(data_dir),
+            "db_path": str(db_file),
+            "database_path": str(db_file),
+            "database_url": settings.database_url,
+            "db_bytes": db_file.stat().st_size if db_file.is_file() else 0,
+            "images_bytes": folder_size_bytes(data_dir / "images"),
+            "thumbnails_bytes": folder_size_bytes(data_dir / "thumbnails"),
+        },
+        "counts": counts,
+        "task_runs": task_summary,
+        "recent_failures": recent_failures,
+    }
+
+
+def render_learning_items_for_prompt(items: list[dict], max_chars: int = LEARNING_ITEM_SUMMARY_LIMIT) -> tuple[str, bool]:
+    if not items:
+        return "暂无结构化学习条目。", False
+    labels = {"question": "题目", "section": "板块", "knowledge": "知识点", "answer": "作答"}
+    lines = [
+        (
+            f"{index + 1}. {labels.get(row['item_type'], row['item_type'])}：{row['content']}；"
+            f"科目={row.get('subject') or '未识别'}；位置={row.get('location_ref') or '未识别'}；"
+            f"first={row['first_seen_at'] or '未知'}；last={row['last_seen_at'] or '未知'}；"
+            f"sequence={row['first_sequence_index']}-{row['last_sequence_index']}；证据={row['evidence_count']}"
+        )
+        for index, row in enumerate(items)
+    ]
+    return render_limited_lines(lines, max_chars, "条结构化学习记录")
+
+
+def render_mistake_items_for_prompt(items: list[dict], max_chars: int = 5000) -> tuple[str, bool]:
+    if not items:
+        return "暂无明确错题本候选。", False
+    lines = [
+        (
+            f"{index + 1}. {row.get('title') or '错题候选'}；状态={row.get('status') or 'suspected'}；"
+            f"科目={row.get('subject') or '未识别'}；位置={row.get('location_ref') or '未识别'}；"
+            f"题目={row.get('question_text') or '未识别'}；学生答案={row.get('student_answer') or '未识别'}；"
+            f"参考答案={row.get('expected_answer') or '未识别'}；错误类型={row.get('error_type') or '未识别'}；"
+            f"错因/证据={row.get('error_reason') or row.get('evidence') or '未识别'}；"
+            f"订正={row.get('correction') or '未识别'}；下一步={row.get('next_action') or '未识别'}；"
+            f"知识点={','.join(row.get('knowledge_points') or []) or '未识别'}"
+        )
+        for index, row in enumerate(items)
+    ]
+    return render_limited_lines(lines, max_chars, "条错题本候选")
+
+
+def build_report_process_note(session: dict, learning_items: list[dict], mistake_items: list[dict], stats: dict) -> str:
+    strategy = session_strategy(session)
+    strategy_text = build_strategy_context(strategy)
+    item_counts: dict[str, int] = {}
+    for item in learning_items:
+        item_counts[item.get("item_type") or "unknown"] = item_counts.get(item.get("item_type") or "unknown", 0) + 1
+    return (
+        "报告生成依据摘要：\n"
+        f"- 学生/系统目标：{strategy_text}\n"
+        f"- 结构化学习条目：题目 {item_counts.get('question', 0)}，板块 {item_counts.get('section', 0)}，"
+        f"知识点 {item_counts.get('knowledge', 0)}，作答 {item_counts.get('answer', 0)}\n"
+        f"- 错题本候选：{len(mistake_items)} 条\n"
+        f"- 视觉证据：抓拍 {stats['image_count']} 张，批次分析 {stats['analysis_count']} 条，"
+        f"去重后可用分析 {stats['unique_done_analysis_count']} 条，重复分析 {stats['duplicate_done_analysis_count']} 条\n"
+        "- 报告生成方式：先收集关键帧和差异分析，再合并学习条目、错题候选、时间线和用户要求，最后生成报告。"
+    )
+
+
+def build_distill_source_notes(analyses: list[dict], max_chars: int = FINAL_REPORT_DISTILL_SOURCE_CHAR_LIMIT) -> tuple[list[str], dict]:
+    unique_rows, duplicate_count = dedupe_analyses(analyses)
+    if not unique_rows:
+        return ["暂无可提炼的批次视觉分析内容。"], {"duplicate_done_analysis_count": duplicate_count, "source_chars": 0}
+    per_note_limit = max(
+        FINAL_REPORT_DISTILL_ANALYSIS_MIN_CHARS,
+        min(FINAL_REPORT_DISTILL_ANALYSIS_MAX_CHARS, max_chars // max(len(unique_rows), 1) - 120),
+    )
+    notes = [build_evidence_note(row, index + 1, per_note_limit) for index, row in enumerate(unique_rows)]
+    total_chars = sum(len(note) for note in notes)
+    if total_chars <= max_chars:
+        return notes, {"duplicate_done_analysis_count": duplicate_count, "source_chars": total_chars}
+    selected = sorted(representative_indices(len(notes)))
+    while selected:
+        rendered_notes = [notes[index] for index in selected]
+        omitted = len(notes) - len(rendered_notes)
+        rendered_chars = sum(len(note) for note in rendered_notes)
+        if rendered_chars <= max_chars:
+            if omitted:
+                rendered_notes.append(f"... 已省略 {omitted} 条重复或代表性较低的批次分析，保留开头/中段/结尾证据 ...")
+            return rendered_notes, {"duplicate_done_analysis_count": duplicate_count, "source_chars": rendered_chars, "omitted_note_count": omitted}
+        selected.pop(len(selected) // 2)
+    fallback = [truncate_text("\n".join(notes), max_chars)]
+    return fallback, {"duplicate_done_analysis_count": duplicate_count, "source_chars": len(fallback[0]), "omitted_note_count": len(notes) - 1}
+
+
+def chunk_text_blocks(blocks: list[str], max_chars: int) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_chars = 0
+    for block in blocks:
+        block_chars = len(block)
+        if current and current_chars + block_chars + 2 > max_chars:
+            chunks.append("\n\n".join(current))
+            current = []
+            current_chars = 0
+        if block_chars > max_chars:
+            chunks.append(truncate_text(block, max_chars))
+            continue
+        current.append(block)
+        current_chars += block_chars + 2
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks
+
+
+def build_distill_prompt(session: dict, images: list[dict], notes_chunk: str, chunk_index: int, chunk_count: int, stats: dict) -> str:
+    start, end, total_seconds = report_time_bounds(session, images)
+    timeline_lines = build_timeline_lines(session, images)
+    timeline, timeline_compressed = render_limited_lines(timeline_lines, 5000, "条抓拍时间线") if timeline_lines else ("无抓拍图片。", False)
+    time_weight_summary = build_time_weight_summary(session, images)
+    timeline = f"{time_weight_summary}\n{timeline}" if timeline else time_weight_summary
+    compressed_notice = "时间线已抽样压缩；" if timeline_compressed else ""
+    return prompts.render_prompt(
+        "distill_final_evidence",
+        chunk_index=chunk_index,
+        chunk_count=chunk_count,
+        compressed_notice=compressed_notice,
+        image_count=stats["image_count"],
+        analysis_count=stats["analysis_count"],
+        unique_done_analysis_count=stats["unique_done_analysis_count"],
+        duplicate_done_analysis_count=stats["duplicate_done_analysis_count"],
+        start=start.isoformat() if start else "未知",
+        end=end.isoformat() if end else session.get("finished_at") or "未知",
+        total_duration=format_duration(total_seconds),
+        timeline=timeline,
+        notes_chunk=notes_chunk,
+    )
+
+
+def build_final_report_prompt(
+    session: dict,
+    images: list[dict],
+    analyses: list[dict],
+    distilled_notes: str | None = None,
+    learning_items: list[dict] | None = None,
+    mistake_items: list[dict] | None = None,
+) -> str:
+    start, end, total_seconds = report_time_bounds(session, images)
+    timeline_lines = build_timeline_lines(session, images)
+    if timeline_lines:
+        timeline, timeline_compressed = render_limited_lines(timeline_lines, FINAL_REPORT_TIMELINE_CHAR_LIMIT, "条抓拍时间线")
+    else:
+        timeline, timeline_compressed = "无抓拍图片。", False
+    time_weight_summary = build_time_weight_summary(session, images)
+    timeline = f"{time_weight_summary}\n{timeline}"
+    if distilled_notes is None:
+        batch_notes, analyses_compressed = build_limited_batch_notes(analyses, FINAL_REPORT_ANALYSES_CHAR_LIMIT)
+        evidence_label = "批次视觉分析"
+    else:
+        batch_notes = truncate_text(distilled_notes, FINAL_REPORT_DISTILLED_NOTES_CHAR_LIMIT)
+        analyses_compressed = len(distilled_notes) > FINAL_REPORT_DISTILLED_NOTES_CHAR_LIMIT
+        evidence_label = "分批提炼后的关键证据"
+    stats = final_report_evidence_stats(images, analyses)
+    item_notes, items_compressed = render_learning_items_for_prompt(learning_items or [])
+    mistake_notes, mistakes_compressed = render_mistake_items_for_prompt(mistake_items or [])
+    if item_notes:
+        process_note = build_report_process_note(session, learning_items or [], mistake_items or [], stats)
+        batch_notes = (
+            f"【学生目标与动态策略】\n{build_strategy_context(session_strategy(session))}\n\n"
+            f"【错题本候选】\n{mistake_notes}\n\n"
+            f"【结构化学习条目（已按题目/板块/知识点去重）】\n{item_notes}\n\n"
+            f"【报告生成依据】\n{process_note}\n\n"
+            f"【{evidence_label}】\n{batch_notes}"
+        )
+    compressed_notice = ""
+    if timeline_compressed or analyses_compressed or items_compressed or mistakes_compressed or distilled_notes is not None:
+        compressed_notice = (
+            "注意：后端已按模型上下文预算压缩时间线或批次分析，并删除重复描述；"
+            "未列出的细节不要编造，只基于可见证据概述。\n\n"
+        )
+    prompt = prompts.render_prompt(
+        "final_report",
+        evidence_label=evidence_label,
+        compressed_notice=compressed_notice,
+        start=start.isoformat() if start else "未知",
+        end=end.isoformat() if end else session.get("finished_at") or "未知",
+        total_duration=format_duration(total_seconds),
+        image_count=len(images),
+        analysis_count=stats["analysis_count"],
+        raw_analysis_chars=stats["raw_analysis_chars"],
+        raw_capture_meta_chars=stats["raw_capture_meta_chars"],
+        unique_done_analysis_count=stats["unique_done_analysis_count"],
+        duplicate_done_analysis_count=stats["duplicate_done_analysis_count"],
+        timeline=timeline,
+        batch_notes=batch_notes,
+    )
+    return truncate_text(prompt, FINAL_REPORT_PROMPT_CHAR_LIMIT)
+
+
+def build_qa_session_summary_prompt(session: dict, qa_events: list[dict]) -> str:
+    qa_lines = []
+    for index, event in enumerate(reversed(qa_events), start=1):
+        context = event.get("context") if isinstance(event.get("context"), dict) else {}
+        qa_lines.append(
+            (
+                f"{index}. 时间={event.get('created_at')}; "
+                f"触发={event.get('trigger_type') or event.get('source')}; "
+                f"意图={context.get('student_intent') or 'unknown'}\n"
+                f"问：{truncate_text(event.get('question'), 260)}\n"
+                f"答：{truncate_text(event.get('answer'), 520)}"
+            )
+        )
+    return truncate_text(
+        f"""
+请把这个没有观察图片或以实时语音问答为主的学习回合，压缩成一段可查看的回合总结。
+
+要求：
+- 用中文，结构清晰，适合 App 历史对话里的“查看报告”。
+- 不要编造题目、图片内容或耗时；只能基于问答文本和会话策略。
+- 重点保留：用户问了什么、模型怎么答、当前结论/卡点、下一步可以继续问什么。
+- 如果信息不足，明确写“证据不足”。
+
+会话：
+- id={session.get('id')}
+- title={session.get('title')}
+- student_goal={session.get('student_goal') or ''}
+
+动态策略：
+{build_strategy_context(session_strategy(session))}
+
+问答记录：
+{chr(10).join(qa_lines) if qa_lines else "暂无问答记录。"}
+
+请输出这些栏目：
+回合摘要：
+用户主要问题：
+已给出的帮助：
+可能的卡点：
+下一步建议：
+报告生成依据：
+""".strip(),
+        FINAL_REPORT_PROMPT_CHAR_LIMIT,
+    )
+
+
+async def wait_for_batch_analyses(session_id: str) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + FINAL_REPORT_WAIT_SECONDS
+    while True:
+        with connect() as conn:
+            running = conn.execute(
+                "SELECT COUNT(*) AS count FROM analyses WHERE session_id=? AND scope='batch' AND status='running'",
+                (session_id,),
+            ).fetchone()["count"]
+        if running == 0 or loop.time() >= deadline:
+            return
+        await asyncio.sleep(1)
+
+
+async def run_analysis(
+    analysis_id: str,
+    session_id: str,
+    batch_id: str | None,
+    prompt: str,
+    filenames: list[str],
+    summarize: bool = False,
+    task_id: str | None = None,
+    already_claimed: bool = False,
+) -> tuple[str, str]:
+    if not already_claimed:
+        mark_task_run(task_id, "running")
+    storage_settings = get_settings()
+    settings = effective_llm_settings_for_session(session_id)
+    image_paths = [storage_settings.data_dir / "images" / name for name in filenames]
     emit_log(f"开始大模型解析：{len(image_paths)} 张图片", session_id=session_id)
     try:
-        content = await llm.analyze_images(settings, prompt, image_paths)
+        content = await run_with_llm_gate(
+            f"vision:{analysis_id[:8]} images={len(image_paths)}",
+            session_id,
+            lambda: llm.analyze_images(settings, prompt, image_paths),
+            priority=LLM_PRIORITY_BACKGROUND,
+        )
         status = "done"
+        if analysis_needs_clarity_warning(content):
+            emit_log(
+                (
+                    "图片拍摄提醒：课本/试卷/屏幕可能未完整进入拍摄区域，"
+                    "或题干、数字、页码看不清。"
+                    "请调整相机角度/距离，确保材料完整清晰可见后重新拍摄并解析。"
+                ),
+                session_id=session_id,
+                level="warning",
+            )
     except Exception as exc:
-        content = f"大模型解析失败：{exc}"
+        content = f"大模型解析失败：{llm.format_llm_error(exc)}"
         status = "failed"
         emit_log(content, session_id=session_id, level="error")
     now = utc_now()
@@ -71,15 +7104,210 @@ async def run_analysis(analysis_id: str, session_id: str, batch_id: str | None, 
             (status, content, now, analysis_id),
         )
         if summarize:
-            previous = conn.execute("SELECT summary FROM sessions WHERE id=?", (session_id,)).fetchone()
-            merged = ((previous["summary"] if previous else "") + "\n\n" + content).strip()
             conn.execute(
-                "UPDATE sessions SET summary=?, status=?, updated_at=? WHERE id=?",
-                (merged, "analyzed" if status == "done" else "error", now, session_id),
+                "UPDATE sessions SET status=?, updated_at=? WHERE id=?",
+                ("analyzed" if status == "done" else "error", now, session_id),
             )
         else:
             conn.execute("UPDATE sessions SET status=?, updated_at=? WHERE id=?", (status, now, session_id))
+    if status == "done":
+        counts = store_learning_items_from_analysis(session_id, batch_id, analysis_id, content, filenames)
+        inferred = infer_needs_from_analysis(content)
+        if counts["mistake_item_count"]:
+            inferred = merge_tags(inferred, ["mistake_book"])
+        if counts["learning_item_count"]:
+            inferred = merge_tags(inferred, ["knowledge_points"])
+        if inferred:
+            update_session_needs(session_id, inferred, "根据最新画面分析动态调整关注点：" + "、".join(tag_label(tag) for tag in inferred))
+        if counts["learning_item_count"] or counts["mistake_item_count"]:
+            emit_log(
+                f"已写入学习资产：结构化条目 {counts['learning_item_count']} 条，错题本候选 {counts['mistake_item_count']} 条",
+                session_id=session_id,
+            )
+            record_report_event(
+                session_id,
+                "batch_assets",
+                "批次学习资产入库",
+                f"batch={batch_id or 'single'}；结构化条目={counts['learning_item_count']}；错题本候选={counts['mistake_item_count']}；动态需求={','.join(inferred)}",
+                analysis_id,
+            )
+    if not already_claimed:
+        mark_task_run(task_id, "done" if status == "done" else "failed", error=content if status != "done" else "")
     emit_log(f"解析完成：{status}", session_id=session_id)
+    return status, content
+
+
+async def distill_final_report_evidence(settings, session: dict, images: list[dict], analyses: list[dict], session_id: str) -> str | None:
+    if not should_distill_final_evidence(images, analyses):
+        return None
+    stats = final_report_evidence_stats(images, analyses)
+    notes, source_stats = build_distill_source_notes(analyses)
+    chunks = chunk_text_blocks(notes, FINAL_REPORT_DISTILL_CHUNK_CHAR_LIMIT)
+    emit_log(
+        (
+            "最终报告证据过大，先分批提炼："
+            f"images={stats['image_count']} analyses={stats['analysis_count']} "
+            f"raw_analysis_chars={stats['raw_analysis_chars']} raw_capture_meta_chars={stats['raw_capture_meta_chars']} "
+            f"unique_done={stats['unique_done_analysis_count']} duplicates={stats['duplicate_done_analysis_count']} "
+            f"source_chars={source_stats.get('source_chars', 0)} chunks={len(chunks)}"
+        ),
+        session_id=session_id,
+    )
+    distilled_chunks: list[str] = []
+    for index, chunk in enumerate(chunks, start=1):
+        prompt = build_distill_prompt(session, images, chunk, index, len(chunks), stats)
+        emit_log(f"开始提炼最终报告证据：第 {index}/{len(chunks)} 批，prompt_chars={len(prompt)}", session_id=session_id)
+        try:
+            distilled = await run_with_llm_gate(
+                f"distill:{session_id[:8]} chunk={index}/{len(chunks)}",
+                session_id,
+                lambda: llm.analyze_text(settings, prompt, max_tokens=FINAL_REPORT_DISTILL_MAX_TOKENS),
+                priority=LLM_PRIORITY_BACKGROUND,
+            )
+        except Exception as exc:
+            emit_log(
+                f"最终报告证据提炼失败，回退到直接压缩报告路径：{llm.format_llm_error(exc)}",
+                session_id=session_id,
+                level="warning",
+            )
+            return None
+        distilled_chunks.append(f"【提炼批次 {index}/{len(chunks)}】\n{distilled.strip()}")
+    return "\n\n".join(distilled_chunks)
+
+
+async def run_qa_session_summary(
+    analysis_id: str,
+    session_id: str,
+    task_id: str | None = None,
+    already_claimed: bool = False,
+) -> tuple[str, str]:
+    if not already_claimed:
+        mark_task_run(task_id, "running")
+    with connect() as conn:
+        session_row = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if not session_row:
+        content = "回合总结失败：session not found"
+        if not already_claimed:
+            mark_task_run(task_id, "failed", error=content)
+        return "failed", content
+    session = dict(session_row)
+    events = [event for event in qa_events_for_session(session_id, 80) if event.get("question") or event.get("answer")]
+    prompt = build_qa_session_summary_prompt(session, events)
+    settings = effective_llm_settings_for_session(session_id)
+    try:
+        content = await run_with_llm_gate(
+            f"qa_session_summary:{session_id[:8]}",
+            session_id,
+            lambda: llm.analyze_text(settings, prompt, max_tokens=1200),
+            priority=LLM_PRIORITY_BACKGROUND,
+        )
+        content = truncate_text(content, QA_ANSWER_CHAR_LIMIT)
+        status = "done"
+    except Exception as exc:
+        status = "failed"
+        content = f"回合总结失败：{llm.format_llm_error(exc)}"
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE analyses SET status=?, prompt=?, content=?, updated_at=? WHERE id=?",
+            (status, prompt, content, now, analysis_id),
+        )
+        conn.execute(
+            "UPDATE sessions SET summary=?, status=?, report_generated_at=?, updated_at=? WHERE id=?",
+            (content if status == "done" else "", "completed" if status == "done" else "error", now if status == "done" else "", now, session_id),
+        )
+    if not already_claimed:
+        mark_task_run(task_id, "done" if status == "done" else "failed", error=content if status != "done" else "")
+    emit_log(f"QA 回合总结完成：{status}", session_id=session_id, level="info" if status == "done" else "error")
+    return status, content
+
+
+async def run_final_report(analysis_id: str, session_id: str, task_id: str | None = None, already_claimed: bool = False) -> tuple[str, str]:
+    if not already_claimed:
+        mark_task_run(task_id, "running")
+    await wait_for_batch_analyses(session_id)
+    settings = effective_llm_settings_for_session(session_id)
+    with connect() as conn:
+        session_row = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if not session_row:
+            content = f"最终报告生成失败：session not found: {session_id}"
+            if not already_claimed:
+                mark_task_run(task_id, "failed", error=content)
+            return "failed", content
+        session = dict(session_row)
+        images = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT images.*, COALESCE(obs.novelty_status, 'unknown') AS novelty_status
+                FROM images
+                LEFT JOIN session_observations obs ON obs.image_id = images.id
+                WHERE images.session_id=?
+                ORDER BY sequence_index, captured_at, created_at
+                """,
+                (session_id,),
+            )
+        ]
+        images = [row for row in images if image_row_has_valid_content(row)]
+        analyses = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM analyses WHERE session_id=? ORDER BY created_at",
+                (session_id,),
+            )
+        ]
+        learning_items = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM learning_items
+                WHERE session_id=?
+                ORDER BY first_sequence_index, first_seen_at, created_at
+                """,
+                (session_id,),
+            )
+        ]
+        mistake_items = mistake_items_for_session(session_id)
+    try:
+        distilled_notes = await distill_final_report_evidence(settings, session, images, analyses, session_id)
+        prompt = build_final_report_prompt(session, images, analyses, distilled_notes, learning_items, mistake_items)
+        stats = final_report_evidence_stats(images, analyses)
+        process_note = build_report_process_note(session, learning_items, mistake_items, stats)
+        record_report_event(session_id, "final_prompt_context", "最终报告生成依据", process_note, analysis_id)
+        emit_log(
+            (
+                "开始生成学习回合最终总结报告："
+                f"prompt_chars={len(prompt)} images={stats['image_count']} analyses={stats['analysis_count']} "
+                f"raw_evidence_chars={stats['raw_evidence_chars']} distilled={'yes' if distilled_notes else 'no'}"
+            ),
+            session_id=session_id,
+        )
+        content = await run_with_llm_gate(
+            f"final_report:{session_id[:8]}",
+            session_id,
+            lambda: llm.analyze_text(settings, prompt),
+            priority=LLM_PRIORITY_BACKGROUND,
+        )
+        status = "done"
+    except Exception as exc:
+        content = f"最终报告生成失败：{llm.format_llm_error(exc)}"
+        status = "failed"
+        emit_log(content, session_id=session_id, level="error")
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE analyses SET status=?, content=?, updated_at=? WHERE id=?",
+            (status, content, now, analysis_id),
+        )
+        conn.execute(
+            "UPDATE sessions SET summary=?, status=?, report_generated_at=?, updated_at=? WHERE id=?",
+            (content, "completed" if status == "done" else "error", now if status == "done" else "", now, session_id),
+        )
+    if not already_claimed:
+        mark_task_run(task_id, "done" if status == "done" else "failed", error=content if status != "done" else "")
+    emit_log(f"最终总结报告生成完成：{status}", session_id=session_id)
+    return status, content
 
 
 @app.get("/health")
@@ -87,104 +7315,1752 @@ def health() -> dict:
     return {"ok": True, "service": "xue"}
 
 
+@app.get("/health/llm")
+async def llm_health(request: Request) -> dict:
+    principal = principal_from_request(request)
+    settings = effective_llm_settings(principal["account_id"], principal.get("user_id", ""))
+    try:
+        result = await llm.check_health(settings)
+        result["usage"] = llm_usage_snapshot(principal["account_id"])
+        result["active_config"] = active_model_config(principal["account_id"], principal.get("user_id", ""))
+        return result
+    except Exception as exc:
+        return {
+            "ok": False,
+            "base_url": settings.llm_base_url,
+            "model": settings.llm_model,
+            "error": llm.format_llm_error(exc),
+            "usage": llm_usage_snapshot(principal["account_id"]),
+            "active_config": active_model_config(principal["account_id"], principal.get("user_id", "")),
+        }
+
+
+@app.get("/api/auth/config")
+def get_auth_config() -> dict:
+    return auth_public_config()
+
+
+@app.post("/api/auth/register")
+async def register_user(request: Request) -> dict:
+    init_db()
+    settings = get_settings()
+    if not settings.registration_enabled:
+        raise HTTPException(403, "registration disabled")
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(422, "invalid JSON body")
+    email = normalize_email(body.get("email"))
+    password = str(body.get("password") or "")
+    display_name = clean_auth_text(body.get("display_name") or body.get("displayName") or body.get("name"), 120)
+    account_name = clean_auth_text(body.get("account_name") or body.get("accountName"), 120) or (display_name or email.split("@")[0])
+    student_name = clean_auth_text(body.get("student_name") or body.get("studentName"), 120) or "默认学生"
+    if not email or not AUTH_EMAIL_RE.match(email):
+        raise HTTPException(422, "valid email is required")
+    if len(password) < AUTH_PASSWORD_MIN_LENGTH:
+        raise HTTPException(422, f"password must be at least {AUTH_PASSWORD_MIN_LENGTH} characters")
+    now = utc_now()
+    account_id = uuid.uuid4().hex
+    user_id = uuid.uuid4().hex
+    member_id = uuid.uuid4().hex
+    parent_profile_id = uuid.uuid4().hex
+    student_profile_id = uuid.uuid4().hex
+    try:
+        with connect() as conn:
+            existing = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+            if existing:
+                raise HTTPException(409, "email already registered")
+            conn.execute(
+                "INSERT INTO accounts(id, name, status, plan, created_at, updated_at) VALUES(?, ?, 'active', 'free', ?, ?)",
+                (account_id, account_name, now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO users(
+                    id, account_id, email, display_name, password_hash, role, status,
+                    created_at, updated_at, last_login_at
+                )
+                VALUES(?, ?, ?, ?, ?, 'owner', 'active', ?, ?, ?)
+                """,
+                (user_id, account_id, email, display_name or email, hash_password(password), now, now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO account_members(id, account_id, user_id, role, status, created_at, updated_at)
+                VALUES(?, ?, ?, 'owner', 'active', ?, ?)
+                """,
+                (member_id, account_id, user_id, now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO identity_profiles(
+                    id, account_id, user_id, profile_type, display_name, relation, metadata,
+                    status, created_at, updated_at
+                )
+                VALUES(?, ?, ?, 'parent', ?, 'owner', '{}', 'active', ?, ?)
+                """,
+                (parent_profile_id, account_id, user_id, display_name or "家长", now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO identity_profiles(
+                    id, account_id, user_id, profile_type, display_name, student_id, relation, metadata,
+                    status, created_at, updated_at
+                )
+                VALUES(?, ?, ?, 'student', ?, ?, '', '{}', 'active', ?, ?)
+                """,
+                (student_profile_id, account_id, user_id, student_name, student_profile_id, now, now),
+            )
+            user = dict(conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone())
+    except HTTPException:
+        raise
+    token = make_access_token(user)
+    return {
+        "access_token": token,
+        "token_type": AUTH_SCHEME.lower(),
+        "user": public_user(user),
+        "account": {"id": account_id, "name": account_name, "plan": "free", "status": "active"},
+        "profiles": account_profiles(account_id),
+        "auth": auth_public_config(),
+    }
+
+
+@app.post("/api/auth/login")
+async def login_user(request: Request) -> dict:
+    init_db()
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(422, "invalid JSON body")
+    email = normalize_email(body.get("email"))
+    password = str(body.get("password") or "")
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM users WHERE email=? AND status='active'", (email,)).fetchone()
+        if not row or not verify_password(password, row["password_hash"]):
+            raise HTTPException(401, "invalid email or password")
+        now = utc_now()
+        conn.execute("UPDATE users SET last_login_at=?, updated_at=? WHERE id=?", (now, now, row["id"]))
+        user = dict(conn.execute("SELECT * FROM users WHERE id=?", (row["id"],)).fetchone())
+    return {
+        "access_token": make_access_token(user),
+        "token_type": AUTH_SCHEME.lower(),
+        "user": public_user(user),
+        "profiles": account_profiles(user["account_id"]),
+        "auth": auth_public_config(),
+    }
+
+
+@app.get("/api/auth/me")
+def get_current_user(request: Request) -> dict:
+    principal = principal_from_request(request)
+    if not principal.get("authenticated"):
+        return {"authenticated": False, "auth": auth_public_config()}
+    return {
+        "authenticated": True,
+        "user": principal["user"],
+        "profiles": account_profiles(principal["account_id"]),
+        "active_model_config": active_model_config(principal["account_id"], principal["user_id"]),
+        "auth": auth_public_config(),
+    }
+
+
+@app.get("/api/profiles")
+def list_profiles(request: Request) -> dict:
+    principal = principal_from_request(request)
+    return {"profiles": account_profiles(principal["account_id"])}
+
+
+@app.post("/api/profiles")
+async def post_profile(request: Request) -> dict:
+    principal = principal_from_request(request, required=True)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(422, "invalid JSON body")
+    profile = create_identity_profile(principal["account_id"], body, user_id=principal["user_id"] if body.get("attach_to_user") else "")
+    return {"profile": profile, "profiles": account_profiles(principal["account_id"])}
+
+
+@app.get("/api/model-platforms")
+def model_platforms() -> dict:
+    return {
+        "platforms": [
+            {"provider": provider, **details}
+            for provider, details in MODEL_PROVIDERS.items()
+        ],
+        "recommended_gateway": {
+            "name": "LiteLLM Proxy",
+            "purpose": "统一 OpenAI/Anthropic/Gemini/智谱等模型平台到 OpenAI-compatible API，并集中做 key、配额和日志管理。",
+            "deploy_target": "ydz@100.64.0.13",
+        },
+        "system_default": active_model_config(),
+    }
+
+
+@app.get("/api/model-configs")
+def list_model_configs(request: Request) -> dict:
+    principal = principal_from_request(request)
+    with connect() as conn:
+        rows = [
+            model_config_public(row)
+            for row in conn.execute(
+                "SELECT * FROM model_configs WHERE account_id=? ORDER BY is_default DESC, updated_at DESC",
+                (principal["account_id"],),
+            )
+        ]
+    return {"configs": rows, "active": active_model_config(principal["account_id"], principal.get("user_id", ""))}
+
+
+@app.post("/api/model-configs")
+async def upsert_model_config(request: Request) -> dict:
+    principal = principal_from_request(request, required=True)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(422, "invalid JSON body")
+    provider = clean_auth_text(body.get("provider"), 40)
+    if provider not in MODEL_PROVIDERS:
+        raise HTTPException(422, "unsupported model provider")
+    name = clean_auth_text(body.get("name"), 120) or MODEL_PROVIDERS[provider]["label"]
+    base_url = clean_auth_text(body.get("base_url") or body.get("baseUrl"), 500)
+    model = clean_auth_text(body.get("model"), 160)
+    if not base_url or not model:
+        raise HTTPException(422, "base_url and model are required")
+    config_id = clean_auth_text(body.get("id"), 80) or uuid.uuid4().hex
+    api_key = body.get("api_key", body.get("apiKey"))
+    enabled = 0 if body.get("enabled") is False else 1
+    is_default = 1 if body.get("is_default") is True or body.get("isDefault") is True else 0
+    max_concurrency = max(1, min(64, int(body.get("max_concurrency") or body.get("maxConcurrency") or 1)))
+    min_interval_seconds = max(0.0, float(body.get("min_interval_seconds") or body.get("minIntervalSeconds") or 0))
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    now = utc_now()
+    with connect() as conn:
+        existing = conn.execute(
+            "SELECT * FROM model_configs WHERE id=? AND account_id=?",
+            (config_id, principal["account_id"]),
+        ).fetchone()
+        encrypted_key = encrypt_model_secret(api_key) if api_key not in (None, "") else (existing["api_key_encrypted"] if existing else "")
+        if is_default:
+            conn.execute("UPDATE model_configs SET is_default=0 WHERE account_id=?", (principal["account_id"],))
+        conn.execute(
+            """
+            INSERT INTO model_configs(
+                id, account_id, owner_user_id, provider, name, base_url, api_key_encrypted,
+                model, enabled, is_default, max_concurrency, min_interval_seconds,
+                metadata, created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                provider=excluded.provider,
+                name=excluded.name,
+                base_url=excluded.base_url,
+                api_key_encrypted=excluded.api_key_encrypted,
+                model=excluded.model,
+                enabled=excluded.enabled,
+                is_default=excluded.is_default,
+                max_concurrency=excluded.max_concurrency,
+                min_interval_seconds=excluded.min_interval_seconds,
+                metadata=excluded.metadata,
+                updated_at=excluded.updated_at
+            """,
+            (
+                config_id,
+                principal["account_id"],
+                principal["user_id"],
+                provider,
+                name,
+                base_url,
+                encrypted_key,
+                model,
+                enabled,
+                is_default,
+                max_concurrency,
+                min_interval_seconds,
+                json_dumps(metadata),
+                now,
+                now,
+            ),
+        )
+        if not is_default:
+            default_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM model_configs WHERE account_id=? AND enabled=1 AND is_default=1",
+                (principal["account_id"],),
+            ).fetchone()["count"]
+            if not default_count:
+                conn.execute("UPDATE model_configs SET is_default=1 WHERE id=? AND account_id=?", (config_id, principal["account_id"]))
+        row = conn.execute("SELECT * FROM model_configs WHERE id=? AND account_id=?", (config_id, principal["account_id"])).fetchone()
+    return {"config": model_config_public(row), "active": active_model_config(principal["account_id"], principal["user_id"])}
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
     return (Path(__file__).parent / "static" / "dashboard.html").read_text(encoding="utf-8")
 
 
-@app.get("/api/sessions")
-def list_sessions() -> dict:
+@app.get("/prompts", response_class=HTMLResponse)
+def prompt_settings_page() -> str:
+    return (Path(__file__).parent / "static" / "prompts.html").read_text(encoding="utf-8")
+
+
+@app.get("/assets", response_class=HTMLResponse)
+def asset_browser_page() -> str:
+    return (Path(__file__).parent / "static" / "assets.html").read_text(encoding="utf-8")
+
+
+@app.get("/session-panel", response_class=HTMLResponse)
+def session_panel_page() -> str:
+    return (Path(__file__).parent / "static" / "session-panel.html").read_text(encoding="utf-8")
+
+
+@app.get("/api/prompts")
+def list_prompts() -> dict:
+    init_db()
+    return {"prompts": prompts.list_prompt_records()}
+
+
+@app.get("/api/assets")
+def list_assets(
+    request: Request,
+    kind: str = Query("learning", pattern="^(learning|mistake)$"),
+    session_id: str = Query(""),
+    item_type: str = Query(""),
+    status: str = Query(""),
+    review_state: str = Query(""),
+    error_type: str = Query(""),
+    subject: str = Query(""),
+    location: str = Query(""),
+    q: str = Query(""),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(ASSET_PAGE_SIZE_DEFAULT, ge=1, le=ASSET_PAGE_SIZE_MAX),
+) -> dict:
+    init_db()
+    principal = principal_from_request(request)
+    filters = {
+        "kind": kind,
+        "session_id": session_id,
+        "item_type": item_type,
+        "status": status,
+        "review_state": review_state,
+        "error_type": error_type,
+        "subject": subject,
+        "location": location,
+        "q": q,
+    }
+    if kind == "mistake":
+        result = browse_mistake_assets(
+            session_id=session_id,
+            status=status,
+            review_state=review_state,
+            error_type=error_type,
+            subject=subject,
+            location=location,
+            q=q,
+            page=page,
+            page_size=page_size,
+            account_id=principal["account_id"],
+        )
+    else:
+        result = browse_learning_assets(session_id=session_id, item_type=item_type, subject=subject, location=location, q=q, page=page, page_size=page_size, account_id=principal["account_id"])
+    result["filters"] = filters
+    return result
+
+
+@app.get("/api/learning-columns")
+def learning_columns_overview(request: Request, page_size: int = Query(40, ge=1, le=ASSET_PAGE_SIZE_MAX)) -> dict:
+    init_db()
+    principal = principal_from_request(request)
+    learning_items, learning_total, mistake_items, mistake_total = global_learning_column_items(page_size, account_id=principal["account_id"])
     with connect() as conn:
-        sessions = [dict(row) for row in conn.execute("SELECT * FROM sessions ORDER BY created_at DESC LIMIT 100")]
+        sessions = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT id, title, status, created_at, updated_at, student_goal,
+                       assistant_focus, inferred_needs, report_style,
+                       (SELECT COUNT(*) FROM learning_items WHERE learning_items.session_id = sessions.id) AS learning_count,
+                       (SELECT COUNT(*) FROM mistake_items WHERE mistake_items.session_id = sessions.id) AS mistake_count
+                FROM sessions
+                WHERE account_id=? AND (student_goal != '' OR assistant_focus != '' OR inferred_needs != '[]' OR report_style != '')
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 60
+                """,
+                (principal["account_id"],),
+            )
+        ]
+    return {
+        "scope": "global",
+        "learning_items": [compact_global_asset_item(item) for item in learning_items],
+        "learning_total": learning_total,
+        "mistake_items": [compact_global_asset_item(item) for item in mistake_items],
+        "mistake_total": mistake_total,
+        "strategy_sessions": sessions,
+        "strategy_total": len(sessions),
+    }
+
+
+def compact_global_asset_item(item: dict) -> dict:
+    compact = dict(item)
+    for key in ("document_body", "source_image_ids"):
+        compact.pop(key, None)
+    if len(str(compact.get("content") or "")) > 260:
+        compact["content"] = truncate_text(compact.get("content"), 260)
+    if len(str(compact.get("question_text") or "")) > 260:
+        compact["question_text"] = truncate_text(compact.get("question_text"), 260)
+    if len(str(compact.get("error_reason") or "")) > 220:
+        compact["error_reason"] = truncate_text(compact.get("error_reason"), 220)
+    if len(str(compact.get("evidence") or "")) > 220:
+        compact["evidence"] = truncate_text(compact.get("evidence"), 220)
+    details = compact.get("source_image_details")
+    if isinstance(details, list):
+        compact["source_image_details"] = details[:2]
+    return compact
+
+
+@app.post("/api/sessions/{session_id}/mistakes")
+async def post_session_mistake(session_id: str, request: Request) -> dict:
+    principal = principal_from_request(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(422, "invalid JSON body")
+    with connect() as conn:
+        require_account_session(conn, session_id, principal)
+    mistake = create_manual_mistake_item(session_id, body)
+    emit_log(
+        f"加入错题本：{truncate_text(mistake.get('title') or mistake.get('question_text'), 120)}",
+        session_id=session_id,
+        source="mistake",
+    )
+    return {"mistake": mistake}
+
+
+@app.patch("/api/mistakes/{mistake_id}")
+async def patch_mistake(mistake_id: str, request: Request) -> dict:
+    init_db()
+    principal = principal_from_request(request)
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT mi.id
+            FROM mistake_items mi
+            LEFT JOIN sessions ON sessions.id = mi.session_id
+            WHERE mi.id=? AND sessions.account_id=?
+            """,
+            (mistake_id, principal["account_id"]),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "mistake not found")
+    body = await request.json()
+    mistake = update_mistake_item(mistake_id, body if isinstance(body, dict) else {})
+    emit_log(
+        f"更新错题状态：{mistake_id} status={mistake.get('status')} review_state={mistake.get('review_state')}",
+        session_id=mistake.get("session_id"),
+        source="dashboard",
+    )
+    return {"mistake": mistake}
+
+
+@app.get("/api/mistakes/{mistake_id}/review-events")
+def get_mistake_review_events(request: Request, mistake_id: str, limit: int = Query(60, ge=1, le=200)) -> dict:
+    init_db()
+    principal = principal_from_request(request)
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT mi.id
+            FROM mistake_items mi
+            LEFT JOIN sessions ON sessions.id = mi.session_id
+            WHERE mi.id=? AND sessions.account_id=?
+            """,
+            (mistake_id, principal["account_id"]),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "mistake not found")
+    return list_review_events_for_mistake(mistake_id, limit)
+
+
+@app.post("/api/mistakes/{mistake_id}/review-events")
+async def post_mistake_review_event(mistake_id: str, request: Request) -> dict:
+    init_db()
+    principal = principal_from_request(request)
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT mi.id
+            FROM mistake_items mi
+            LEFT JOIN sessions ON sessions.id = mi.session_id
+            WHERE mi.id=? AND sessions.account_id=?
+            """,
+            (mistake_id, principal["account_id"]),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "mistake not found")
+    body = await request.json()
+    result = create_review_event(mistake_id, body if isinstance(body, dict) else {})
+    event = result["event"]
+    mistake = result["mistake"]
+    emit_log(
+        f"记录错题复习事件：{mistake_id} result={event.get('result')} review_count={mistake.get('review_count')}",
+        session_id=mistake.get("session_id"),
+        source=event.get("source") or "dashboard",
+    )
+    return result
+
+
+@app.get("/api/review-queue")
+def review_queue(
+    request: Request,
+    status: str = Query(""),
+    subject: str = Query(""),
+    page_ref: str = Query(""),
+    question_ref: str = Query(""),
+    item_type: str = Query(""),
+    error_type: str = Query(""),
+    error_reason: str = Query(""),
+    q: str = Query(""),
+    due_only: bool = Query(True),
+    page_size: int = Query(ASSET_PAGE_SIZE_DEFAULT, ge=1, le=ASSET_PAGE_SIZE_MAX),
+) -> dict:
+    init_db()
+    principal = principal_from_request(request)
+    return review_queue_items(
+        account_id=principal["account_id"],
+        status=status,
+        subject=subject,
+        page_ref=page_ref,
+        question_ref=question_ref,
+        item_type=item_type,
+        error_type=error_type,
+        error_reason=error_reason,
+        q=q,
+        due_only=due_only,
+        page_size=page_size,
+    )
+
+
+@app.get("/api/student-profile")
+def get_student_profile(request: Request) -> dict:
+    init_db()
+    principal = principal_from_request(request)
+    return {"profile": student_profile(account_id=principal["account_id"])}
+
+
+@app.get("/api/observability")
+def get_observability(request: Request) -> dict:
+    init_db()
+    principal = principal_from_request(request)
+    return observability_snapshot(account_id=principal["account_id"], user_id=principal.get("user_id", ""))
+
+
+@app.put("/api/prompts/{prompt_key}")
+async def update_prompt(prompt_key: str, request: Request) -> dict:
+    init_db()
+    body = await request.json()
+    try:
+        record = prompts.set_prompt(prompt_key, str(body.get("content", "")))
+    except KeyError:
+        raise HTTPException(404, "prompt not found")
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    emit_log(f"更新提示词：{prompt_key}", source="dashboard")
+    return {"prompt": record}
+
+
+@app.post("/api/prompts/{prompt_key}/reset")
+def reset_prompt(prompt_key: str) -> dict:
+    init_db()
+    try:
+        record = prompts.reset_prompt(prompt_key)
+    except KeyError:
+        raise HTTPException(404, "prompt not found")
+    emit_log(f"恢复默认提示词：{prompt_key}", source="dashboard")
+    return {"prompt": record}
+
+
+@app.post("/api/prompts/reset")
+def reset_all_prompts() -> dict:
+    init_db()
+    records = prompts.reset_all_prompts()
+    emit_log("恢复全部默认提示词", source="dashboard")
+    return {"prompts": records}
+
+
+@app.get("/api/images/{filename}/thumbnail")
+def image_thumbnail(filename: str) -> FileResponse:
+    image_path = image_path_for_request(filename)
+    thumb_path = thumbnail_path_for(image_path.name)
+    if not thumb_path.is_file() or thumb_path.stat().st_mtime < image_path.stat().st_mtime:
+        try:
+            create_thumbnail(image_path, thumb_path)
+        except Exception as exc:
+            raise HTTPException(422, f"could not create thumbnail: {exc}") from exc
+    return FileResponse(
+        thumb_path,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+@app.get("/api/sessions")
+def list_sessions(request: Request, include_summary: bool = False) -> dict:
+    principal = principal_from_request(request)
+    summary_expr = "summary" if include_summary else "'' AS summary"
+    with connect() as conn:
+        sessions = [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT
+                    id, device_id, mode, title, status, created_at, updated_at,
+                    finished_at, report_generated_at, student_goal, assistant_focus, inferred_needs, report_style, {summary_expr},
+                    substr(summary, 1, 240) AS summary_preview,
+                    (SELECT COUNT(*) FROM images WHERE images.session_id = sessions.id) AS image_count,
+                    (SELECT COUNT(*) FROM analyses WHERE analyses.session_id = sessions.id) AS analysis_count,
+                    (SELECT COUNT(*) FROM qa_events WHERE qa_events.session_id = sessions.id) AS qa_count,
+                    (SELECT COUNT(*) FROM mistake_items WHERE mistake_items.session_id = sessions.id) AS mistake_count
+                FROM sessions
+                WHERE account_id=?
+                ORDER BY created_at DESC
+                LIMIT 100
+                """,
+                (principal["account_id"],),
+            )
+        ]
     return {"sessions": sessions}
 
 
-@app.get("/api/sessions/{session_id}")
-def get_session(session_id: str) -> dict:
+@app.get("/api/memory")
+def get_memory(request: Request, limit: int = Query(80, ge=1, le=200)) -> dict:
+    init_db()
+    principal = principal_from_request(request)
+    task_id = schedule_memory_consolidation_if_due(account_id=principal["account_id"])
+    return {
+        "profile": memory_profile(account_id=principal["account_id"]),
+        "events": memory_events(limit, account_id=principal["account_id"]),
+        "consolidation": {
+            "interval_seconds": MEMORY_CONSOLIDATION_INTERVAL_SECONDS,
+            "scheduled_task_id": task_id or "",
+        },
+    }
+
+
+@app.post("/api/memory/consolidate")
+async def consolidate_memory(request: Request, background_tasks: BackgroundTasks) -> dict:
+    init_db()
+    principal = principal_from_request(request)
+    task_id = schedule_memory_consolidation_if_due(force=True, account_id=principal["account_id"])
+    if task_id:
+        background_tasks.add_task(execute_next_task_run_now)
+    return {"status": "queued" if task_id else "skipped", "task_id": task_id or ""}
+
+
+@app.post("/api/sessions/{session_id}/memory")
+async def create_session_memory(session_id: str, request: Request, background_tasks: BackgroundTasks) -> dict:
+    init_db()
+    principal = principal_from_request(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(422, "invalid JSON body")
     with connect() as conn:
-        session = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
-        if not session:
-            raise HTTPException(404, "session not found")
-        images = [dict(row) for row in conn.execute("SELECT * FROM images WHERE session_id=? ORDER BY created_at", (session_id,))]
+        session = require_account_session(conn, session_id, principal)
+    text = clean_user_text(body.get("text") or body.get("memory") or body.get("summary"), MEMORY_EVENT_TEXT_LIMIT)
+    if len(text) < 2:
+        raise HTTPException(422, "text is required")
+    event = record_memory_event(
+        session_id=session_id,
+        account_id=principal["account_id"],
+        qa_event_id=clean_user_text(body.get("qa_event_id"), 80),
+        source=clean_user_text(body.get("source"), 80) or "ios-manual",
+        message_type=clean_user_text(body.get("message_type"), 80) or "formed_memory",
+        text=text,
+        payload=body.get("payload") if isinstance(body.get("payload"), dict) else {},
+    )
+    task_id = schedule_memory_consolidation_if_due(force=True, account_id=principal["account_id"])
+    if task_id:
+        background_tasks.add_task(execute_next_task_run_now)
+    emit_log(
+        f"形成记忆：{truncate_text(text, 120)}",
+        session_id=session_id,
+        source="memory",
+    )
+    return {
+        "event": event,
+        "profile": memory_profile(account_id=principal["account_id"]),
+        "consolidation": {
+            "status": "queued" if task_id else "skipped",
+            "task_id": task_id or "",
+        },
+    }
+
+
+@app.get("/visualizations/{filename}")
+def get_teaching_visualization_file(filename: str) -> FileResponse:
+    init_db()
+    path = visualization_file_path(filename)
+    return FileResponse(
+        path,
+        media_type="text/html; charset=utf-8",
+        headers={
+            "Content-Security-Policy": TEACHING_VISUALIZATION_CSP,
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, max-age=60",
+        },
+    )
+
+
+@app.post("/api/visualizations")
+async def create_teaching_visualization(request: Request) -> dict:
+    init_db()
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(422, "invalid JSON body")
+    source_type = clean_user_text(body.get("source_type") or body.get("sourceType"), 40)
+    source_id = clean_user_text(body.get("source_id") or body.get("sourceId"), 120)
+    session_id = clean_user_text(body.get("session_id") or body.get("sessionId"), 120)
+    text = clean_user_text(body.get("text") or body.get("source_text") or body.get("sourceText"), TEACHING_VISUALIZATION_SOURCE_CHAR_LIMIT)
+    title = clean_user_text(body.get("title"), 160)
+    extra_instruction = clean_user_text(body.get("extra_instruction") or body.get("instruction") or body.get("extraInstruction"), 1200)
+    force_raw = body.get("force", False)
+    force = force_raw is True or str(force_raw).strip().lower() in {"1", "true", "yes", "on"}
+    if source_type not in TEACHING_VISUALIZATION_SOURCE_TYPES:
+        raise HTTPException(422, "source_type must be qa_event, analysis, or custom")
+    if source_type == "custom":
+        if not text:
+            raise HTTPException(422, "text is required for custom visualization")
+        session_id = ensure_visualization_session(session_id, title)
+        if not source_id:
+            source_id = "custom_" + hashlib.sha256((session_id + "\n" + text).encode("utf-8")).hexdigest()[:32]
+    if not source_id:
+        raise HTTPException(422, "source_id is required")
+    visualization = await generate_teaching_visualization(
+        source_type=source_type,
+        source_id=source_id,
+        session_id=session_id,
+        source_text=text,
+        title=title,
+        force=force,
+        extra_instruction=extra_instruction,
+    )
+    return {"visualization": visualization}
+
+
+@app.get("/api/sessions/{session_id}/overview")
+def get_session_overview(
+    request: Request,
+    session_id: str,
+    analysis_limit: int = Query(DEFAULT_SESSION_ANALYSIS_LIMIT, ge=1, le=MAX_SESSION_ANALYSIS_LIMIT),
+    analysis_offset: int = Query(0, ge=0),
+) -> dict:
+    principal = principal_from_request(request)
+    with connect() as conn:
+        session = require_account_session(conn, session_id, principal)
+
+        image_count = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM images
+            LEFT JOIN session_observations obs ON obs.image_id = images.id
+            WHERE images.session_id=? AND COALESCE(obs.novelty_status, 'unknown') != 'invalid'
+            """,
+            (session_id,),
+        ).fetchone()["count"]
+        analysis_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM analyses WHERE session_id=? AND scope != 'final'",
+            (session_id,),
+        ).fetchone()["count"]
+        qa_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM qa_events WHERE session_id=?",
+            (session_id,),
+        ).fetchone()["count"]
+        analyses = [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT {analysis_public_columns()}
+                FROM analyses
+                WHERE session_id=? AND scope != 'final'
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (session_id, analysis_limit, analysis_offset),
+            )
+        ]
+        analyses = attach_visualization_metadata(analyses, "analysis", text_keys=("content",))
+        final_analysis = conn.execute(
+            f"""
+            SELECT {analysis_public_columns()}
+            FROM analyses
+            WHERE session_id=? AND scope='final'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+
+        batch_ids = [row["batch_id"] for row in analyses if row.get("batch_id")]
+        include_single_images = any(row["scope"] == "single" for row in analyses)
+        image_params: list = [session_id]
+        image_filters: list[str] = []
+        if batch_ids:
+            placeholders = ", ".join("?" for _ in batch_ids)
+            image_filters.append(f"images.batch_id IN ({placeholders})")
+            image_params.extend(batch_ids)
+        if include_single_images:
+            image_filters.append("(images.batch_id IS NULL AND images.kind='single')")
+
+        if image_filters:
+            images = [
+                dict(row)
+                for row in conn.execute(
+                    f"""
+                    SELECT {image_public_select()}
+                    FROM images
+                    LEFT JOIN session_observations obs ON obs.image_id = images.id
+                    WHERE images.session_id=? AND ({' OR '.join(image_filters)})
+                    ORDER BY images.sequence_index, images.captured_at, images.created_at
+                    """,
+                    image_params,
+                )
+            ]
+        else:
+            images = [
+                dict(row)
+                for row in conn.execute(
+                    f"""
+                    SELECT {image_public_select()}
+                    FROM images
+                    LEFT JOIN session_observations obs ON obs.image_id = images.id
+                    WHERE images.session_id=?
+                    ORDER BY images.sequence_index, images.captured_at, images.created_at
+                    LIMIT ?
+                    """,
+                    (session_id, SESSION_OVERVIEW_IMAGE_FALLBACK_LIMIT),
+                )
+            ]
+        learning_items = learning_items_for_session(session_id)
+        mistake_items = mistake_items_for_session(session_id)
+        report_events = report_events_for_session(session_id, 40)
+        qa_events = qa_events_for_session(session_id, 60)
+
+    return {
+        "session": dict(session),
+        "images": images,
+        "analyses": analyses,
+        "final_analysis": dict(final_analysis) if final_analysis else None,
+        "learning_items": learning_items,
+        "mistake_items": mistake_items,
+        "report_events": report_events,
+        "qa_events": qa_events,
+        "image_count": image_count,
+        "analysis_count": analysis_count,
+        "qa_count": qa_count,
+        "analysis_limit": analysis_limit,
+        "analysis_offset": analysis_offset,
+        "has_more_analyses": analysis_offset + len(analyses) < analysis_count,
+    }
+
+
+@app.get("/api/sessions/{session_id}")
+def get_session(request: Request, session_id: str) -> dict:
+    principal = principal_from_request(request)
+    return session_payload(session_id, principal)
+
+
+def session_payload(session_id: str, principal: dict | None = None) -> dict:
+    principal = principal or default_principal()
+    with connect() as conn:
+        session = require_account_session(conn, session_id, principal)
+        images = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT images.*, COALESCE(obs.novelty_status, 'unknown') AS novelty_status,
+                       COALESCE(obs.signal_summary, '') AS signal_summary
+                FROM images
+                LEFT JOIN session_observations obs ON obs.image_id = images.id
+                WHERE images.session_id=?
+                ORDER BY images.created_at
+                """,
+                (session_id,),
+            )
+        ]
         analyses = [dict(row) for row in conn.execute("SELECT * FROM analyses WHERE session_id=? ORDER BY created_at", (session_id,))]
-    return {"session": dict(session), "images": images, "analyses": analyses}
+        analyses = attach_visualization_metadata(analyses, "analysis", text_keys=("content",))
+    return {
+        "session": dict(session),
+        "images": images,
+        "analyses": analyses,
+        "learning_items": learning_items_for_session(session_id),
+        "mistake_items": mistake_items_for_session(session_id),
+        "report_events": report_events_for_session(session_id, 40),
+        "qa_events": qa_events_for_session(session_id, 80),
+    }
+
+
+@app.get("/api/device-control")
+def get_device_control(request: Request, session_id: str = "", device_id: str = "", limit: int = Query(8, ge=1, le=40)) -> dict:
+    init_db()
+    principal = principal_from_request(request)
+    require_control_token(request)
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    with connect() as conn:
+        expire_old_control_commands(conn, now)
+        filters: list[str] = ["account_id=?"]
+        params: list[object] = [principal["account_id"]]
+        if session_id:
+            filters.append("session_id=?")
+            params.append(session_id)
+        if device_id:
+            filters.append("device_id=?")
+            params.append(device_id)
+        where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
+        devices = [
+            device_state_row_to_dict(dict(row), now_dt)
+            for row in conn.execute(
+                f"""
+                SELECT *
+                FROM device_states
+                {where_sql}
+                ORDER BY last_seen_at DESC
+                LIMIT ?
+                """,
+                [*params, limit],
+            )
+        ]
+        if (not devices or not any(device.get("online") for device in devices)) and session_id and not device_id:
+            fallback = latest_device_state(conn, account_id=principal["account_id"], online_only=True)
+            if fallback:
+                fallback_item = device_state_row_to_dict(fallback, now_dt)
+                devices = [fallback_item, *[device for device in devices if device.get("device_id") != fallback_item.get("device_id")]]
+        command_filters: list[str] = ["account_id=?"]
+        command_params: list[object] = [principal["account_id"]]
+        if session_id:
+            command_filters.append("session_id=?")
+            command_params.append(session_id)
+        if device_id:
+            command_filters.append("device_id=?")
+            command_params.append(device_id)
+        command_where = f"WHERE {' AND '.join(command_filters)}" if command_filters else ""
+        commands = [
+            control_command_row_to_dict(dict(row))
+            for row in conn.execute(
+                f"""
+                SELECT *
+                FROM control_commands
+                {command_where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                [*command_params, limit],
+            )
+        ]
+    latest = devices[0] if devices else None
+    return {
+        "devices": devices,
+        "latest_device": latest,
+        "recent_commands": commands,
+        "poll_interval_seconds": DEVICE_CONTROL_POLL_INTERVAL_SECONDS,
+        "online_after_seconds": DEVICE_CONTROL_ONLINE_SECONDS,
+        "command_ttl_seconds": CONTROL_COMMAND_TTL_SECONDS,
+    }
+
+
+@app.post("/api/device-control/poll")
+async def poll_device_control(request: Request) -> dict:
+    init_db()
+    principal = principal_from_request(request)
+    body = await request.json()
+    require_control_token(request, body)
+    device_id = clean_user_text(body.get("device_id"), 160)
+    if not device_id:
+        raise HTTPException(422, "device_id is required")
+    state = body.get("state")
+    state_payload = compact_device_state(state if isinstance(state, dict) else {})
+    session_id = clean_user_text(body.get("session_id") or state_payload.get("session_id"), 160)
+    source = clean_user_text(body.get("source"), 80) or "ios"
+    now = utc_now()
+    commands: list[dict] = []
+    with connect() as conn:
+        expire_old_control_commands(conn, now)
+        conn.execute(
+            """
+            INSERT INTO device_states(device_id, account_id, session_id, source, state, last_seen_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(device_id) DO UPDATE SET
+                account_id=excluded.account_id,
+                session_id=excluded.session_id,
+                source=excluded.source,
+                state=excluded.state,
+                last_seen_at=excluded.last_seen_at,
+                updated_at=excluded.updated_at
+            """,
+            (device_id, principal["account_id"], session_id, source, json_dumps(state_payload), now, now),
+        )
+        commands = [
+            control_command_row_to_dict(row)
+            for row in select_commands_for_device(conn, device_id=device_id, session_id=session_id, limit=6, now=now, account_id=principal["account_id"])
+        ]
+    return {
+        "commands": commands,
+        "poll_interval_seconds": DEVICE_CONTROL_POLL_INTERVAL_SECONDS,
+        "server_time": now,
+    }
+
+
+@app.post("/api/control-commands")
+async def create_control_command(request: Request) -> dict:
+    init_db()
+    principal = principal_from_request(request)
+    body = await request.json()
+    require_control_token(request, body)
+    command_type = clean_user_text(body.get("command_type") or body.get("type"), 80)
+    if command_type not in CONTROL_COMMAND_TYPES:
+        raise HTTPException(422, "unsupported command_type")
+    payload = body.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    payload = {str(key): (truncate_text(value, 2000) if isinstance(value, str) else value) for key, value in payload.items()}
+    session_id = clean_user_text(body.get("session_id"), 160)
+    device_id = clean_user_text(body.get("device_id"), 160)
+    source = clean_user_text(body.get("source"), 80) or "dashboard"
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    expires_at = (now_dt + timedelta(seconds=CONTROL_COMMAND_TTL_SECONDS)).isoformat()
+    with connect() as conn:
+        expire_old_control_commands(conn, now)
+        if not device_id:
+            row = latest_device_state(conn, account_id=principal["account_id"], session_id=session_id, online_only=True) if session_id else None
+            if not row:
+                row = latest_device_state(conn, account_id=principal["account_id"], online_only=True)
+            if not row and session_id:
+                row = latest_device_state(conn, account_id=principal["account_id"], session_id=session_id)
+            if not row:
+                row = latest_device_state(conn, account_id=principal["account_id"])
+            if row:
+                device_id = str(row.get("device_id") or "")
+        if not device_id and not session_id:
+            raise HTTPException(409, "no iOS device has checked in yet")
+        command_id = uuid.uuid4().hex
+        conn.execute(
+            """
+            INSERT INTO control_commands(
+                id, account_id, device_id, session_id, command_type, payload, status, source,
+                created_at, expires_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (command_id, principal["account_id"], device_id, session_id, command_type, json_dumps(payload), source, now, expires_at),
+        )
+        row = conn.execute("SELECT * FROM control_commands WHERE id=?", (command_id,)).fetchone()
+    emit_log(
+        f"Dashboard command queued: {command_type} target_device={device_id or '*'} target_session={session_id or '*'}",
+        session_id=session_id or None,
+        device_id=device_id or None,
+        source=source,
+    )
+    return {"command": control_command_row_to_dict(dict(row))}
+
+
+@app.post("/api/control-commands/{command_id}/ack")
+async def acknowledge_control_command(command_id: str, request: Request) -> dict:
+    init_db()
+    body = await request.json()
+    require_control_token(request, body)
+    status = clean_user_text(body.get("status"), 40) or "applied"
+    if status not in CONTROL_COMMAND_ACK_STATUSES:
+        raise HTTPException(422, "unsupported ack status")
+    error = clean_user_text(body.get("error"), 1000)
+    device_id = clean_user_text(body.get("device_id"), 160)
+    session_id = clean_user_text(body.get("session_id"), 160)
+    state = body.get("state")
+    state_payload = compact_device_state(state if isinstance(state, dict) else {})
+    now = utc_now()
+    with connect() as conn:
+        if device_id:
+            conn.execute(
+                """
+                INSERT INTO device_states(device_id, session_id, source, state, last_seen_at, updated_at)
+                VALUES(?, ?, 'ios', ?, ?, ?)
+                ON CONFLICT(device_id) DO UPDATE SET
+                    session_id=CASE WHEN excluded.session_id='' THEN device_states.session_id ELSE excluded.session_id END,
+                    state=CASE WHEN excluded.state='{}' THEN device_states.state ELSE excluded.state END,
+                    last_seen_at=excluded.last_seen_at,
+                    updated_at=excluded.updated_at
+                """,
+                (device_id, session_id, json_dumps(state_payload), now, now),
+            )
+        cursor = conn.execute(
+            """
+            UPDATE control_commands
+            SET status=?, error=?, acknowledged_at=?
+            WHERE id=?
+            """,
+            (status, error, now, command_id),
+        )
+        if cursor.rowcount != 1:
+            raise HTTPException(404, "command not found")
+        row = conn.execute("SELECT * FROM control_commands WHERE id=?", (command_id,)).fetchone()
+    return {"command": control_command_row_to_dict(dict(row))}
+
+
+@app.post("/api/sessions/{session_id}/qa")
+async def ask_session_question(
+    session_id: str,
+    request: Request,
+    question: str = Form(""),
+    trigger_type: str = Form("voice"),
+    source: str = Form("ios"),
+    focus: str = Form("{}"),
+    context: str = Form("{}"),
+    gesture: str = Form("{}"),
+    image: UploadFile | None = File(None),
+) -> dict:
+    init_db()
+    principal = principal_from_request(request)
+    focus_payload = parse_json_object(focus)
+    context_payload = parse_json_object(context)
+    gesture_payload = parse_json_object(gesture)
+    transcript_fallback = ""
+    for key in ("question", "transcript", "recognized_text", "recognizedText"):
+        value = context_payload.get(key)
+        if isinstance(value, str) and value.strip():
+            transcript_fallback = value
+            break
+    cleaned_question = clean_user_text(question, QA_QUESTION_CHAR_LIMIT)
+    if not cleaned_question:
+        cleaned_question = clean_user_text(transcript_fallback, QA_QUESTION_CHAR_LIMIT)
+    if not cleaned_question:
+        raise HTTPException(422, "question is required")
+    trigger = clean_user_text(trigger_type, 80) or "voice"
+    source_text = clean_user_text(source, 80) or "ios"
+    student_intent = infer_qa_student_intent(trigger, context_payload, cleaned_question)
+    context_payload = dict(context_payload)
+    context_payload["student_intent"] = student_intent
+    context_payload["dialog_state"] = {
+        "turn": qa_turn_index(context_payload),
+        "is_followup": qa_is_followup_like(trigger, context_payload, cleaned_question),
+        "requires_current_visual": student_intent in QA_VISUAL_REVIEW_INTENTS,
+        "question_has_new_problem_reference": qa_question_has_new_problem_reference(cleaned_question),
+    }
+    with connect() as conn:
+        session = require_account_session(conn, session_id, principal)
+        max_sequence = conn.execute(
+            "SELECT COALESCE(MAX(sequence_index), -1) AS max_sequence FROM images WHERE session_id=?",
+            (session_id,),
+        ).fetchone()["max_sequence"]
+    image_id: str | None = None
+    image_filename: str | None = None
+    image_row: dict | None = None
+    uploaded_image_id: str | None = None
+    uploaded_image_filename: str | None = None
+    uploaded_frame_quality: dict = {}
+    rejected_image_id: str | None = None
+    rejected_image_filename: str | None = None
+    client_rejected_frame_quality = qa_rejected_client_frame_quality(context_payload)
+    current_image_rejected = client_rejected_frame_quality is not None
+    previous_qa_image_row = latest_session_image_for_qa(session_id)
+    image_context_mode = "text_only"
+    if image is not None and image.filename:
+        capture_meta = {
+            "source": source_text,
+            "trigger_type": trigger,
+            "student_intent": student_intent,
+            "qa_focus": focus_payload,
+            "qa_context": context_payload,
+            "qa_gesture": gesture_payload,
+        }
+        qa_frame_quality_payload = context_payload.get("qa_frame_quality") or context_payload.get("qaFrameQuality")
+        if isinstance(qa_frame_quality_payload, dict):
+            capture_meta["qa_frame_quality"] = qa_frame_quality_payload
+        image_id, image_filename, _ = await save_upload(
+            image,
+            session_id,
+            "qa",
+            batch_id="qa",
+            captured_at=utc_now(),
+            sequence_index=int(max_sequence or -1) + 1,
+            capture_meta=capture_meta,
+        )
+        uploaded_image_id = image_id
+        uploaded_image_filename = image_filename
+        uploaded_frame_quality = qa_quality_with_relevance(
+            qa_uploaded_frame_quality(capture_meta, image_filename),
+            question=cleaned_question,
+            trigger=trigger,
+            context=context_payload,
+            student_intent=student_intent,
+            previous_image_row=previous_qa_image_row,
+        )
+        if qa_should_soft_accept_first_frame(
+            uploaded_frame_quality,
+            question=cleaned_question,
+            trigger=trigger,
+            context=context_payload,
+            student_intent=student_intent,
+        ):
+            uploaded_frame_quality = {
+                **uploaded_frame_quality,
+                "eligible": True,
+                "reason": "first_question_current_frame",
+                "detail": (
+                    uploaded_frame_quality.get("detail")
+                    or "首问/新题已上传当前抓拍，后端允许进入视觉模型并由模型继续判断可见内容"
+                ),
+                "relevance": "accepted_first_or_new_problem_current_frame",
+            }
+        with connect() as conn:
+            row = conn.execute("SELECT * FROM images WHERE id=?", (image_id,)).fetchone()
+            uploaded_row = dict(row) if row else None
+        if uploaded_frame_quality.get("eligible") is True:
+            current_image_rejected = False
+            update_qa_image_context_verdict(uploaded_image_id, uploaded_frame_quality, accepted=True)
+            with connect() as conn:
+                row = conn.execute("SELECT * FROM images WHERE id=?", (uploaded_image_id,)).fetchone()
+                uploaded_row = dict(row) if row else uploaded_row
+            image_row = uploaded_row
+            image_context_mode = "current_frame"
+        else:
+            update_qa_image_context_verdict(uploaded_image_id, uploaded_frame_quality, accepted=False)
+            rejected_image_id = uploaded_image_id
+            rejected_image_filename = uploaded_image_filename
+            current_image_rejected = True
+            image_id = None
+            image_filename = None
+            image_row = latest_session_image_for_qa(session_id, exclude_image_id=rejected_image_id)
+            if image_row:
+                image_id = image_row.get("id")
+                image_filename = image_row.get("filename")
+                image_context_mode = "fallback_after_rejected_current_frame"
+            else:
+                image_context_mode = "rejected_current_frame"
+            emit_log(
+                (
+                    "QA 当前抓拍未进入大模型上下文："
+                    f"reason={uploaded_frame_quality.get('reason') or 'unknown'}；"
+                    f"detail={uploaded_frame_quality.get('detail') or ''}"
+                ),
+                session_id=session_id,
+                device_id=source_text,
+                source="qa",
+                level="warning",
+            )
+    if image_row is None and image_context_mode == "text_only":
+        image_row = latest_session_image_for_qa(session_id)
+        if image_row:
+            image_id = image_row.get("id")
+            image_filename = image_row.get("filename")
+            image_context_mode = "ignored_current_frame_fallback" if current_image_rejected else "recent_session_frame"
+        elif current_image_rejected:
+            image_context_mode = "ignored_current_frame_text_only"
+            uploaded_frame_quality = client_rejected_frame_quality or uploaded_frame_quality
+    context_payload["image_context_mode"] = image_context_mode
+    context_payload["used_image_context"] = bool(image_filename)
+    context_payload["selected_image_id"] = image_id or ""
+    context_payload["selected_image_filename"] = image_filename or ""
+    context_payload["uploaded_image_id"] = uploaded_image_id or ""
+    context_payload["uploaded_image_filename"] = uploaded_image_filename or ""
+    context_payload["current_image_rejected"] = current_image_rejected
+    context_payload["rejected_image_id"] = rejected_image_id or ""
+    context_payload["rejected_image_filename"] = rejected_image_filename or ""
+    event = insert_qa_event(
+        session_id,
+        image_id=image_id,
+        source=source_text,
+        trigger_type=trigger,
+        question=cleaned_question,
+        focus=focus_payload,
+        context=context_payload,
+        gesture=gesture_payload,
+    )
+    record_memory_event(
+        session_id=session_id,
+        account_id=principal["account_id"],
+        qa_event_id=event.get("id") or "",
+        source=source_text,
+        message_type="typed_text" if trigger == "typed_chat" else "voice_to_text",
+        text=cleaned_question,
+        payload={"trigger_type": trigger, "student_intent": student_intent},
+    )
+    prompt_context_payload = qa_prompt_context(context_payload, current_image_rejected=current_image_rejected)
+    prompt = build_qa_prompt(
+        session,
+        question=cleaned_question,
+        trigger_type=trigger,
+        focus=focus_payload,
+        context=prompt_context_payload,
+        gesture=gesture_payload,
+        image_row=image_row,
+        image_context_mode=image_context_mode,
+    )
+    settings = effective_llm_settings_for_session(session_id)
+    try:
+        image_paths = [image_path_for_request(image_filename)] if image_filename else []
+        if image_paths:
+            try:
+                answer = await run_with_llm_gate(
+                    f"qa_image:{session_id[:8]}",
+                    session_id,
+                    lambda: llm.analyze_images(settings, prompt, image_paths),
+                    priority=LLM_PRIORITY_REALTIME,
+                )
+            except Exception as image_exc:
+                if not current_image_rejected:
+                    raise
+                emit_log(
+                    f"QA fallback image failed, retrying as text follow-up: {truncate_text(str(image_exc), 180)}",
+                    session_id=session_id,
+                    device_id=source_text,
+                    source="qa",
+                    level="warning",
+                )
+                answer = await run_with_llm_gate(
+                    f"qa_fallback_text:{session_id[:8]}",
+                    session_id,
+                    lambda: llm.analyze_text(settings, prompt, max_tokens=1800),
+                    priority=LLM_PRIORITY_REALTIME,
+                )
+        else:
+            answer = await run_with_llm_gate(
+                f"qa_text:{session_id[:8]}",
+                session_id,
+                lambda: llm.analyze_text(settings, prompt, max_tokens=1800),
+                priority=LLM_PRIORITY_REALTIME,
+            )
+        if current_image_rejected and qa_answer_is_unhelpful_image_failure(answer):
+            retry_context = dict(prompt_context_payload)
+            retry_context["current_image_rejected"] = True
+            retry_context["current_image_note"] = "The previous draft focused on the rejected image. Rewrite as a direct answer to the student's spoken follow-up using prior context only."
+            retry_prompt = build_qa_prompt(
+                session,
+                question=cleaned_question,
+                trigger_type=trigger,
+                focus=focus_payload,
+                context=retry_context,
+                gesture=gesture_payload,
+                image_row=image_row,
+                image_context_mode=image_context_mode,
+            )
+            answer = await run_with_llm_gate(
+                f"qa_retry_text:{session_id[:8]}",
+                session_id,
+                lambda: llm.analyze_text(settings, retry_prompt, max_tokens=1800),
+                priority=LLM_PRIORITY_REALTIME,
+            )
+            if qa_answer_is_unhelpful_image_failure(answer):
+                answer = qa_safe_followup_fallback_answer(cleaned_question)
+        updated = update_qa_event(event["id"], status="done", answer=answer, tts_status="ready")
+        update_session_needs(session_id, infer_need_tags_from_text(cleaned_question + " " + answer), focus_note=cleaned_question)
+        emit_log(
+            f"QA answered trigger={trigger} image_context={image_context_mode} question={truncate_text(cleaned_question, 120)}",
+            session_id=session_id,
+            device_id=source_text,
+            source="qa",
+        )
+        return {
+            "event": updated,
+            "answer": updated.get("answer", ""),
+            "image_id": image_id,
+            "image_filename": image_filename,
+            "used_image_context": bool(image_filename),
+            "image_context_mode": image_context_mode,
+            "uploaded_image_id": uploaded_image_id,
+            "uploaded_image_filename": uploaded_image_filename,
+            "current_image_rejected": current_image_rejected,
+            "rejected_image_id": rejected_image_id,
+            "rejected_image_filename": rejected_image_filename,
+            "frame_quality": uploaded_frame_quality or client_rejected_frame_quality or {},
+            "student_intent": student_intent,
+            "dialog_state": context_payload.get("dialog_state", {}),
+        }
+    except Exception as exc:
+        answer = f"AI 问答失败：{llm.format_llm_error(exc)}"
+        updated = update_qa_event(event["id"], status="failed", answer=answer, tts_status="error")
+        emit_log(answer, session_id=session_id, device_id=source_text, source="qa", level="error")
+        return {
+            "event": updated,
+            "answer": answer,
+            "image_id": image_id,
+            "image_filename": image_filename,
+            "used_image_context": bool(image_filename),
+            "image_context_mode": image_context_mode,
+            "uploaded_image_id": uploaded_image_id,
+            "uploaded_image_filename": uploaded_image_filename,
+            "current_image_rejected": current_image_rejected,
+            "rejected_image_id": rejected_image_id,
+            "rejected_image_filename": rejected_image_filename,
+            "frame_quality": uploaded_frame_quality or client_rejected_frame_quality or {},
+            "student_intent": student_intent,
+            "dialog_state": context_payload.get("dialog_state", {}),
+        }
 
 
 @app.post("/api/solve-single")
 async def solve_single(
+    request: Request,
     background_tasks: BackgroundTasks,
     image: UploadFile = File(...),
     device_id: str = Form("iphone"),
     page_hint: str = Form(""),
     question_hint: str = Form(""),
+    student_goal: str = Form(""),
+    student_profile_id: str = Form(""),
+    report_style: str = Form(""),
+    assistant_focus: str = Form(""),
 ) -> dict:
+    principal = principal_from_request(request)
     session_id = uuid.uuid4().hex
     now = utc_now()
+    resolved_student_profile_id = resolve_student_profile(principal["account_id"], student_profile_id)
+    goal = clean_user_text(student_goal)
+    style = clean_user_text(report_style, 500)
+    requested_focus = clean_user_text(assistant_focus, ASSISTANT_FOCUS_CHAR_LIMIT)
+    inferred = infer_need_tags_from_text(goal + " " + style + " " + requested_focus)
+    focus = requested_focus or ("根据学生输入初始化关注点：" + "、".join(tag_label(tag) for tag in inferred) if inferred else "")
     with connect() as conn:
         conn.execute(
-            "INSERT INTO sessions(id, device_id, mode, title, status, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
-            (session_id, device_id, "single", "单张拍题解析", "uploaded", now, now),
+            """
+            INSERT INTO sessions(
+                id, account_id, student_profile_id, created_by_user_id, device_id, mode, title, status, created_at, updated_at,
+                student_goal, assistant_focus, inferred_needs, report_style
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                principal["account_id"],
+                resolved_student_profile_id,
+                principal.get("user_id", ""),
+                device_id,
+                "single",
+                "单张拍题解析",
+                "uploaded",
+                now,
+                now,
+                goal,
+                focus,
+                json_dumps(inferred),
+                style,
+            ),
         )
-    _, filename = await save_upload(image, session_id, "single")
-    analysis_id = uuid.uuid4().hex
-    prompt = (
-        f"请解析这张学生拍摄的课本/试卷照片。页码提示：{page_hint or '未知'}；题号提示：{question_hint or '未知'}。"
-        "请输出：1. 识别到的页码和题号；2. 题目标题文字；3. 题目内容摘要；4. 分步解题指导；5. 容易错的点。"
+    if goal:
+        record_report_event(session_id, "student_goal", "学生本回合要求", goal)
+    _, filename, _ = await save_upload(
+        image,
+        session_id,
+        "single",
+        page_hint=page_hint,
+        question_hint=question_hint,
+        sequence_index=0,
     )
+    analysis_id = uuid.uuid4().hex
+    prompt = prompts.render_prompt("single_analysis", page_hint=page_hint or "未知", question_hint=question_hint or "未知")
+    strategy_context = build_strategy_context({"student_goal": goal, "assistant_focus": focus, "inferred_needs": inferred, "report_style": style})
+    prompt = f"{prompt}\n\n{strategy_context}"
     with connect() as conn:
         conn.execute(
             "INSERT INTO analyses(id, session_id, scope, status, prompt, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
             (analysis_id, session_id, "single", "running", prompt, now, now),
         )
-    emit_log("收到单张拍题图片，已进入同步解析流程", session_id=session_id, device_id=device_id)
-    await run_analysis(analysis_id, session_id, None, prompt, [filename])
-    return get_session(session_id)
+    with connect() as conn:
+        conn.execute("UPDATE sessions SET status=?, updated_at=? WHERE id=?", ("analyzing", utc_now(), session_id))
+    emit_log("收到单张拍题图片，已保存并进入后台解析流程", session_id=session_id, device_id=device_id)
+    task_id = record_task_run(
+        "vision_analysis",
+        session_id=session_id,
+        analysis_id=analysis_id,
+        payload={"scope": "single", "filenames": [filename]},
+        priority=TASK_PRIORITY_BACKGROUND,
+    )
+    background_tasks.add_task(execute_next_task_run_now)
+    return session_payload(session_id, principal)
 
 
 @app.post("/api/sessions")
-def create_session(device_id: str = Form("iphone"), mode: str = Form("burst"), title: str = Form("智能连拍学习回合")) -> dict:
+def create_session(
+    request: Request,
+    device_id: str = Form("iphone"),
+    mode: str = Form("burst"),
+    title: str = Form("智能观察学习回合"),
+    student_goal: str = Form(""),
+    student_profile_id: str = Form(""),
+    report_style: str = Form(""),
+    assistant_focus: str = Form(""),
+) -> dict:
+    principal = principal_from_request(request)
     session_id = uuid.uuid4().hex
     now = utc_now()
+    resolved_student_profile_id = resolve_student_profile(principal["account_id"], student_profile_id)
+    goal = clean_user_text(student_goal)
+    style = clean_user_text(report_style, 500)
+    requested_focus = clean_user_text(assistant_focus, ASSISTANT_FOCUS_CHAR_LIMIT)
+    inferred = infer_need_tags_from_text(goal + " " + style + " " + requested_focus)
+    focus = requested_focus or ("根据学生输入初始化关注点：" + "、".join(tag_label(tag) for tag in inferred) if inferred else "")
     with connect() as conn:
         conn.execute(
-            "INSERT INTO sessions(id, device_id, mode, title, status, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
-            (session_id, device_id, mode, title, "created", now, now),
+            """
+            INSERT INTO sessions(
+                id, account_id, student_profile_id, created_by_user_id, device_id, mode, title, status, created_at, updated_at,
+                student_goal, assistant_focus, inferred_needs, report_style
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                principal["account_id"],
+                resolved_student_profile_id,
+                principal.get("user_id", ""),
+                device_id,
+                mode,
+                title,
+                "created",
+                now,
+                now,
+                goal,
+                focus,
+                json_dumps(inferred),
+                style,
+            ),
         )
     emit_log("创建学习回合", session_id=session_id, device_id=device_id)
+    if goal:
+        record_report_event(session_id, "student_goal", "学生本回合要求", goal)
     return {"session_id": session_id}
+
+
+@app.patch("/api/sessions/{session_id}/strategy")
+async def update_session_strategy(session_id: str, request: Request) -> dict:
+    principal = principal_from_request(request)
+    body = await request.json()
+    has_goal = "student_goal" in body or "goal" in body
+    has_style = "report_style" in body
+    has_focus = "assistant_focus" in body or "focus" in body
+    goal = clean_user_text(body.get("student_goal", body.get("goal", ""))) if has_goal else None
+    style = clean_user_text(body.get("report_style", ""), 500) if has_style else None
+    focus = clean_user_text(body.get("assistant_focus", body.get("focus", "")), ASSISTANT_FOCUS_CHAR_LIMIT) if has_focus else None
+    inferred = infer_need_tags_from_text(" ".join(value for value in (goal, style, focus) if value))
+    now = utc_now()
+    with connect() as conn:
+        session = require_account_session(conn, session_id, principal)
+        merged = merge_tags(json_list(session["inferred_needs"]), inferred)
+        next_goal = goal if has_goal else session["student_goal"]
+        next_style = style if has_style else session["report_style"]
+        next_focus = focus if has_focus else session["assistant_focus"]
+        conn.execute(
+            """
+            UPDATE sessions
+            SET student_goal=?, report_style=?, assistant_focus=?, inferred_needs=?, updated_at=?
+            WHERE id=?
+            """,
+            (next_goal, next_style, next_focus, json_dumps(merged), now, session_id),
+        )
+    record_report_event(
+        session_id,
+        "strategy_update",
+        "学习目标/报告策略更新",
+        "\n".join(
+            [
+                f"student_goal={goal if has_goal else '(unchanged)'}",
+                f"report_style={style if has_style else '(unchanged)'}",
+                f"assistant_focus={focus if has_focus else '(unchanged)'}",
+                f"inferred_needs={','.join(inferred)}",
+            ]
+        ),
+    )
+    with connect() as conn:
+        updated = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+    return {"session": dict(updated), "strategy": session_strategy(dict(updated))}
 
 
 @app.post("/api/sessions/{session_id}/batches")
 async def upload_batch(
     session_id: str,
+    request: Request,
     background_tasks: BackgroundTasks,
     images: list[UploadFile] = File(...),
     device_id: str = Form("iphone"),
     environment: str = Form(""),
+    capture_meta: str = Form(""),
 ) -> dict:
+    principal = principal_from_request(request)
     with connect() as conn:
-        if not conn.execute("SELECT id FROM sessions WHERE id=?", (session_id,)).fetchone():
-            raise HTTPException(404, "session not found")
+        session = require_account_session(conn, session_id, principal)
     batch_id = uuid.uuid4().hex
     filenames = []
-    for image in images:
-        _, filename = await save_upload(image, session_id, "burst", batch_id)
+    analysis_filenames = []
+    image_rows = []
+    analysis_image_rows = []
+    capture_items = parse_capture_meta(capture_meta, len(images))
+    with connect() as conn:
+        max_sequence = conn.execute(
+            "SELECT COALESCE(MAX(sequence_index), -1) AS max_sequence FROM images WHERE session_id=?",
+            (session_id,),
+        ).fetchone()["max_sequence"]
+    for index, image in enumerate(images):
+        meta = capture_items[index]
+        meta_sequence = meta_int(meta, "sequence_index", "sequenceIndex", "index")
+        sequence_index = meta_sequence if meta_sequence is not None else (max_sequence + index + 1)
+        captured_at = meta_text(meta, "captured_at", "capturedAt", "timestamp", "created_at")
+        page_hint = meta_text(meta, "page_hint", "pageHint")
+        question_hint = meta_text(meta, "question_hint", "questionHint")
+        image_id, filename, observation = await save_upload(
+            image,
+            session_id,
+            "burst",
+            batch_id,
+            page_hint=page_hint,
+            question_hint=question_hint,
+            captured_at=captured_at or None,
+            sequence_index=sequence_index,
+            capture_meta=meta,
+        )
         filenames.append(filename)
+        row = {
+            "image_id": image_id,
+            "filename": filename,
+            "captured_at": observation.get("captured_at") or captured_at,
+            "sequence_index": sequence_index,
+            "capture_meta": observation.get("capture_meta") or meta_string(meta),
+            "novelty_status": observation.get("novelty_status", "unknown"),
+            "duplicate_of_image_id": observation.get("duplicate_of_image_id", ""),
+            "signal_summary": observation.get("signal_summary", ""),
+            "discard_reason": observation.get("discard_reason", ""),
+            "discard_detail": observation.get("discard_detail", ""),
+        }
+        image_rows.append(row)
+        if row["novelty_status"] not in {"duplicate", "invalid"}:
+            analysis_filenames.append(filename)
+            analysis_image_rows.append(row)
     now = utc_now()
     analysis_id = uuid.uuid4().hex
-    prompt = (
-        f"这是一个学习回合中的一批智能连拍照片，共 {len(filenames)} 张。环境信息：{environment or '未提供'}。"
-        "请识别关键课本/试卷内容、学习行为线索、题目变化，并输出本批照片对学习报告有价值的信息。"
-    )
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO analyses(id, session_id, batch_id, scope, status, prompt, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-            (analysis_id, session_id, batch_id, "batch", "running", prompt, now, now),
+    previous_context = build_previous_batch_context(session_id, exclude_batch_id=batch_id)
+    if analysis_image_rows:
+        learning_context = build_learning_items_context(session_id)
+        merged_context = previous_context
+        if learning_context:
+            merged_context = f"{previous_context}\n\n此前已结构化保存的学习条目：\n{learning_context}"
+        prompt = build_batch_prompt(environment, analysis_image_rows, merged_context, build_strategy_context(session_strategy(session)))
+        with connect() as conn:
+            conn.execute(
+                "INSERT INTO analyses(id, session_id, batch_id, scope, status, prompt, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                (analysis_id, session_id, batch_id, "batch", "running", prompt, now, now),
+            )
+            conn.execute("UPDATE sessions SET status=?, updated_at=? WHERE id=?", ("analyzing", now, session_id))
+        emit_log(
+            (
+                f"收到智能观察批次：{len(filenames)} 张，其中新增关键画面 {len(analysis_filenames)} 张，"
+                f"重复观察 {sum(1 for row in image_rows if row.get('novelty_status') == 'duplicate')} 张，"
+                f"无相关画面 {sum(1 for row in image_rows if row.get('novelty_status') == 'invalid')} 张"
+            ),
+            session_id=session_id,
+            device_id=device_id,
         )
-        conn.execute("UPDATE sessions SET status=?, updated_at=? WHERE id=?", ("analyzing", now, session_id))
-    emit_log(f"收到智能连拍批次：{len(filenames)} 张", session_id=session_id, device_id=device_id)
-    background_tasks.add_task(run_analysis, analysis_id, session_id, batch_id, prompt, filenames, True)
-    return {"session_id": session_id, "batch_id": batch_id, "analysis_id": analysis_id, "image_count": len(filenames)}
+        task_id = record_task_run(
+            "vision_analysis",
+            session_id=session_id,
+            analysis_id=analysis_id,
+            payload={"scope": "batch", "batch_id": batch_id, "filenames": analysis_filenames},
+            priority=TASK_PRIORITY_BACKGROUND,
+        )
+        background_tasks.add_task(execute_next_task_run_now)
+    else:
+        invalid_count = sum(1 for row in image_rows if row.get("novelty_status") == "invalid")
+        prompt = "无新增可解析关键画面。"
+        content = skipped_batch_content(image_rows)
+        with connect() as conn:
+            conn.execute(
+                "INSERT INTO analyses(id, session_id, batch_id, scope, status, prompt, content, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (analysis_id, session_id, batch_id, "batch", "done", prompt, content, now, now),
+            )
+            conn.execute("UPDATE sessions SET status=?, updated_at=? WHERE id=?", ("analyzed", now, session_id))
+        if invalid_count:
+            emit_log(
+                f"收到智能观察批次：{len(filenames)} 张，其中无相关画面 {invalid_count} 张，已跳过大模型解析",
+                session_id=session_id,
+                device_id=device_id,
+            )
+        else:
+            emit_log(f"收到重复观察批次：{len(filenames)} 张，无新增关键画面，已跳过大模型解析", session_id=session_id, device_id=device_id)
+    return {
+        "session_id": session_id,
+        "batch_id": batch_id,
+        "analysis_id": analysis_id,
+        "image_count": len(filenames),
+        "analysis_image_count": len(analysis_filenames),
+        "duplicate_image_count": sum(1 for row in image_rows if row.get("novelty_status") == "duplicate"),
+        "discarded_image_count": sum(1 for row in image_rows if row.get("novelty_status") == "invalid"),
+        "skipped_image_count": len(filenames) - len(analysis_filenames),
+    }
+
+
+@app.post("/api/sessions/{session_id}/finish")
+async def finish_session(session_id: str, request: Request, background_tasks: BackgroundTasks, device_id: str = Form("iphone")) -> dict:
+    principal = principal_from_request(request)
+    now = utc_now()
+    with connect() as conn:
+        session = require_account_session(conn, session_id, principal)
+        image_count = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM images
+            LEFT JOIN session_observations obs ON obs.image_id = images.id
+            WHERE images.session_id=? AND COALESCE(obs.novelty_status, 'unknown') != 'invalid'
+            """,
+            (session_id,),
+        ).fetchone()["count"]
+        qa_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM qa_events WHERE session_id=?",
+            (session_id,),
+        ).fetchone()["count"]
+        existing = conn.execute(
+            "SELECT id, status FROM analyses WHERE session_id=? AND scope='final' ORDER BY created_at DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if existing and existing["status"] == "running":
+            analysis_id = existing["id"]
+        else:
+            analysis_id = uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO analyses(id, session_id, scope, status, prompt, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (analysis_id, session_id, "final", "running", prompts.get_prompt("final_analysis_placeholder"), now, now),
+            )
+        conn.execute(
+            "UPDATE sessions SET status=?, finished_at=?, updated_at=? WHERE id=?",
+            ("finalizing", now, now, session_id),
+        )
+    emit_log("收到结束学习回合请求，开始汇总最终报告", session_id=session_id, device_id=device_id)
+    if image_count == 0:
+        if qa_count > 0:
+            task_id = record_task_run(
+                "qa_session_summary",
+                session_id=session_id,
+                analysis_id=analysis_id,
+                payload={"scope": "final", "mode": "qa_session_summary"},
+                priority=TASK_PRIORITY_FINAL_REPORT,
+            )
+            background_tasks.add_task(execute_next_task_run_now)
+            return {
+                "session_id": session_id,
+                "analysis_id": analysis_id,
+                "status": "finalizing",
+                "image_count": image_count,
+                "qa_count": qa_count,
+                "summary_mode": "qa_session_summary",
+            }
+        with connect() as conn:
+            empty_report = prompts.get_prompt("empty_report")
+            conn.execute(
+                "UPDATE analyses SET status=?, content=?, updated_at=? WHERE id=?",
+                ("done", empty_report, now, analysis_id),
+            )
+            conn.execute(
+                "UPDATE sessions SET summary=?, status=?, report_generated_at=?, updated_at=? WHERE id=?",
+                (empty_report, "completed", now, now, session_id),
+            )
+        return {"session_id": session_id, "analysis_id": analysis_id, "status": "completed", "image_count": image_count, "qa_count": qa_count}
+    task_id = record_task_run(
+        "final_report",
+        session_id=session_id,
+        analysis_id=analysis_id,
+        payload={"scope": "final"},
+        priority=TASK_PRIORITY_FINAL_REPORT,
+    )
+    background_tasks.add_task(execute_next_task_run_now)
+    return {"session_id": session_id, "analysis_id": analysis_id, "status": "finalizing", "image_count": image_count}
 
 
 @app.post("/api/logs")
@@ -201,9 +9077,10 @@ async def ingest_log(request: Request) -> dict:
 
 
 @app.get("/api/logs")
-def get_logs(session_id: str | None = None, after_id: int = 0) -> dict:
-    sql = "SELECT * FROM logs WHERE id > ?"
-    params: list = [after_id]
+def get_logs(request: Request, session_id: str | None = None, after_id: int = 0) -> dict:
+    principal = principal_from_request(request)
+    sql = "SELECT * FROM logs WHERE id > ? AND account_id = ?"
+    params: list = [after_id, principal["account_id"]]
     if session_id:
         sql += " AND session_id = ?"
         params.append(session_id)
@@ -214,15 +9091,16 @@ def get_logs(session_id: str | None = None, after_id: int = 0) -> dict:
 
 
 @app.get("/api/logs/stream")
-async def stream_logs(session_id: str | None = None, after_id: int = 0) -> StreamingResponse:
+async def stream_logs(request: Request, session_id: str | None = None, after_id: int = 0) -> StreamingResponse:
+    principal = principal_from_request(request)
+
     async def events():
         last_id = after_id
         while True:
-            data = get_logs(session_id=session_id, after_id=last_id)["logs"]
+            data = get_logs(request, session_id=session_id, after_id=last_id)["logs"]
             for item in data:
                 last_id = max(last_id, item["id"])
                 yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
             await asyncio.sleep(1)
 
     return StreamingResponse(events(), media_type="text/event-stream")
-
