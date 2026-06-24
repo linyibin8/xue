@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     llm_max_concurrency: int = 1
     llm_min_interval_seconds: float = 8.0
     llm_queue_warn_size: int = 3
+    # Background jobs (visualization/report) yield the model to realtime voice/QA:
+    # they only run once the realtime lane has been idle this long, and defer at
+    # most this long before forcing through (so they never starve).
+    llm_background_idle_seconds: float = 12.0
+    llm_background_max_defer_seconds: float = 240.0
+    llm_realtime_retry: int = 1
     max_upload_mb: int = 20
     control_token: str = ""
     auth_required: bool = False

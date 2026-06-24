@@ -64,6 +64,7 @@ llm_gate_wait_seq = 0
 llm_gate_waiters: dict[str, dict] = {}
 llm_gate_inflight_realtime = 0
 llm_gate_inflight_background = 0
+llm_gate_last_realtime_at = 0.0
 task_dispatcher_task: asyncio.Task | None = None
 THUMBNAIL_MAX_SIDE = 640
 THUMBNAIL_QUALITY = 82
@@ -1182,18 +1183,22 @@ async def run_with_llm_gate(
     user_id: str = "",
 ):
     global llm_gate_inflight, llm_gate_waiting, llm_gate_last_started_at, llm_gate_wait_seq
-    global llm_gate_inflight_realtime, llm_gate_inflight_background
+    global llm_gate_inflight_realtime, llm_gate_inflight_background, llm_gate_last_realtime_at
     account_id, user_id = session_llm_identity(session_id, account_id=account_id, user_id=user_id)
     settings = effective_llm_settings(account_id, user_id)
     max_concurrency = normalize_llm_max_concurrency(settings.llm_max_concurrency)
     min_interval = normalize_llm_min_interval(settings.llm_min_interval_seconds)
+    idle_cooldown = max(0.0, float(getattr(settings, "llm_background_idle_seconds", 12.0) or 0))
+    max_defer = max(0.0, float(getattr(settings, "llm_background_max_defer_seconds", 240.0) or 0))
     normalized_priority = normalize_llm_priority(priority)
     lane = "realtime" if normalized_priority <= LLM_PRIORITY_REALTIME else "background"
     warned = False
+    idle_notified = False
     waiter_id = uuid.uuid4().hex
     registered_waiter = False
     usage_event_id = ""
     usage_started_at: float | None = None
+    started_waiting = asyncio.get_running_loop().time()
     try:
         while True:
             async with llm_gate_lock:
@@ -1216,8 +1221,21 @@ async def run_with_llm_gate(
                     and llm_gate_last_started_at > 0
                     and now - llm_gate_last_started_at < min_interval
                 )
+                realtime_waiting = llm_gate_waiting_counts()["realtime"]
+                # Background jobs (visualization/report) yield the model to realtime
+                # voice/QA: only run once the realtime lane has been quiet for the
+                # cooldown, but never defer longer than max_defer (avoid starvation).
+                wait_for_idle = (
+                    lane != "realtime"
+                    and (now - started_waiting) < max_defer
+                    and (
+                        llm_gate_inflight_realtime > 0
+                        or realtime_waiting > 0
+                        or (llm_gate_last_realtime_at > 0 and now - llm_gate_last_realtime_at < idle_cooldown)
+                    )
+                )
                 wait_for_priority = next_waiter_id != waiter_id
-                if not wait_for_slot and not wait_for_interval and not wait_for_priority:
+                if not wait_for_slot and not wait_for_interval and not wait_for_priority and not wait_for_idle:
                     llm_gate_waiters.pop(waiter_id, None)
                     registered_waiter = False
                     llm_gate_waiting = len(llm_gate_waiters)
@@ -1227,6 +1245,8 @@ async def run_with_llm_gate(
                     else:
                         llm_gate_inflight_background += 1
                     llm_gate_last_started_at = now
+                    if lane == "realtime":
+                        llm_gate_last_realtime_at = now
                     counts = llm_gate_waiting_counts()
                     emit_llm_gate_log(
                         (
@@ -1255,16 +1275,38 @@ async def run_with_llm_gate(
                         session_id=session_id,
                         level="warning",
                     )
+                if wait_for_idle and not idle_notified:
+                    idle_notified = True
+                    emit_llm_gate_log(
+                        f"后台任务让行实时语音：{label} 将在模型空闲时生成（语音/问答优先）",
+                        session_id=session_id,
+                    )
             await asyncio.sleep(wait_seconds)
     finally:
         if registered_waiter:
             async with llm_gate_lock:
                 llm_gate_waiters.pop(waiter_id, None)
                 llm_gate_waiting = len(llm_gate_waiters)
+    retries = int(getattr(settings, "llm_realtime_retry", 1) or 0) if lane == "realtime" else 0
     try:
         usage_started_at = asyncio.get_running_loop().time()
         usage_event_id = record_llm_usage_start(label, session_id, lane, account_id, user_id)
-        result = await call()
+        attempt = 0
+        while True:
+            try:
+                result = await call()
+                break
+            except Exception:
+                if attempt < retries:
+                    attempt += 1
+                    emit_llm_gate_log(
+                        f"实时请求失败，自动重试 {attempt}/{retries}：{label}",
+                        session_id=session_id,
+                        level="warning",
+                    )
+                    await asyncio.sleep(0.8)
+                    continue
+                raise
         record_llm_usage_finish(usage_event_id, "done", started_monotonic=usage_started_at)
         return result
     except Exception as exc:
@@ -1275,6 +1317,7 @@ async def run_with_llm_gate(
             llm_gate_inflight = max(0, llm_gate_inflight - 1)
             if lane == "realtime":
                 llm_gate_inflight_realtime = max(0, llm_gate_inflight_realtime - 1)
+                llm_gate_last_realtime_at = asyncio.get_running_loop().time()
             else:
                 llm_gate_inflight_background = max(0, llm_gate_inflight_background - 1)
 
@@ -4288,7 +4331,7 @@ async def generate_teaching_visualization(
             f"teaching_visualization:{source_type}:{source_id[:8]}",
             resolved_session_id or None,
             lambda: llm.analyze_text(settings, prompt, max_tokens=TEACHING_VISUALIZATION_MAX_TOKENS),
-            priority=LLM_PRIORITY_REALTIME,
+            priority=LLM_PRIORITY_BACKGROUND,
         )
         clean_html = sanitize_teaching_html(raw_html)
         html_filename = write_teaching_visualization_html(visualization_id, clean_html)
@@ -8243,7 +8286,7 @@ def get_teaching_visualization_file(filename: str) -> FileResponse:
 @app.post("/api/visualizations")
 async def create_teaching_visualization(request: Request) -> dict:
     init_db()
-    principal_from_request(request)  # binds the per-account DB context for this request
+    principal = principal_from_request(request)  # binds the per-account DB context for this request
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(422, "invalid JSON body")
@@ -8265,16 +8308,44 @@ async def create_teaching_visualization(request: Request) -> dict:
             source_id = "custom_" + hashlib.sha256((session_id + "\n" + text).encode("utf-8")).hexdigest()[:32]
     if not source_id:
         raise HTTPException(422, "source_id is required")
-    visualization = await generate_teaching_visualization(
-        source_type=source_type,
-        source_id=source_id,
-        session_id=session_id,
-        source_text=text,
-        title=title,
-        force=force,
-        extra_instruction=extra_instruction,
-    )
-    return {"visualization": visualization}
+    # If it's already generated and ready, return immediately.
+    existing = latest_visualization_for_source(source_type, source_id)
+    if existing and existing.get("status") == "ready" and existing.get("can_open") and not force:
+        return {"visualization": existing}
+    # Otherwise generate asynchronously at BACKGROUND priority so it never competes
+    # with realtime voice/QA — it runs when the model is idle. Return a "running"
+    # status the client already understands and polls (session/QA overview).
+    account_id = principal["account_id"]
+
+    async def _generate_in_background() -> None:
+        set_current_account(account_id)
+        ensure_account_db(account_id)
+        try:
+            await generate_teaching_visualization(
+                source_type=source_type,
+                source_id=source_id,
+                session_id=session_id,
+                source_text=text,
+                title=title,
+                force=force,
+                extra_instruction=extra_instruction,
+            )
+        except Exception as exc:
+            emit_log(f"可视化生成失败：{exc}", session_id=session_id or None, source="visualization", level="error")
+
+    asyncio.create_task(_generate_in_background())
+    pending = dict(existing) if existing else {
+        "id": "",
+        "source_type": source_type,
+        "source_id": source_id,
+        "session_id": session_id,
+    }
+    pending.update({
+        "status": "running",
+        "queued": True,
+        "message": "已加入空闲生成队列：可视化会在语音/问答空闲时自动生成，完成后可在该回复下点「打开可视化」查看。",
+    })
+    return {"visualization": pending}
 
 
 @app.get("/api/sessions/{session_id}/overview")
