@@ -13,3 +13,4 @@ DerivedData/
 *.xcarchive
 *.ipa
 tmp/
+backend/.env

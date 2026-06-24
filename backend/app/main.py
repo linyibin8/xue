@@ -35,12 +35,25 @@ AUTH_TOKEN_ALGORITHM = "HS256"
 AUTH_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 PROFILE_TYPES = {"student", "parent", "teacher"}
 MODEL_PROVIDERS = {
-    "evowit": {"label": "EvoWit 默认模型", "supports_custom_base_url": True},
-    "openai": {"label": "OpenAI", "supports_custom_base_url": True},
-    "anthropic": {"label": "Anthropic", "supports_custom_base_url": True},
-    "gemini": {"label": "Google Gemini", "supports_custom_base_url": True},
-    "zhipu": {"label": "智谱 AI", "supports_custom_base_url": True},
-    "openai-compatible": {"label": "OpenAI-compatible", "supports_custom_base_url": True},
+    "evowit": {"label": "EvoWit 默认模型", "supports_custom_base_url": True, "openai_compatible": True,
+               "default_base_url": "http://100.64.0.5:39000/v1", "default_model": "evowit-agent27b",
+               "key_hint": "默认使用我们提供的模型，无需填写 Key"},
+    "openai": {"label": "OpenAI", "supports_custom_base_url": True, "openai_compatible": True,
+               "default_base_url": "https://api.openai.com/v1", "default_model": "gpt-4o-mini",
+               "key_hint": "填写你的 OpenAI API Key（sk-...）"},
+    "anthropic": {"label": "Anthropic (Claude)", "supports_custom_base_url": True, "openai_compatible": False,
+                  "default_base_url": "https://api.anthropic.com", "default_model": "claude-sonnet-4-5",
+                  "via_gateway": True,
+                  "key_hint": "Anthropic 原生格式，请经网关接入（见下方网关）"},
+    "gemini": {"label": "Google Gemini", "supports_custom_base_url": True, "openai_compatible": True,
+               "default_base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "default_model": "gemini-2.0-flash",
+               "key_hint": "填写你的 Google AI Studio API Key"},
+    "zhipu": {"label": "智谱 AI (GLM)", "supports_custom_base_url": True, "openai_compatible": True,
+              "default_base_url": "https://open.bigmodel.cn/api/paas/v4", "default_model": "glm-4-flash",
+              "key_hint": "填写你的智谱 API Key"},
+    "openai-compatible": {"label": "OpenAI-compatible", "supports_custom_base_url": True, "openai_compatible": True,
+                          "default_base_url": "", "default_model": "",
+                          "key_hint": "任意兼容 OpenAI /chat/completions 的服务"},
 }
 DEFAULT_ACCOUNT_ID = "local"
 llm_gate_lock = asyncio.Lock()
@@ -7504,8 +7517,9 @@ def model_platforms() -> dict:
             for provider, details in MODEL_PROVIDERS.items()
         ],
         "recommended_gateway": {
-            "name": "LiteLLM Proxy",
-            "purpose": "统一 OpenAI/Anthropic/Gemini/智谱等模型平台到 OpenAI-compatible API，并集中做 key、配额和日志管理。",
+            "name": "new-api",
+            "purpose": "统一 OpenAI/Anthropic/Gemini/智谱等平台到 OpenAI-compatible API；OpenAI 兼容的平台可直接在上面填 Base URL+Key，Anthropic 等非兼容平台经网关接入。",
+            "endpoint": get_settings().llm_gateway_url or "",
             "deploy_target": "ydz@100.64.0.13",
         },
         "system_default": active_model_config(),

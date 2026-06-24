@@ -967,11 +967,14 @@
       const usage = obs.llm_usage || {};
       const health = obs.model_health || {};
       opsStatusEl.textContent = obs.account_id ? `${health.busy ? "繁忙" : "可用"} · 24h ${Number(usage.total || 0)} 次` : "未加载";
+      const byModel = (usage.by_model || []).slice(0, 5)
+        .map(m => `<div class="muted">· ${escapeHtml(m.model || m.provider || "?")}：${Number(m.count || 0)} 次</div>`).join("");
       opsGridEl.innerHTML = `
         <div class="ops-row"><strong>${Number(gate.inflight || 0)} / ${Number(gate.max_concurrency || 0)}</strong><div class="muted">当前生成 / 最大并发</div></div>
         <div class="ops-row"><strong>${Number(gate.waiting || 0)}</strong><div class="muted">排队请求</div></div>
-        <div class="ops-row"><strong>${Number(usage.success_rate || 0)}</strong><div class="muted">24h 成功率</div></div>
+        <div class="ops-row"><strong>${(Number(usage.success_rate || 0) * 100).toFixed(0)}%</strong><div class="muted">24h 成功率（${Number(usage.done || 0)}/${Number(usage.total || 0)}）</div></div>
         <div class="ops-row"><strong>${Number(usage.avg_duration_ms || 0)}ms</strong><div class="muted">平均耗时</div></div>
+        <div class="ops-row" style="grid-column:1/-1"><strong>${escapeHtml(gate.active_provider || "evowit")} · ${escapeHtml(gate.active_model || "")}</strong><div class="muted">${health.busy ? "繁忙" : "空闲"} · 当前模型${byModel ? "（近 24h 分布）" : ""}</div>${byModel}</div>
       `;
     }
 

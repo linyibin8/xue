@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     llm_api_key: str = "ollama"
     llm_model: str = "evowit-agent27b"
     llm_provider: str = "evowit"
+    llm_gateway_url: str = ""
+    llm_gateway_key: str = ""
     llm_max_concurrency: int = 1
     llm_min_interval_seconds: float = 8.0
     llm_queue_warn_size: int = 3
