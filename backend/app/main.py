@@ -1155,6 +1155,32 @@ def normalize_llm_priority(priority: int | str | None) -> int:
         return LLM_PRIORITY_BACKGROUND
 
 
+def free_quota_state(account_id: str) -> dict:
+    """Today's realtime usage of the DEFAULT (our) model for an account vs the free cap."""
+    settings = get_settings()
+    limit = int(settings.free_daily_quota or 0)
+    state = {"enabled": limit > 0, "limit": limit, "used": 0, "remaining": -1}
+    if limit <= 0:
+        return state
+    account_id = account_id or settings.default_account_id or DEFAULT_ACCOUNT_ID
+    day_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00")
+    try:
+        with connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM llm_usage_events
+                WHERE account_id=? AND lane='realtime' AND base_url=? AND created_at>=? AND status!='failed'
+                """,
+                (account_id, settings.llm_base_url, day_start),
+            ).fetchone()
+        used = int(row["n"] or 0) if row else 0
+    except Exception:
+        used = 0
+    state["used"] = used
+    state["remaining"] = max(0, limit - used)
+    return state
+
+
 def llm_gate_waiting_counts() -> dict[str, int]:
     realtime = sum(1 for waiter in llm_gate_waiters.values() if int(waiter.get("priority", LLM_PRIORITY_BACKGROUND)) <= LLM_PRIORITY_REALTIME)
     background = max(0, len(llm_gate_waiters) - realtime)
@@ -1192,6 +1218,18 @@ async def run_with_llm_gate(
     max_defer = max(0.0, float(getattr(settings, "llm_background_max_defer_seconds", 240.0) or 0))
     normalized_priority = normalize_llm_priority(priority)
     lane = "realtime" if normalized_priority <= LLM_PRIORITY_REALTIME else "background"
+    base_settings = get_settings()
+    if (
+        lane == "realtime"
+        and int(base_settings.free_daily_quota or 0) > 0
+        and settings.llm_base_url == base_settings.llm_base_url
+    ):
+        quota = free_quota_state(account_id)
+        if quota["enabled"] and quota["remaining"] <= 0:
+            raise HTTPException(
+                429,
+                f"今日免费额度已用完（{quota['used']}/{quota['limit']} 次）。可在「账号与模型」里配置你自己的大模型继续使用，或明日自动恢复。",
+            )
     warned = False
     idle_notified = False
     waiter_id = uuid.uuid4().hex
@@ -6887,6 +6925,7 @@ def observability_snapshot(account_id: str = "", user_id: str = "") -> dict:
             "active_base_url": active_config.get("base_url"),
         },
         "llm_usage": llm_usage_snapshot(account_id),
+        "quota": free_quota_state(account_id),
         "model_health": {
             "default_base_url": settings.llm_base_url,
             "active_config": active_config,

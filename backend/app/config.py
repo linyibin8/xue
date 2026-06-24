@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     llm_background_idle_seconds: float = 12.0
     llm_background_max_defer_seconds: float = 240.0
     llm_realtime_retry: int = 1
+    # Free-tier cap: max realtime calls per account per UTC day on the DEFAULT (our)
+    # model. 0 = unlimited. Users who configure their own model key are never capped.
+    free_daily_quota: int = 0
     max_upload_mb: int = 20
     control_token: str = ""
     auth_required: bool = False
