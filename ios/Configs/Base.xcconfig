@@ -1,5 +1,5 @@
 APP_NAME = Xue
-APP_BUNDLE_ID = com.evowit.xue
+APP_BUNDLE_ID = com.linyibin8.xue
 APPLE_TEAM_ID = N3G45G5H74
 APP_VERSION = 1.0.0
 APP_BUILD_NUMBER = 1
