@@ -1,3 +1,4 @@
+name: xue
 services:
   xue:
     build: .
