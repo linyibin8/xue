@@ -5764,6 +5764,9 @@ Structured learning context:
 Structured context assets from client:
 {json_dumps((context or {}).get('structured_context_assets') or [])}
 
+Semantically related items from this student's own knowledge base (past mistakes/knowledge points retrieved by meaning, ranked by relevance to the current question; use ONLY when genuinely relevant, e.g. for review, similar-problem warnings, or concept reinforcement — never as factual proof):
+{json_dumps((context or {}).get('semantic_knowledge') or [])}
+
 Context asset use policy:
 {json_dumps((context or {}).get('context_use_policy') or {})}
 
@@ -7158,6 +7161,12 @@ async def run_analysis(
                 f"batch={batch_id or 'single'}；结构化条目={counts['learning_item_count']}；错题本候选={counts['mistake_item_count']}；动态需求={','.join(inferred)}",
                 analysis_id,
             )
+        try:
+            indexed_count = await index_knowledge_items(collect_unindexed_knowledge_rows())
+            if indexed_count:
+                emit_log(f"语义知识库已自动索引 {indexed_count} 条新条目", session_id=session_id)
+        except Exception:
+            pass
     if not already_claimed:
         mark_task_run(task_id, "done" if status == "done" else "failed", error=content if status != "done" else "")
     emit_log(f"解析完成：{status}", session_id=session_id)
@@ -7621,6 +7630,15 @@ def collect_account_knowledge_rows() -> list[dict]:
             if text:
                 rows.append({"kind": "learning", "ref_id": d["id"], "student_profile_id": "", "text": text})
     return rows
+
+
+def collect_unindexed_knowledge_rows() -> list[dict]:
+    rows = collect_account_knowledge_rows()
+    if not rows:
+        return []
+    with connect() as conn:
+        indexed = {(r["kind"], r["ref_id"]) for r in conn.execute("SELECT kind, ref_id FROM knowledge_vectors")}
+    return [r for r in rows if (r["kind"], r["ref_id"]) not in indexed]
 
 
 async def knowledge_semantic_search(query: str, k: int = 5, kinds: list[str] | None = None) -> list[dict]:
@@ -8775,6 +8793,18 @@ async def ask_session_question(
         payload={"trigger_type": trigger, "student_intent": student_intent},
     )
     prompt_context_payload = qa_prompt_context(context_payload, current_image_rejected=current_image_rejected)
+    try:
+        if embeddings.embed_enabled():
+            hits = await knowledge_semantic_search(cleaned_question, k=4)
+            relevant = [
+                {"kind": h["kind"], "score": h["score"], "text": h["text"][:300]}
+                for h in hits if h.get("score", 0) >= 0.35
+            ]
+            if relevant:
+                prompt_context_payload = dict(prompt_context_payload)
+                prompt_context_payload["semantic_knowledge"] = relevant
+    except Exception:
+        pass
     prompt = build_qa_prompt(
         session,
         question=cleaned_question,
