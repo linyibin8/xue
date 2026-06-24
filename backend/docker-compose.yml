@@ -12,3 +12,11 @@ services:
       XUE_LLM_BASE_URL: http://100.64.0.5:39000/v1
       XUE_LLM_API_KEY: ollama
       XUE_LLM_MODEL: evowit-agent27b
+      # Disable host-injected proxy (127.0.0.1:7897) so httpx reaches the LLM
+      # over the tailscale network directly (httpx does not honor CIDR no_proxy).
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      NO_PROXY: "*"
+      no_proxy: "*"
