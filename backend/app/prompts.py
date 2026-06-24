@@ -1,7 +1,7 @@
 import sqlite3
 from dataclasses import dataclass
 
-from .db import connect, utc_now
+from .db import connect_control, utc_now
 
 
 @dataclass(frozen=True)
@@ -237,7 +237,7 @@ PROMPT_DEFINITION_BY_KEY = {definition.key: definition for definition in PROMPT_
 
 
 def ensure_prompt_table() -> None:
-    with connect() as conn:
+    with connect_control() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS prompts (
@@ -262,7 +262,7 @@ def get_default_prompt(key: str) -> str:
 
 def _prompt_overrides() -> dict[str, dict]:
     try:
-        with connect() as conn:
+        with connect_control() as conn:
             rows = conn.execute("SELECT prompt_key, content, updated_at FROM prompts").fetchall()
     except sqlite3.OperationalError:
         return {}
@@ -271,7 +271,7 @@ def _prompt_overrides() -> dict[str, dict]:
 
 def _prompt_override(key: str) -> dict | None:
     try:
-        with connect() as conn:
+        with connect_control() as conn:
             row = conn.execute("SELECT prompt_key, content, updated_at FROM prompts WHERE prompt_key=?", (key,)).fetchone()
     except sqlite3.OperationalError:
         return None
@@ -323,7 +323,7 @@ def set_prompt(key: str, content: str) -> dict:
     normalized = validate_prompt_content(key, content)
     ensure_prompt_table()
     now = utc_now()
-    with connect() as conn:
+    with connect_control() as conn:
         conn.execute(
             """
             INSERT INTO prompts(prompt_key, content, updated_at)
@@ -340,14 +340,14 @@ def set_prompt(key: str, content: str) -> dict:
 def reset_prompt(key: str) -> dict:
     get_prompt_definition(key)
     ensure_prompt_table()
-    with connect() as conn:
+    with connect_control() as conn:
         conn.execute("DELETE FROM prompts WHERE prompt_key=?", (key,))
     return next(record for record in list_prompt_records() if record["key"] == key)
 
 
 def reset_all_prompts() -> list[dict]:
     ensure_prompt_table()
-    with connect() as conn:
+    with connect_control() as conn:
         conn.execute("DELETE FROM prompts")
     return list_prompt_records()
 

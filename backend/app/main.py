@@ -499,6 +499,27 @@ def default_principal() -> dict:
     }
 
 
+def bind_account_context_from_token(request: Request | None) -> None:
+    """Lightweight: set the per-account DB context from the JWT account_id without a DB round-trip.
+
+    Used by high-frequency, best-effort endpoints (e.g. log ingest) that should land in the
+    caller's account DB but don't need full user verification.
+    """
+    default_id = get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    authorization = request.headers.get("Authorization", "") if request else ""
+    scheme, token = get_authorization_scheme_param(authorization)
+    if token and scheme.lower() == AUTH_SCHEME.lower():
+        try:
+            payload = jwt.decode(token, auth_secret_key(), algorithms=[AUTH_TOKEN_ALGORITHM])
+            account_id = str(payload.get("account_id") or "")
+            if account_id:
+                set_current_account(account_id)
+                return
+        except Exception:
+            pass
+    set_current_account(default_id)
+
+
 def principal_from_request(request: Request | None, *, required: bool | None = None) -> dict:
     settings = get_settings()
     must_auth = settings.auth_required if required is None else required
@@ -9295,6 +9316,7 @@ async def finish_session(session_id: str, request: Request, background_tasks: Ba
 
 @app.post("/api/logs")
 async def ingest_log(request: Request) -> dict:
+    bind_account_context_from_token(request)
     body = await request.json()
     emit_log(
         str(body.get("message", "")),
