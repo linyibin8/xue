@@ -1,0 +1,14 @@
+services:
+  xue:
+    build: .
+    container_name: xue
+    restart: unless-stopped
+    ports:
+      - "8028:8028"
+    volumes:
+      - ./data:/app/data
+    environment:
+      XUE_PUBLIC_BASE_URL: https://xue.evowit.com
+      XUE_LLM_BASE_URL: http://100.64.0.5:39000/v1
+      XUE_LLM_API_KEY: ollama
+      XUE_LLM_MODEL: evowit-agent27b

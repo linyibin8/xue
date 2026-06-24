@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>知进伴学 后端展示</title>
+  <style>
+    :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: #f6f7f9; color: #15171a; }
+    header { height: 56px; display: flex; align-items: center; justify-content: space-between; padding: 0 18px; background: #ffffff; border-bottom: 1px solid #dde1e7; }
+    h1 { font-size: 18px; margin: 0; }
+    main { display: grid; grid-template-columns: 320px 1fr 420px; height: calc(100vh - 56px); }
+    aside, section { overflow: auto; }
+    aside { border-right: 1px solid #dde1e7; background: #ffffff; }
+    button.session { width: 100%; border: 0; border-bottom: 1px solid #edf0f3; background: transparent; padding: 14px; text-align: left; cursor: pointer; }
+    button.session:hover, button.session.active { background: #eef5ff; }
+    .muted { color: #667085; font-size: 12px; }
+    .viewer { display: grid; grid-template-columns: minmax(280px, 46%) 1fr; gap: 16px; padding: 16px; }
+    .images { display: grid; gap: 12px; align-content: start; }
+    .shot { background: #ffffff; border: 1px solid #dde1e7; border-radius: 8px; overflow: hidden; }
+    .shot img { width: 100%; display: block; cursor: zoom-in; }
+    .shot .cap { padding: 8px 10px; font-size: 12px; color: #475467; }
+    .analysis { display: grid; gap: 12px; align-content: start; }
+    article { background: #ffffff; border: 1px solid #dde1e7; border-radius: 8px; padding: 14px; white-space: pre-wrap; line-height: 1.55; }
+    .logs { border-left: 1px solid #dde1e7; background: #101828; color: #d0d5dd; padding: 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+    .log { padding: 5px 0; border-bottom: 1px solid rgba(255,255,255,.06); }
+    dialog { width: min(92vw, 1100px); border: 0; padding: 0; background: #000; }
+    dialog img { width: 100%; display: block; }
+    @media (max-width: 1100px) { main { grid-template-columns: 260px 1fr; } .logs { display: none; } .viewer { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>知进伴学 后端展示</h1>
+    <span class="muted">xue.evowit.com</span>
+  </header>
+  <main>
+    <aside id="sessions"></aside>
+    <section class="viewer">
+      <div class="images" id="images"></div>
+      <div class="analysis" id="analysis"></div>
+    </section>
+    <section class="logs" id="logs"></section>
+  </main>
+  <dialog id="zoom" onclick="this.close()"><img id="zoomImg" alt=""></dialog>
+  <script>
+    let current = null;
+    let lastLog = 0;
+    const sessionsEl = document.querySelector("#sessions");
+    const imagesEl = document.querySelector("#images");
+    const analysisEl = document.querySelector("#analysis");
+    const logsEl = document.querySelector("#logs");
+
+    async function loadSessions() {
+      const res = await fetch("/api/sessions");
+      const data = await res.json();
+      sessionsEl.innerHTML = data.sessions.map(s => `
+        <button class="session ${s.id === current ? "active" : ""}" data-id="${s.id}">
+          <strong>${s.title}</strong><br>
+          <span class="muted">${s.mode} · ${s.status}</span><br>
+          <span class="muted">${new Date(s.created_at).toLocaleString()}</span>
+        </button>`).join("");
+      if (!current && data.sessions[0]) current = data.sessions[0].id;
+      document.querySelectorAll(".session").forEach(btn => btn.onclick = () => { current = btn.dataset.id; loadSession(); loadSessions(); });
+      if (current) loadSession();
+    }
+
+    async function loadSession() {
+      const res = await fetch(`/api/sessions/${current}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      imagesEl.innerHTML = data.images.map(img => `
+        <div class="shot">
+          <img src="/images/${img.filename}" alt="${img.original_name}" onclick="zoom('/images/${img.filename}')">
+          <div class="cap">${img.kind} ${img.batch_id ? "· batch " + img.batch_id.slice(0, 8) : ""}</div>
+        </div>`).join("");
+      analysisEl.innerHTML = `
+        <article><strong>学习回合报告</strong>\n${data.session.summary || "等待汇总..."}</article>
+        ${data.analyses.map(a => `<article><strong>${a.scope} · ${a.status}</strong>\n${a.content || "分析中..."}</article>`).join("")}`;
+    }
+
+    function zoom(src) {
+      document.querySelector("#zoomImg").src = src;
+      document.querySelector("#zoom").showModal();
+    }
+
+    async function loadLogs() {
+      const res = await fetch(`/api/logs?after_id=${lastLog}`);
+      const data = await res.json();
+      for (const log of data.logs) {
+        lastLog = Math.max(lastLog, log.id);
+        const div = document.createElement("div");
+        div.className = "log";
+        div.textContent = `[${new Date(log.created_at).toLocaleTimeString()}] ${log.source}/${log.level}: ${log.message}`;
+        logsEl.append(div);
+      }
+      while (logsEl.children.length > 200) logsEl.firstChild.remove();
+      logsEl.scrollTop = logsEl.scrollHeight;
+    }
+
+    setInterval(loadSessions, 3000);
+    setInterval(loadLogs, 1000);
+    loadSessions();
+    loadLogs();
+  </script>
+</body>
+</html>
+
