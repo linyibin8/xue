@@ -267,6 +267,7 @@ struct iPadLearnView: View {
                 TextField("输入问题，或先拍题…", text: $draft, axis: .vertical)
                     .lineLimit(1...4)
                     .textFieldStyle(.plain)
+                    .accessibilityIdentifier("ipad-composer-field")
                     .focused($composerFocused)
                     .padding(.horizontal, 14).padding(.vertical, 10)
                     .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
