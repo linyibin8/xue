@@ -68,6 +68,22 @@
     </section>
   </main>
   <script>
+    (function () {
+      // Per-account prompts: forward the saved auth token so the backend scopes
+      // edits to the logged-in user's account (matches assets.html/session-panel.html).
+      const authTokenStorageKey = "xue.authToken";
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = (input, init = {}) => {
+        const url = typeof input === "string" ? input : (input && input.url) || "";
+        const target = new URL(url, location.href);
+        const headers = new Headers(init.headers || (typeof input !== "string" ? input.headers : undefined) || {});
+        const token = localStorage.getItem(authTokenStorageKey) || "";
+        if (token && target.origin === location.origin && !headers.has("Authorization")) {
+          headers.set("Authorization", `Bearer ${token}`);
+        }
+        return originalFetch(input, { ...init, headers, credentials: init.credentials || "same-origin" });
+      };
+    })();
     let prompts = [];
     let currentKey = "";
     const listEl = document.querySelector("#promptList");

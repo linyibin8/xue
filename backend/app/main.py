@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 
-from . import embeddings, llm, prompts
+from . import embeddings, llm, memory_store, prompts
 from .config import get_settings
 from .db import connect, connect_control, ensure_account_db, init_db, list_account_ids, set_current_account, utc_now
 
@@ -105,6 +105,16 @@ OBSERVATION_LOOKBACK_LIMIT = 80
 VISUAL_DUPLICATE_DISTANCE = 3.2
 VISUAL_TEXT_DUPLICATE_DISTANCE = 5.2
 TEXT_DUPLICATE_DISTANCE = 0.22
+# Keyframe override for 智能观察 dedup: even when the frame is visually a near
+# duplicate (camera barely moved), keep it as new content if the OCR token set
+# changed meaningfully (the student wrote a new step). Guards against dropping the
+# one frame that actually carries new information.
+KEYFRAME_TEXT_CHANGE_DISTANCE = 0.45  # Jaccard distance of text tokens vs the matched previous frame
+KEYFRAME_MIN_NEW_TOKENS = 3  # require this many genuinely-new tokens (filters single-token OCR noise)
+# 语音抓拍快筛: an eligible follow-up frame this close (visually) to the previous QA
+# image, with this much text overlap, is the same page -> answer on carried context
+# (text-only fast path) instead of a redundant ~6s vision call.
+QA_DUPLICATE_FOLLOWUP_TOKEN_OVERLAP = 0.75
 LEARNING_ITEM_CONTENT_LIMIT = 900
 LEARNING_ITEM_TITLE_LIMIT = 120
 LEARNING_ITEM_SUMMARY_LIMIT = 6000
@@ -2259,6 +2269,38 @@ def qa_should_soft_accept_first_frame(quality: dict, *, question: str, trigger: 
     return any(marker in detail for marker in ("文字", "题目", "结构", "学习材料", "课本", "试卷", "屏幕"))
 
 
+def _qa_fingerprint_meta(meta: dict) -> dict:
+    """QA frames carry their visual_sample/text tokens under qa_frame_quality; fall
+    back to that nested dict when the top level has no fingerprint."""
+    if visual_sample_from_meta(meta) or normalized_text_tokens(meta):
+        return meta
+    nested = meta_dict(meta, "qa_frame_quality", "qaFrameQuality", "frame_quality", "frameQuality")
+    return nested or meta
+
+
+def qa_frame_duplicates_previous(meta: dict, previous_image_row: dict | None) -> bool:
+    """True when an eligible follow-up frame is essentially the same page as the
+    previous QA image, so re-sending it to the vision model adds nothing and we can
+    answer on the carried text context (faster realtime voice path). Conservative:
+    reuses the observation dedup distance and additionally requires high text overlap."""
+    if not previous_image_row:
+        return False
+    current = _qa_fingerprint_meta(meta)
+    previous = _qa_fingerprint_meta(capture_meta_dict(previous_image_row.get("capture_meta")))
+    distance = fingerprint_distance(visual_sample_from_meta(current), visual_sample_from_meta(previous))
+    if distance is None:
+        current_hash = visual_hash_from_meta(current)
+        previous_hash = visual_hash_from_meta(previous)
+        return bool(current_hash and current_hash == previous_hash)
+    if distance > VISUAL_DUPLICATE_DISTANCE:
+        return False
+    current_tokens = normalized_text_tokens(current)
+    previous_tokens = normalized_text_tokens(previous)
+    if not current_tokens or not previous_tokens:
+        return True
+    return qa_token_overlap_score(current_tokens, previous_tokens) >= QA_DUPLICATE_FOLLOWUP_TOKEN_OVERLAP
+
+
 def qa_context_rejected_from_meta(meta: dict) -> bool:
     if meta_bool(meta, "qa_context_rejected", "qaContextRejected") is True:
         return True
@@ -2315,6 +2357,7 @@ def dynamic_strategy_context(
     strategy_context = context.get("strategy_context") if isinstance(context.get("strategy_context"), dict) else {}
     observation = context.get("observation_context") if isinstance(context.get("observation_context"), dict) else {}
     frame_quality = context.get("qa_frame_quality") if isinstance(context.get("qa_frame_quality"), dict) else {}
+    agent_memories = context.get("agent_memories") if isinstance(context.get("agent_memories"), list) else []
     memory_candidates = context.get("memory_digest_candidates") or context.get("long_term_memory_candidates") or []
     if not isinstance(memory_candidates, list):
         memory_candidates = []
@@ -2338,7 +2381,16 @@ def dynamic_strategy_context(
             "重点形成记忆："
             + "；".join(truncate_text(event.get("text"), 150) for event in formed_memories)
         )
-    if memory_candidates:
+    if agent_memories:
+        lines.append(
+            "相关记忆（按语义+新近度+重要性检索）："
+            + "；".join(
+                truncate_text(m.get("text"), 120)
+                for m in agent_memories[:5]
+                if isinstance(m, dict) and m.get("text")
+            )
+        )
+    elif memory_candidates:
         lines.append("记忆整理候选：" + "；".join(truncate_text(item, 120) for item in memory_candidates[:4]))
     if client_dynamic:
         lines.append(f"客户端动态策略：{truncate_text(json_dumps(client_dynamic), 700)}")
@@ -2470,15 +2522,25 @@ def best_previous_observation(session_id: str, visual_hash: str, visual_sample: 
         token_distance = text_token_distance(text_tokens, previous_tokens)
         hash_distance = visual_hash_distance(visual_hash, row.get("visual_hash") or "")
         exact_hash = bool(visual_hash and visual_hash == row.get("visual_hash"))
+        # Keyframe override: when the camera barely moved but the student wrote
+        # meaningfully new text, this frame carries new content and must not be
+        # collapsed into the previous (visually similar) one.
+        new_token_count = len(set(text_tokens) - set(previous_tokens)) if text_tokens else 0
+        significant_new_text = (
+            token_distance is not None
+            and token_distance >= KEYFRAME_TEXT_CHANGE_DISTANCE
+            and new_token_count >= KEYFRAME_MIN_NEW_TOKENS
+        )
         duplicate = exact_hash
-        if sample_distance is not None:
-            duplicate = duplicate or sample_distance <= VISUAL_DUPLICATE_DISTANCE
-            duplicate = duplicate or (
-                sample_distance <= VISUAL_TEXT_DUPLICATE_DISTANCE
-                and (token_distance is None or token_distance <= TEXT_DUPLICATE_DISTANCE)
-            )
-        elif hash_distance is not None:
-            duplicate = duplicate or hash_distance <= 6
+        if not significant_new_text:
+            if sample_distance is not None:
+                duplicate = duplicate or sample_distance <= VISUAL_DUPLICATE_DISTANCE
+                duplicate = duplicate or (
+                    sample_distance <= VISUAL_TEXT_DUPLICATE_DISTANCE
+                    and (token_distance is None or token_distance <= TEXT_DUPLICATE_DISTANCE)
+                )
+            elif hash_distance is not None:
+                duplicate = duplicate or hash_distance <= 6
         if token_distance is not None and token_distance <= 0.08 and exact_hash:
             duplicate = True
         if not duplicate:
@@ -3385,11 +3447,45 @@ def mistake_status_for_text(text: str) -> str | None:
     return None
 
 
+def mistake_is_empty_sentinel(text: str) -> bool:
+    """The "no mistakes" placeholder lines (e.g. 暂无明确错题候选) contain the word
+    错题 and would otherwise be parsed into a bogus mistake item."""
+    s = text or ""
+    return ("暂无" in s or "无明确" in s) and ("错题" in s or "候选" in s)
+
+
+def report_has_student_answer(content: str) -> bool:
+    """True when the report shows at least one real student answer somewhere.
+    Used to tell an unstarted/blank new paper (no answers anywhere) apart from a
+    worked paper with a few questions left blank: in the former, blank questions are
+    NOT mistakes; in the latter, the blanks ARE kept as 未完成 (疑似不会做)."""
+    placeholders = {"未识别", "未知", "无", "无内容", "无可分析内容", "空白", "未作答", "暂无"}
+    for raw_line in (content or "").splitlines():
+        line = clean_learning_line(raw_line)
+        if not line or learning_item_type_for_line(line) != "answer":
+            continue
+        # A wrong answer still means the student wrote something, so it counts as an
+        # attempt; only skip lines that report the answer as blank/missing.
+        if any(marker in line for marker in ("空白", "未作答", "未完成")):
+            continue
+        body = clean_learning_line(content_after_label(line))
+        if not body or len(body) < 2:
+            continue
+        if body in placeholders or any(marker in body for marker in ("未识别", "空白", "未作答")):
+            continue
+        return True
+    return False
+
+
 def extract_mistake_items(content: str, learning_items: list[dict] | None = None) -> list[dict]:
     items: list[dict] = []
     seen: set[str] = set()
     knowledge_lines = [item["content"] for item in (learning_items or []) if item.get("item_type") == "knowledge"]
     context_subject = extract_subject_from_text(content)
+    # A wholly-blank paper (no student answers anywhere) is an unstarted/new paper,
+    # not a set of mistakes. Only treat blank questions as 未完成错题 once at least
+    # one question on the material has actually been answered.
+    has_student_answer = report_has_student_answer(content)
     recent_question = ""
     recent_answer = ""
     recent_expected = ""
@@ -3408,6 +3504,10 @@ def extract_mistake_items(content: str, learning_items: list[dict] | None = None
         if expected:
             recent_expected = expected
         if not status:
+            continue
+        if mistake_is_empty_sentinel(line):
+            continue
+        if status == "incomplete" and not has_student_answer:
             continue
         title_source = recent_question or body or line
         digest = short_hash(normalize_learning_content(f"{title_source}\n{line}"))
@@ -5106,6 +5206,10 @@ QA_SECTION_ALIASES = {
     "改正": "订正建议",
     "结论": "结论",
     "答案": "结论",
+    "知识点": "知识点",
+    "知识点候选": "知识点",
+    "知识板块": "知识点",
+    "考点": "知识点",
     "先想一想": "先想一想",
     "先试一下": "先想一想",
     "提示": "先想一想",
@@ -5125,6 +5229,7 @@ QA_SECTION_CLASS = {
     "错因提醒": "warning",
     "订正建议": "fix",
     "结论": "result",
+    "知识点": "knowledge",
     "先想一想": "idea",
     "下一步小任务": "follow",
     "追问建议": "follow",
@@ -5140,6 +5245,7 @@ QA_SECTION_ORDER = [
     "错因提醒",
     "订正建议",
     "结论",
+    "知识点",
     "下一步小任务",
     "追问建议",
 ]
@@ -5155,6 +5261,7 @@ QA_SECTION_ICON = {
     "错因提醒": "⚠️",
     "订正建议": "🛠️",
     "结论": "🎯",
+    "知识点": "📚",
     "下一步小任务": "🚀",
     "追问建议": "💬",
 }
@@ -5208,9 +5315,16 @@ def qa_answer_html(answer: str) -> str:
         else:
             loose.append(line)
 
+    # 没有任何标签时，说明这是一段简短的自然回复（核对/闲聊/概念一句话），
+    # 直接当作普通段落渲染，不要硬塞进“解题步骤”卡片，保持简约。
     if loose and not sections:
-        sections["解题步骤"] = loose
-    elif loose:
+        plain = "".join(
+            f"<p>{inline_qa_markup(line)}</p>"
+            for line in loose
+            if str(line).strip()
+        )
+        return truncate_text(f'<div class="qa-rich-answer qa-plain-reply">{plain}</div>', QA_HTML_CHAR_LIMIT)
+    if loose:
         sections.setdefault("解题思路", []).extend(loose)
 
     parts = ['<div class="qa-rich-answer">']
@@ -5852,24 +5966,20 @@ Use the current camera frame when provided, the session context, and the student
 Be concise, but include enough reasoning steps for a student to continue solving.
 If the student asks to check mistakes, compare the visible work, point out likely wrong parts, and give the next correction step.
 If the referenced problem is ambiguous, say what you can infer and ask for a short clarification.
-Format the answer as short labeled lines so the UI can render it as a study card.
-Put every labeled section on its own line, separated by an actual newline. Never run several labels together in one paragraph, and start each new 题号 (e.g. 题1、题2) on its own line too. Use these labels when relevant:
-题目：...
-关键条件：...
-先想一想：...
-学生答案：...
-检查结果：...
-解题思路：...
-步骤：...
-错因：...
-订正：...
-结论：...
-下一步小任务：...
-下一步：
-1. 举一反三：...
-2. 总结知识点：...
-3. 按用户偏好：...
-追问建议：...
+Write a concise, targeted answer. Do NOT fill a fixed template — choose the layout that actually fits THIS question, and keep it short.
+
+Layout rules (important):
+- Use short labeled lines only when they help. Put each label on its own line with a real newline; never put two labels on one line; start each 题号 (题1、题2) on its own line.
+- Include a label ONLY if it carries real, specific content for this question. Omit any label that would be empty, generic, or just repeats the question. A tight answer with 1-3 labels beats one that fills every label.
+- Match the layout to the question type, for example:
+  · 只是核对对错: 主要给 检查结果，必要时再加 错因/订正；通常不需要 题目/关键条件/解题步骤。
+  · 让你讲这道题: 题目（一句）+ 解题思路或步骤 + 结论；只有条件多或存在干扰条件时才用 关键条件。hint_first 偏好下改用 先想一想 代替直接给步骤。
+  · 概念/知识点提问: 用 知识点 把概念讲清楚 + 一个小例子，不要硬套 题目/学生答案。
+  · 简单追问或闲聊: 直接用一两句自然中文回答，可以完全不用任何标签。
+- If you do not use labels, just answer in one or two short plain sentences.
+
+Available labels (pick only the subset you need; keep this relative order when several appear):
+题目、关键条件、先想一想、学生答案、检查结果、解题思路、步骤、错因、订正、结论、知识点、下一步小任务、追问建议
 
 Plain-text math formatting rules:
 - Write student answers, formulas, and units as ordinary readable text, not Markdown or LaTeX.
@@ -5913,6 +6023,9 @@ Structured context assets from client:
 Semantically related items from this student's own knowledge base (past mistakes/knowledge points retrieved by meaning, ranked by relevance to the current question; use ONLY when genuinely relevant, e.g. for review, similar-problem warnings, or concept reinforcement — never as factual proof):
 {json_dumps((context or {}).get('semantic_knowledge') or [])}
 
+Durable memories about THIS student, semantically retrieved for the current question (preferences, recurring mistakes/habits, goals; use for personalization and tone, NEVER as proof of the current answer; ignore any that aren't genuinely relevant):
+{json_dumps([{'text': m.get('text'), 'kind': m.get('kind'), 'score': m.get('score')} for m in ((context or {}).get('agent_memories') or [])])}
+
 Context asset use policy:
 {json_dumps((context or {}).get('context_use_policy') or {})}
 
@@ -5930,9 +6043,9 @@ Answer quality rules:
 - When Strategy includes 当前生效回答方式 or 当前生效场景, treat that as the only active coach preference even if inferred_needs lists other possible tags.
 - Follow the learning coach preference in Strategy and client_context. If the preference is hint_first, lead with 先想一想 and avoid giving the final answer until the student asks or checking requires it.
 - If the preference is check_only, do not solve the whole problem. Say whether the visible answer/process is correct, wrong, or unclear, then give one correction direction.
-- If the preference is step_by_step or full_explain, still keep steps compact and end with one actionable 下一步小任务.
-- Unless the student only needs a yes/no check, include either 先想一想 or 下一步小任务 so the answer creates a next learning action.
-- Every answer must end with 下一步 containing exactly three short options: 举一反三, 总结知识点, and 按用户偏好. Keep each option clickable-style and actionable in one line.
+- If the preference is step_by_step or full_explain, keep steps compact; add one actionable 下一步小任务 only when it genuinely helps.
+- Add 先想一想 or 下一步小任务 only when it gives a real next action worth doing; for a simple check, a concept reply, or chit-chat, leave it out.
+- Do NOT force a 下一步 / 追问建议 block on every answer. Include 追问建议 (one short line) only when an obvious useful follow-up exists; otherwise end naturally without it.
 - If inferred_student_intent is correction_check, answer as a same-dialogue correction review: compare the student's latest visible work with the prior QA context, decide whether the revision is now correct, and give one precise next correction if needed.
 - If inferred_student_intent is answer_check or visual_check, inspect the provided/current frame first and report what is correct, wrong, or unclear. Keep it connected to the referenced prior problem when the wording says "again", "this", "here", "changed", "改完", "再看看", or similar.
 - If context says current_image_rejected=true or context_mode is fallback/text-only, silently ignore the new capture. Do not say the image was not recognized; answer the student's spoken follow-up from recent QA turns, prior valid image context, and structured learning context.
@@ -7825,6 +7938,35 @@ async def reindex_knowledge(request: Request) -> dict:
     return {"ok": True, "indexed": count, "embed_enabled": embeddings.embed_enabled()}
 
 
+@app.get("/api/memory/agent")
+async def list_agent_memories(request: Request, kind: str = "", limit: int = 200) -> dict:
+    principal = principal_from_request(request, required=True)
+    return {
+        "memories": memory_store.list_memories(account_id=principal["account_id"], kind=kind, limit=limit),
+        "stats": memory_store.stats(account_id=principal["account_id"]),
+    }
+
+
+@app.get("/api/memory/agent/search")
+async def search_agent_memories(request: Request, q: str = "", k: int = 5, min_score: float = 0.0) -> dict:
+    """Preview exactly which durable memories a question would pull into context,
+    with the full per-memory score breakdown (semantic/recency/importance/usage)."""
+    principal = principal_from_request(request, required=True)
+    memories = await memory_store.retrieve(
+        q,
+        account_id=principal["account_id"],
+        k=max(1, min(k, 50)),
+        min_score=min_score,
+        mark_used=False,
+    )
+    return {"query": q, "memories": memories, "weights": {
+        "semantic": memory_store.W_SEMANTIC,
+        "recency": memory_store.W_RECENCY,
+        "importance": memory_store.W_IMPORTANCE,
+        "usage": memory_store.W_USAGE,
+    }}
+
+
 @app.post("/api/knowledge/search")
 async def search_knowledge(request: Request) -> dict:
     principal_from_request(request, required=True)
@@ -7972,8 +8114,11 @@ def session_panel_page() -> str:
 
 
 @app.get("/api/prompts")
-def list_prompts() -> dict:
+def list_prompts(request: Request) -> dict:
     init_db()
+    # Scope to the caller's account (principal_from_request sets the account context);
+    # enforces login when auth_required is on. Prompts are per-account isolated.
+    principal_from_request(request)
     return {"prompts": prompts.list_prompt_records()}
 
 
@@ -8213,6 +8358,7 @@ def get_observability(request: Request) -> dict:
 @app.put("/api/prompts/{prompt_key}")
 async def update_prompt(prompt_key: str, request: Request) -> dict:
     init_db()
+    principal = principal_from_request(request)
     body = await request.json()
     try:
         record = prompts.set_prompt(prompt_key, str(body.get("content", "")))
@@ -8220,26 +8366,28 @@ async def update_prompt(prompt_key: str, request: Request) -> dict:
         raise HTTPException(404, "prompt not found")
     except ValueError as exc:
         raise HTTPException(422, str(exc))
-    emit_log(f"更新提示词：{prompt_key}", source="dashboard")
+    emit_log(f"更新提示词：{prompt_key}（账号 {principal['account_id']}）", source="dashboard")
     return {"prompt": record}
 
 
 @app.post("/api/prompts/{prompt_key}/reset")
-def reset_prompt(prompt_key: str) -> dict:
+def reset_prompt(prompt_key: str, request: Request) -> dict:
     init_db()
+    principal = principal_from_request(request)
     try:
         record = prompts.reset_prompt(prompt_key)
     except KeyError:
         raise HTTPException(404, "prompt not found")
-    emit_log(f"恢复默认提示词：{prompt_key}", source="dashboard")
+    emit_log(f"恢复默认提示词：{prompt_key}（账号 {principal['account_id']}）", source="dashboard")
     return {"prompt": record}
 
 
 @app.post("/api/prompts/reset")
-def reset_all_prompts() -> dict:
+def reset_all_prompts(request: Request) -> dict:
     init_db()
+    principal = principal_from_request(request)
     records = prompts.reset_all_prompts()
-    emit_log("恢复全部默认提示词", source="dashboard")
+    emit_log(f"恢复全部默认提示词（账号 {principal['account_id']}）", source="dashboard")
     return {"prompts": records}
 
 
@@ -8791,6 +8939,55 @@ async def acknowledge_control_command(command_id: str, request: Request) -> dict
     return {"command": control_command_row_to_dict(dict(row))}
 
 
+async def extract_memories_after_qa(
+    *,
+    session_id: str,
+    account_id: str,
+    question: str,
+    answer: str,
+    feedback: str,
+    source_event_id: str,
+) -> None:
+    """Background: distill durable memories from a finished QA turn.
+
+    Runs on the background LLM lane so it never competes with realtime QA on the
+    concurrency-1 model. Failures are swallowed (best-effort enrichment).
+    """
+    async def _call(prompt: str) -> str:
+        return await run_with_llm_gate(
+            f"memory_extract:{session_id[:8]}",
+            session_id,
+            lambda: llm.analyze_text(effective_llm_settings_for_session(session_id), prompt, max_tokens=400),
+            priority=LLM_PRIORITY_BACKGROUND,
+            account_id=account_id,
+        )
+
+    try:
+        stored = await memory_store.extract_and_store(
+            question=question,
+            answer=answer,
+            feedback=feedback,
+            account_id=account_id,
+            source_event_id=source_event_id,
+            llm_call=_call,
+        )
+        if stored:
+            adds = sum(1 for m in stored if m.get("op") == "add")
+            updates = len(stored) - adds
+            emit_log(
+                f"memory extracted: +{adds} new, ~{updates} updated",
+                session_id=session_id,
+                source="memory",
+            )
+    except Exception as exc:
+        emit_log(
+            f"memory extraction failed: {truncate_text(str(exc), 160)}",
+            session_id=session_id,
+            source="memory",
+            level="warning",
+        )
+
+
 @app.post("/api/sessions/{session_id}/qa")
 async def ask_session_question(
     session_id: str,
@@ -8899,7 +9096,28 @@ async def ask_session_question(
         with connect() as conn:
             row = conn.execute("SELECT * FROM images WHERE id=?", (image_id,)).fetchone()
             uploaded_row = dict(row) if row else None
-        if uploaded_frame_quality.get("eligible") is True:
+        skip_duplicate_vision = (
+            uploaded_frame_quality.get("eligible") is True
+            and get_settings().qa_skip_duplicate_frame_vision
+            and student_intent not in QA_VISUAL_REVIEW_INTENTS
+            and not qa_is_first_or_new_problem_turn(trigger, context_payload, cleaned_question)
+            and qa_frame_duplicates_previous(capture_meta, previous_qa_image_row)
+        )
+        if skip_duplicate_vision:
+            current_image_rejected = False
+            update_qa_image_context_verdict(uploaded_image_id, uploaded_frame_quality, accepted=False)
+            image_id = None
+            image_filename = None
+            image_row = None
+            image_context_mode = "duplicate_current_frame_text_only"
+            emit_log(
+                "QA 当前抓拍与上一张几乎一致，转纯文本快路径，跳过视觉模型",
+                session_id=session_id,
+                device_id=source_text,
+                source="qa",
+                level="info",
+            )
+        elif uploaded_frame_quality.get("eligible") is True:
             current_image_rejected = False
             update_qa_image_context_verdict(uploaded_image_id, uploaded_frame_quality, accepted=True)
             with connect() as conn:
@@ -8982,6 +9200,14 @@ async def ask_session_question(
                 prompt_context_payload["semantic_knowledge"] = relevant
     except Exception:
         pass
+    retrieved_memories: list = []
+    try:
+        retrieved_memories = await memory_store.retrieve_for_turn(cleaned_question, account_id=principal["account_id"])
+        if retrieved_memories:
+            prompt_context_payload = dict(prompt_context_payload)
+            prompt_context_payload["agent_memories"] = retrieved_memories
+    except Exception:
+        retrieved_memories = []
     prompt = build_qa_prompt(
         session,
         question=cleaned_question,
@@ -9050,6 +9276,25 @@ async def ask_session_question(
                 answer = qa_safe_followup_fallback_answer(cleaned_question)
         updated = update_qa_event(event["id"], status="done", answer=answer, tts_status="ready")
         update_session_needs(session_id, infer_need_tags_from_text(cleaned_question + " " + answer), focus_note=cleaned_question)
+        memory_feedback = "；".join(
+            part
+            for part in (
+                f"场景={context_payload.get('learning_mode_title') or ''}",
+                f"回答方式={context_payload.get('coach_depth_title') or ''}",
+                str(context_payload.get("coach_preference") or "").strip(),
+            )
+            if part and not part.endswith("=")
+        )
+        asyncio.create_task(
+            extract_memories_after_qa(
+                session_id=session_id,
+                account_id=principal["account_id"],
+                question=cleaned_question,
+                answer=answer,
+                feedback=memory_feedback,
+                source_event_id=event.get("id") or "",
+            )
+        )
         emit_log(
             f"QA answered trigger={trigger} image_context={image_context_mode} question={truncate_text(cleaned_question, 120)}",
             session_id=session_id,
@@ -9071,6 +9316,7 @@ async def ask_session_question(
             "frame_quality": uploaded_frame_quality or client_rejected_frame_quality or {},
             "student_intent": student_intent,
             "dialog_state": context_payload.get("dialog_state", {}),
+            "agent_memories": retrieved_memories,
         }
     except Exception as exc:
         answer = f"AI 问答失败：{llm.format_llm_error(exc)}"

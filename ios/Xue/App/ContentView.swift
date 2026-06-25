@@ -2981,10 +2981,64 @@ private struct SubmissionContextStrip: View {
                     }
                 }
             }
+
+            if !state.lastTurnMemories.isEmpty {
+                Divider()
+                ContextRetrievedMemorySection(memories: state.lastTurnMemories)
+            }
         }
         .padding(10)
         .background(Color(.secondarySystemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+/// Shows the durable memories the server semantically retrieved into the latest answer,
+/// each with its score breakdown — the concrete answer to "which memories entered this turn".
+private struct ContextRetrievedMemorySection: View {
+    let memories: [RetrievedMemory]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "sparkles")
+                Text("本轮带入的记忆")
+                Spacer()
+                Text("\(memories.count) 条")
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+
+            Text("服务器按 语义+新近度+重要性 检索；「常驻」= 始终带入的偏好/目标/习惯。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            ForEach(memories) { memory in
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(memory.kindLabel)
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color(.tertiarySystemBackground))
+                            .clipShape(Capsule())
+                        Text(memory.text)
+                            .font(.caption2)
+                            .lineLimit(2)
+                        Spacer(minLength: 4)
+                        Text(memory.isPersona ? "常驻" : String(format: "%.2f", memory.score ?? 0))
+                            .font(.caption2.weight(.semibold).monospacedDigit())
+                            .foregroundStyle(memory.isPersona ? Color.purple : Color.accentColor)
+                    }
+                    if !memory.isPersona {
+                        Text(String(format: "语义 %.2f · 新近 %.2f · 重要 %.2f · 用过 %.2f",
+                                    memory.semantic, memory.recency, memory.importance, memory.usage))
+                            .font(.system(size: 9).monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -4476,6 +4530,55 @@ struct ContextBadgeItem: Identifiable, Equatable {
     var fullDetail: String? = nil
 }
 
+/// A durable memory the server retrieved (semantically) into the most recent QA turn,
+/// with the score breakdown that explains *why* it was carried into context.
+/// `score == nil` marks an always-on persona memory (preference/goal/habit).
+struct RetrievedMemory: Identifiable, Equatable {
+    let id: String
+    let kind: String
+    let text: String
+    let score: Double?
+    let semantic: Double
+    let recency: Double
+    let importance: Double
+    let usage: Double
+
+    var isPersona: Bool { score == nil }
+
+    var kindLabel: String {
+        switch kind {
+        case "preference": return "偏好"
+        case "mistake": return "易错"
+        case "goal": return "目标"
+        case "habit": return "习惯"
+        default: return "事实"
+        }
+    }
+
+    static func list(from raw: Any?) -> [RetrievedMemory] {
+        guard let array = raw as? [[String: Any]] else { return [] }
+        return array.compactMap { item in
+            guard let text = (item["text"] as? String), !text.isEmpty else { return nil }
+            let breakdown = item["breakdown"] as? [String: Any] ?? [:]
+            func num(_ value: Any?) -> Double {
+                if let d = value as? Double { return d }
+                if let n = value as? NSNumber { return n.doubleValue }
+                return 0
+            }
+            return RetrievedMemory(
+                id: (item["id"] as? String) ?? UUID().uuidString,
+                kind: (item["kind"] as? String) ?? "fact",
+                text: text,
+                score: item["score"] as? Double,
+                semantic: num(breakdown["semantic"]),
+                recency: num(breakdown["recency"]),
+                importance: num(breakdown["importance"]),
+                usage: num(breakdown["usage"])
+            )
+        }
+    }
+}
+
 struct ContextAssetGroup: Identifiable {
     let id: String
     let title: String
@@ -4797,46 +4900,47 @@ struct QARichAnswerView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 7) {
             ForEach(sections) { section in
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack(spacing: 5) {
-                        Text(section.icon)
-                            .font(.caption)
-                        Text(section.title)
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                            .foregroundStyle(section.tint)
-                    }
-                    if section.lines.count == 1 {
-                        Text(section.lines[0])
-                            .font(.callout)
-                            .fixedSize(horizontal: false, vertical: true)
-                    } else {
-                        VStack(alignment: .leading, spacing: 4) {
-                            ForEach(Array(section.lines.enumerated()), id: \.offset) { index, line in
-                                HStack(alignment: .top, spacing: 6) {
-                                    Text("\(index + 1).")
-                                        .font(.caption)
-                                        .monospacedDigit()
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 18, alignment: .trailing)
-                                    Text(line)
-                                        .font(.callout)
-                                        .fixedSize(horizontal: false, vertical: true)
+                HStack(alignment: .top, spacing: 8) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(section.tint)
+                        .frame(width: 3)
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 5) {
+                            Text(section.icon)
+                                .font(.caption)
+                            Text(section.title)
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                                .foregroundStyle(section.tint)
+                        }
+                        if section.lines.count == 1 {
+                            Text(section.lines[0])
+                                .font(.callout)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            VStack(alignment: .leading, spacing: 4) {
+                                ForEach(Array(section.lines.enumerated()), id: \.offset) { index, line in
+                                    HStack(alignment: .top, spacing: 6) {
+                                        Text("\(index + 1).")
+                                            .font(.caption)
+                                            .monospacedDigit()
+                                            .foregroundStyle(.secondary)
+                                            .frame(width: 16, alignment: .trailing)
+                                        Text(line)
+                                            .font(.callout)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
                                 }
                             }
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(10)
-                .background(section.tint.opacity(0.10))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(section.tint.opacity(0.25), lineWidth: 1)
-                )
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .padding(.vertical, 7)
+                .padding(.horizontal, 9)
+                .background(section.tint.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -4937,6 +5041,8 @@ struct QARichAnswerSection: Identifiable {
             return "订正建议"
         case "答案", "结论":
             return "结论"
+        case "知识点", "知识点候选", "知识板块", "考点":
+            return "知识点"
         case "追问建议", "可以追问", "下一步":
             return "追问建议"
         default:
@@ -4955,6 +5061,7 @@ struct QARichAnswerSection: Identifiable {
         case "错因提醒": return "⚠️"
         case "订正建议": return "🛠️"
         case "结论": return "🎯"
+        case "知识点": return "📚"
         case "下一步小任务": return "🚀"
         case "追问建议": return "💬"
         default: return "📌"
@@ -4975,6 +5082,8 @@ struct QARichAnswerSection: Identifiable {
             return .orange
         case "订正建议", "结论":
             return .green
+        case "知识点":
+            return .indigo
         case "追问建议":
             return .cyan
         default:
@@ -5791,6 +5900,8 @@ final class AppState: ObservableObject {
     @Published var cameraTaskKind = CameraTaskKind.none
     @Published var backgroundCameraEnabled = true
     @Published var lastSubmittedContextItems: [ContextBadgeItem] = []
+    /// Memories the server semantically retrieved into the most recent answer (with score breakdown).
+    @Published var lastTurnMemories: [RetrievedMemory] = []
     @Published var learningMode = LearningModePreference(rawValue: UserDefaults.standard.string(forKey: learningModeDefaultsKey) ?? "") ?? .singleProblem
     @Published var coachDepth = CoachDepthPreference(rawValue: UserDefaults.standard.string(forKey: coachDepthDefaultsKey) ?? "") ?? .hintFirst
     @Published var contextInclusionSettings = ContextInclusionSettings.load()
@@ -8312,15 +8423,18 @@ final class AppState: ObservableObject {
             ))
         }
 
-        let selectedMemories = contextInclusionSettings.memory ? selectedLongTermMemories(for: question) : []
-        if !selectedMemories.isEmpty {
+        if contextInclusionSettings.memory && !lastTurnMemories.isEmpty {
+            let detailLines = lastTurnMemories.map { memory -> String in
+                let scoreText = memory.isPersona ? "常驻" : String(format: "%.2f", memory.score ?? 0)
+                return "[\(memory.kindLabel) \(scoreText)] \(memory.text)"
+            }
             items.append(ContextBadgeItem(
                 id: "submitted-long-term-memory",
-                title: "记忆整理",
-                detail: "\(selectedMemories.count) 条候选",
+                title: "本轮记忆",
+                detail: "\(lastTurnMemories.count) 条（语义检索）",
                 systemImage: "brain.head.profile",
                 tone: .neutral,
-                fullDetail: selectedMemories.joined(separator: "\n")
+                fullDetail: detailLines.joined(separator: "\n")
             ))
         }
 
@@ -8465,23 +8579,6 @@ final class AppState: ObservableObject {
         UserDefaults.standard.set(longTermMemories, forKey: longTermMemoriesDefaultsKey)
         UserDefaults.standard.set(userInputMemory, forKey: userInputMemoryDefaultsKey)
         log("记忆整理已清空本机缓存")
-    }
-
-    private func selectedLongTermMemories(for question: String) -> [String] {
-        let compact = question.lowercased()
-        guard compact.count >= 4 else { return [] }
-        let tokens = Set(
-            compact
-                .components(separatedBy: CharacterSet.alphanumerics.inverted)
-                .filter { $0.count >= 2 }
-        )
-        let source = memoryDigestSummary
-        let selected = source.filter { memory in
-            if compact.isEmpty { return true }
-            let lowered = memory.lowercased()
-            return tokens.contains(where: { lowered.contains($0) })
-        }
-        return Array(selected.prefix(3))
     }
 
     private func updateLongTermMemories(question: String, answer: String) {
@@ -8905,6 +9002,7 @@ final class AppState: ObservableObject {
             let imageContextMode = (json?["image_context_mode"] as? String) ?? (image != nil ? "current_frame" : "text_only")
             qaTurnIndex = currentTurn
             qaAnswer = answer
+            lastTurnMemories = RetrievedMemory.list(from: json?["agent_memories"])
             appendAssistantChatMessage(
                 answer,
                 question: question,
@@ -9112,12 +9210,10 @@ final class AppState: ObservableObject {
             "device_interaction_presence": userOperationPresencePayload(),
             "qa_thread_policy": "In follow-up turns, keep answering about the first-turn captured problem unless the user clearly starts a new problem or taps New Conversation."
         ]
-        if contextInclusionSettings.memory {
-            let selectedMemories = selectedLongTermMemories(for: transcript)
-            payload["memory_digest_policy"] = "memory digest candidates are selected locally and refreshed from server; the model should decide whether each is relevant to the current question before using it"
-            payload["memory_digest_candidates"] = selectedMemories
-            payload["long_term_memory_candidates"] = selectedMemories
-        }
+        // Memory selection now happens server-side: the backend semantically retrieves
+        // the relevant durable memories for this question (see memory_store.retrieve_for_turn)
+        // and returns them as `agent_memories`. The old client-side keyword candidates were
+        // redundant with that, so they are no longer sent.
         if !structuredAssets.isEmpty {
             payload["structured_context_assets"] = structuredAssets.map { $0.compactPayload }
         }

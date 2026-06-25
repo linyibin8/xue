@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     # Free-tier cap: max realtime calls per account per UTC day on the DEFAULT (our)
     # model. 0 = unlimited. Users who configure their own model key are never capped.
     free_daily_quota: int = 0
+    # When a realtime QA follow-up frame is essentially the same page as the
+    # previous QA image, answer on carried context (text-only) instead of a
+    # redundant vision call. Set XUE_QA_SKIP_DUPLICATE_FRAME_VISION=false to disable.
+    qa_skip_duplicate_frame_vision: bool = True
     max_upload_mb: int = 20
     control_token: str = ""
     auth_required: bool = False

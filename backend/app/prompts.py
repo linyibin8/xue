@@ -1,7 +1,7 @@
 import sqlite3
 from dataclasses import dataclass
 
-from .db import connect_control, utc_now
+from .db import connect, connect_control, utc_now
 
 
 @dataclass(frozen=True)
@@ -89,7 +89,7 @@ PROMPT_DEFINITIONS: tuple[PromptDefinition, ...] = (
             "2. 学生作答差异：只记录每题可确定的新答案、改动后的答案、草稿/订正变化、空白/未作答变化；无法确定写“未识别”，不要补充解释。\n"
             "3. 题目耗时线索：只在本栏目写耗时。结合 captured_at、相邻图片间隔、同页同题连续出现、翻页/换题变化和学生在场证据，按持续时间降序估计本批主要动作/题目前后停留多久；不确定写“疑似”。不要在其他栏目重复耗时。\n"
             "4. 简短状态：只给离散状态，例如“科目=数学；书写=是；翻页=否；清晰=一般；有人=是(手/笔)/否/未识别；动作=书写/读题/翻页/离开/未识别；拍摄区域=未完整入镜，需调整相机”。本栏目不要写耗时、时间戳、原因或动作过程；无把握写“未识别/疑似”。\n"
-            "5. 错题本/知识点候选：只有画面明确出现错误、订正、划掉、空白、反复停留或学生要求核对答案时才写；每项不超过 20 字。明确证据指可见错答、改正、划掉、空白或停留异常；没有明确证据写“暂无明确候选”，不要硬凑建议。\n"
+            "5. 错题本/知识点候选：只有画面明确出现错误、订正、划掉、反复停留或学生要求核对答案时才写；每项不超过 20 字。空白要区分：整页几乎无任何手写作答时视为未作答的新卷，不要列为错题候选；仅当本页其它题已作答、个别题留空，才把留空作为“疑似不会做”候选。明确证据指可见错答、改正、划掉或停留异常；没有明确证据写“暂无明确候选”，不要硬凑建议。\n"
             "如果看不清页码或题号，请写“未识别”，不要编造。"
         ),
         variables=("image_count", "environment", "capture_lines", "previous_context"),
@@ -162,7 +162,7 @@ PROMPT_DEFINITIONS: tuple[PromptDefinition, ...] = (
             "学习方式：1 句，按持续时间最主要的学生动作判断方式，并写最关键依据。\n"
             "抓拍画面：1-2 句，概述抓拍数量、材料/页面、学生是否在场、主要动作和画面变化；若课本、试卷、电子显示屏或用户期望材料未完整进入拍摄区域，必须提醒把材料完整放进画面或调整相机，这类提醒不算泛泛建议。\n"
             "画面中的题目和答案：只列可见题目和对应作答；按时间投入和动作证据主次排序，每题 1 条，最多 8 条，未识别就写未识别；短暂扫过的题不要写成主要学习内容。\n"
-            "错题本：只列有证据的错题/疑似错题/未完成题；证据包括可见错答、改正、划掉、空白或停留异常；最多 5 条；没有明确错题时写“暂无明确错题候选”。\n"
+            "错题本：先判断整份材料是否已作答。若整页/整份几乎没有任何学生手写作答（疑似未开始的新卷/空白卷），不要把空白题列为错题，本栏写“暂无明确错题候选（试卷整体空白，疑似未作答的新卷）”。只有当同一份材料其它题已有作答、个别题留空时，才把留空题作为“留空未完成（疑似不会做）”列出，并与“做错”区分。真正的错题需可见错答/改正/划掉等证据，停留异常仅作辅助。最多 5 条；没有明确错题时写“暂无明确错题候选”。\n"
             "知识点与板块：只列由题目或错题直接支持的知识点；最多 5 条；不要泛化。\n"
             "过程解析：只解析证据足够清楚的题；每题最多 3 步；不清楚的题只写需要补拍/补充题干。\n"
             "题目耗时：只在本栏目写耗时；结合时间线、相邻抓拍间隔、学生在场/手笔/书写证据写每页/每题/每动作停留和最长项，无法可靠对应就说明原因；不要把相机空拍或无人时段算到题目上。\n"
@@ -237,7 +237,10 @@ PROMPT_DEFINITION_BY_KEY = {definition.key: definition for definition in PROMPT_
 
 
 def ensure_prompt_table() -> None:
-    with connect_control() as conn:
+    """Create the per-account prompt-override table in the active account's DB.
+    Prompts are isolated per account: connect() routes to the current account
+    (set from the request principal or the background task's account)."""
+    with connect() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS prompts (
@@ -260,7 +263,28 @@ def get_default_prompt(key: str) -> str:
     return get_prompt_definition(key).default
 
 
-def _prompt_overrides() -> dict[str, dict]:
+def _account_overrides() -> dict[str, dict]:
+    # Read-only hot path: don't create the table here (avoids per-render write
+    # locks); a missing table just means "no override yet".
+    try:
+        with connect() as conn:
+            rows = conn.execute("SELECT prompt_key, content, updated_at FROM prompts").fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {row["prompt_key"]: dict(row) for row in rows}
+
+
+def _account_override(key: str) -> dict | None:
+    try:
+        with connect() as conn:
+            row = conn.execute("SELECT prompt_key, content, updated_at FROM prompts WHERE prompt_key=?", (key,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return dict(row) if row else None
+
+
+def _legacy_overrides() -> dict[str, dict]:
+    # Backward-compat fallback: the pre-per-account global table in the control DB.
     try:
         with connect_control() as conn:
             rows = conn.execute("SELECT prompt_key, content, updated_at FROM prompts").fetchall()
@@ -269,7 +293,7 @@ def _prompt_overrides() -> dict[str, dict]:
     return {row["prompt_key"]: dict(row) for row in rows}
 
 
-def _prompt_override(key: str) -> dict | None:
+def _legacy_override(key: str) -> dict | None:
     try:
         with connect_control() as conn:
             row = conn.execute("SELECT prompt_key, content, updated_at FROM prompts WHERE prompt_key=?", (key,)).fetchone()
@@ -279,23 +303,26 @@ def _prompt_override(key: str) -> dict | None:
 
 
 def get_prompt(key: str) -> str:
+    # Resolution: this account's override -> legacy global override -> code default.
     definition = get_prompt_definition(key)
-    row = _prompt_override(key)
+    row = _account_override(key) or _legacy_override(key)
     return row["content"] if row else definition.default
 
 
 def list_prompt_records() -> list[dict]:
-    overrides = _prompt_overrides()
+    account_overrides = _account_overrides()
+    legacy_overrides = _legacy_overrides()
     records = []
     for definition in PROMPT_DEFINITIONS:
-        override = overrides.get(definition.key)
-        content = override["content"] if override else definition.default
+        override = account_overrides.get(definition.key)
+        baseline = legacy_overrides.get(definition.key)
+        effective = override or baseline
         records.append(
             {
                 "key": definition.key,
                 "label": definition.label,
                 "description": definition.description,
-                "content": content,
+                "content": effective["content"] if effective else definition.default,
                 "default_content": definition.default,
                 "variables": list(definition.variables),
                 "is_custom": override is not None,
@@ -323,7 +350,7 @@ def set_prompt(key: str, content: str) -> dict:
     normalized = validate_prompt_content(key, content)
     ensure_prompt_table()
     now = utc_now()
-    with connect_control() as conn:
+    with connect() as conn:
         conn.execute(
             """
             INSERT INTO prompts(prompt_key, content, updated_at)
@@ -340,14 +367,14 @@ def set_prompt(key: str, content: str) -> dict:
 def reset_prompt(key: str) -> dict:
     get_prompt_definition(key)
     ensure_prompt_table()
-    with connect_control() as conn:
+    with connect() as conn:
         conn.execute("DELETE FROM prompts WHERE prompt_key=?", (key,))
     return next(record for record in list_prompt_records() if record["key"] == key)
 
 
 def reset_all_prompts() -> list[dict]:
     ensure_prompt_table()
-    with connect_control() as conn:
+    with connect() as conn:
         conn.execute("DELETE FROM prompts")
     return list_prompt_records()
 
