@@ -2555,12 +2555,15 @@ private struct ChatMessageBubble: View {
         case .user:
             UserTextBubble(text: message.text)
         case .assistant:
+            // 仅在有题目/实质回答时才显示举一反三/加入错题本/形成记忆/可视化（"hi" 等闲聊不显示）
+            let hasActions = message.visualizationCandidate || message.text.count >= 50
             AssistantAnswerBubble(
                 answer: message.text,
                 visualizationCandidate: message.visualizationCandidate,
                 visualizationReason: message.visualizationReason,
                 visualization: message.visualization,
-                showFollowUpActions: isLatestAssistant,
+                showFollowUpActions: isLatestAssistant && hasActions,
+                showAnswerActions: hasActions,
                 preferenceFollowUpTitle: preferenceFollowUpTitle,
                 preferenceFollowUpPrompt: preferenceFollowUpPrompt,
                 onQuickFollowUp: onQuickFollowUp,
