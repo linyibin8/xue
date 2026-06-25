@@ -8094,6 +8094,90 @@ async def search_agent_memories(request: Request, q: str = "", k: int = 5, min_s
     }}
 
 
+@app.get("/api/memory/deltas")
+async def list_memory_deltas(
+    request: Request, unseen_only: int = 1, since: str = "", limit: int = 50
+) -> dict:
+    """Phase 3: per-turn memory deltas for the in-chat "这次更了解你了" chip.
+    Passive pull only — no polling, no server-side push."""
+    principal = principal_from_request(request, required=True)
+    deltas = memory_store.recent_deltas(
+        account_id=principal["account_id"],
+        unseen_only=bool(unseen_only),
+        since=clean_user_text(since, 64),
+        limit=max(1, min(int(limit or 50), 200)),
+    )
+    return {"deltas": deltas}
+
+
+@app.post("/api/memory/deltas/seen")
+async def mark_memory_deltas_seen(request: Request) -> dict:
+    """Best-effort debounce (M8): mark deltas as seen so the chip is not re-shown."""
+    principal = principal_from_request(request, required=True)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(422, "invalid JSON body")
+    ids = body.get("ids")
+    if not isinstance(ids, list):
+        raise HTTPException(422, "ids must be a list")
+    clean_ids = [str(i)[:64] for i in ids if i]
+    updated = memory_store.mark_deltas_seen(clean_ids, account_id=principal["account_id"])
+    return {"updated": updated}
+
+
+@app.patch("/api/memory/agent/{memory_id}")
+async def patch_agent_memory(memory_id: str, request: Request) -> dict:
+    """Phase 3: correct (text) or soft-delete/restore (status) one durable memory.
+
+    - text   -> re-embed in the same transaction (M5); 500 on embed failure (no
+                half-written row), so the client can retry.
+    - status -> active|superseded. Restoring to active runs restore_guard first and
+                returns 409 {error: capacity|duplicate} on conflict (M6). Soft-delete
+                only (status flip), never a hard delete.
+    Cross-account isolation: the memory_id must belong to the caller's account or 404.
+    """
+    principal = principal_from_request(request, required=True)
+    account_id = principal["account_id"]
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(422, "invalid JSON body")
+
+    has_text = "text" in body and body.get("text") is not None
+    has_status = "status" in body and body.get("status") is not None
+    if not has_text and not has_status:
+        raise HTTPException(422, "text or status is required")
+
+    updated: dict | None = None
+    if has_text:
+        text = clean_user_text(body.get("text"), memory_store.MEMORY_TEXT_LIMIT)
+        if not text:
+            raise HTTPException(422, "text is empty")
+        try:
+            updated = await memory_store.update_text(memory_id, text, account_id=account_id)
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(500, f"re-embed failed: {truncate_text(str(exc), 120)}")
+        if updated is None:
+            raise HTTPException(404, "memory not found")
+
+    if has_status:
+        status = clean_user_text(body.get("status"), 32).lower()
+        if status not in ("active", "superseded"):
+            raise HTTPException(422, "status must be active or superseded")
+        if status == "active":
+            guard = await memory_store.restore_guard(memory_id, account_id=account_id)
+            if not guard.get("ok"):
+                reason = guard.get("reason") or "conflict"
+                if reason == "missing":
+                    raise HTTPException(404, "memory not found")
+                raise HTTPException(409, reason)
+        result = memory_store.set_status(memory_id, status, account_id=account_id)
+        if result is None:
+            raise HTTPException(404, "memory not found")
+        updated = result
+
+    return {"memory": updated}
+
+
 @app.post("/api/knowledge/search")
 async def search_knowledge(request: Request) -> dict:
     principal_from_request(request, required=True)
@@ -9101,6 +9185,25 @@ async def extract_memories_after_qa(
         if stored:
             adds = sum(1 for m in stored if m.get("op") == "add")
             updates = len(stored) - adds
+            # Phase 3: record per-turn deltas (op/kind/text are authoritative, from
+            # extract_and_store) so iOS can passively pull the "这次更了解你了" chip.
+            # Still inside the background task — the QA response path is untouched.
+            try:
+                memory_store.write_deltas(
+                    [
+                        {
+                            "qa_event_id": source_event_id,
+                            "memory_id": m.get("id") or "",
+                            "op": m.get("op") or "add",
+                            "kind": m.get("kind") or "fact",
+                            "text": m.get("text") or "",
+                        }
+                        for m in stored
+                    ],
+                    account_id=account_id,
+                )
+            except Exception:
+                pass
             emit_log(
                 f"memory extracted: +{adds} new, ~{updates} updated",
                 session_id=session_id,

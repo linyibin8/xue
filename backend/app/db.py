@@ -737,6 +737,22 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_memories_account ON agent_memories(account_id, status, updated_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_memories_kind ON agent_memories(account_id, kind, status)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_deltas (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL DEFAULT 'local',
+                qa_event_id TEXT NOT NULL DEFAULT '',
+                memory_id TEXT NOT NULL DEFAULT '',
+                op TEXT NOT NULL DEFAULT 'add',
+                kind TEXT NOT NULL DEFAULT 'fact',
+                text TEXT NOT NULL DEFAULT '',
+                seen INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_deltas_account ON memory_deltas(account_id, seen, created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_users_account ON users(account_id, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_account_members_user ON account_members(user_id, status)")

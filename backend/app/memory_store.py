@@ -20,6 +20,7 @@ gate stays in `main.py`.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import uuid
@@ -52,6 +53,21 @@ MEMORY_TEXT_LIMIT = 400
 
 def _account_id(account_id: str = "") -> str:
     return account_id or get_settings().default_account_id or "local"
+
+
+# M2: serialize the read-modify-write dedupe section per account so two QA turns
+# finishing nearly simultaneously can't both miss an existing memory and each
+# insert a near-duplicate. The LLM/embedding calls stay OUTSIDE this lock so the
+# extract pipeline's slow stages never block on it.
+_account_locks: dict[str, asyncio.Lock] = {}
+
+
+def _lock_for(account_id: str) -> asyncio.Lock:
+    lock = _account_locks.get(account_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _account_locks[account_id] = lock
+    return lock
 
 
 def _parse_ts(value: str) -> datetime | None:
@@ -333,43 +349,48 @@ async def extract_and_store(
 
     stored: list[dict] = []
     now = utc_now()
-    with connect(account_id) as conn:
-        existing = conn.execute(
-            "SELECT id, embedding, importance, use_count FROM agent_memories "
-            "WHERE account_id=? AND status='active'",
-            (account_id,),
-        ).fetchall()
-        existing_vecs = [(r["id"], _decode_embedding(r["embedding"]), r) for r in existing]
+    # M2: only the DB read-modify-write is serialized per account; the LLM call and
+    # embedding call above already completed outside this lock.
+    async with _lock_for(account_id):
+        with connect(account_id) as conn:
+            existing = conn.execute(
+                "SELECT id, embedding, importance, use_count FROM agent_memories "
+                "WHERE account_id=? AND status='active'",
+                (account_id,),
+            ).fetchall()
+            existing_vecs = [(r["id"], _decode_embedding(r["embedding"]), r) for r in existing]
 
-        for item, vec in zip(cleaned, vectors):
-            # Dedupe by embedding similarity rather than a second LLM call: cheap, and
-            # essential given the shared concurrency-1 LLM.
-            best_id, best_sim = "", 0.0
-            for mid, mvec, _ in existing_vecs:
-                if not mvec:
-                    continue
-                sim = embeddings.cosine(vec, mvec)
-                if sim > best_sim:
-                    best_id, best_sim = mid, sim
-            if best_id and best_sim >= DEDUPE_COSINE:
-                conn.execute(
-                    "UPDATE agent_memories SET text=?, kind=?, embedding=?, "
-                    "importance=MAX(importance, ?), updated_at=?, source_event_id=? WHERE id=?",
-                    (item["text"], item["kind"], json.dumps(vec), item["importance"], now, source_event_id, best_id),
-                )
-                stored.append({"id": best_id, "op": "update", **item})
-            else:
-                mem_id = uuid.uuid4().hex
-                conn.execute(
-                    "INSERT INTO agent_memories(id, account_id, kind, text, embedding, importance, "
-                    "status, source_event_id, use_count, created_at, updated_at, last_used_at) "
-                    "VALUES(?, ?, ?, ?, ?, ?, 'active', ?, 0, ?, ?, '')",
-                    (mem_id, account_id, item["kind"], item["text"], json.dumps(vec), item["importance"], source_event_id, now, now),
-                )
-                existing_vecs.append((mem_id, vec, None))
-                stored.append({"id": mem_id, "op": "add", **item})
+            for item, vec in zip(cleaned, vectors):
+                # Dedupe by embedding similarity rather than a second LLM call: cheap, and
+                # essential given the shared concurrency-1 LLM.
+                best_id, best_sim = "", 0.0
+                for mid, mvec, _ in existing_vecs:
+                    if not mvec:
+                        continue
+                    sim = embeddings.cosine(vec, mvec)
+                    if sim > best_sim:
+                        best_id, best_sim = mid, sim
+                if best_id and best_sim >= DEDUPE_COSINE:
+                    # M1: do NOT overwrite source_event_id on a dedupe-UPDATE — keep the
+                    # original provenance so a stale memory isn't re-attributed to this turn.
+                    conn.execute(
+                        "UPDATE agent_memories SET text=?, kind=?, embedding=?, "
+                        "importance=MAX(importance, ?), updated_at=? WHERE id=?",
+                        (item["text"], item["kind"], json.dumps(vec), item["importance"], now, best_id),
+                    )
+                    stored.append({"id": best_id, "op": "update", **item})
+                else:
+                    mem_id = uuid.uuid4().hex
+                    conn.execute(
+                        "INSERT INTO agent_memories(id, account_id, kind, text, embedding, importance, "
+                        "status, source_event_id, use_count, created_at, updated_at, last_used_at) "
+                        "VALUES(?, ?, ?, ?, ?, ?, 'active', ?, 0, ?, ?, '')",
+                        (mem_id, account_id, item["kind"], item["text"], json.dumps(vec), item["importance"], source_event_id, now, now),
+                    )
+                    existing_vecs.append((mem_id, vec, None))
+                    stored.append({"id": mem_id, "op": "add", **item})
 
-        _prune(conn, account_id)
+            _prune(conn, account_id)
     return stored
 
 
@@ -427,3 +448,182 @@ def stats(*, account_id: str = "") -> dict:
             ).fetchall()
         }
     return {"total": total, "by_kind": by_kind, "embed_enabled": embeddings.embed_enabled()}
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: rolling-memory deltas + user-facing correction / soft-delete / restore.
+# These are the SINGLE write entry points for status/text mutations (the iOS
+# "我的学习档案" page and the per-turn delta chip both route through here), so the
+# soft-delete invariant (status active/superseded, never hard delete) lives in one
+# place. account_id is always part of the WHERE clause for cross-account isolation.
+# ---------------------------------------------------------------------------
+_MEMORY_PUBLIC_COLUMNS = (
+    "id, kind, text, importance, status, source_event_id, use_count, "
+    "created_at, updated_at, last_used_at"
+)
+
+
+def _memory_row(conn, memory_id: str, account_id: str) -> dict | None:
+    row = conn.execute(
+        f"SELECT {_MEMORY_PUBLIC_COLUMNS} FROM agent_memories WHERE id=? AND account_id=?",
+        (memory_id, account_id),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def set_status(memory_id: str, status: str, *, account_id: str = "") -> dict | None:
+    """Soft-delete / restore: flip agent_memories.status. Never hard-deletes.
+
+    Returns the updated row, or None if the memory does not exist for this account.
+    """
+    account_id = _account_id(account_id)
+    status = (status or "").strip().lower()
+    if status not in ("active", "superseded"):
+        return None
+    now = utc_now()
+    with connect(account_id) as conn:
+        cur = conn.execute(
+            "UPDATE agent_memories SET status=?, updated_at=? WHERE id=? AND account_id=?",
+            (status, now, memory_id, account_id),
+        )
+        if cur.rowcount == 0:
+            return None
+        return _memory_row(conn, memory_id, account_id)
+
+
+async def update_text(memory_id: str, text: str, *, account_id: str = "") -> dict | None:
+    """Correct a memory's text and re-embed it in the SAME transaction (M5).
+
+    Embedding is computed BEFORE the write; if it fails or is empty we raise and
+    never touch the row, so text and embedding can never drift apart. Returns the
+    updated row, or None if the memory does not exist for this account.
+    """
+    account_id = _account_id(account_id)
+    text = (text or "").strip()[:MEMORY_TEXT_LIMIT]
+    if len(text) < 2:
+        raise ValueError("memory text too short")
+    if not embeddings.embed_enabled():
+        raise RuntimeError("embeddings disabled; cannot re-embed corrected memory")
+    vectors = await embeddings.embed_texts([text])
+    if not vectors or not vectors[0]:
+        raise RuntimeError("re-embed failed for corrected memory")
+    vec = vectors[0]
+    now = utc_now()
+    with connect(account_id) as conn:
+        cur = conn.execute(
+            "UPDATE agent_memories SET text=?, embedding=?, updated_at=? WHERE id=? AND account_id=?",
+            (text, json.dumps(vec), now, memory_id, account_id),
+        )
+        if cur.rowcount == 0:
+            return None
+        return _memory_row(conn, memory_id, account_id)
+
+
+def write_deltas(rows: list[dict], *, account_id: str = "") -> int:
+    """Batch-insert per-turn memory deltas (best-effort, fire-and-forget from the
+    extract task). `op`/`kind`/`text` come from the authoritative `stored` list."""
+    account_id = _account_id(account_id)
+    if not rows:
+        return 0
+    now = utc_now()
+    payload = [
+        (
+            uuid.uuid4().hex,
+            account_id,
+            str(r.get("qa_event_id") or ""),
+            str(r.get("memory_id") or ""),
+            (str(r.get("op") or "add") or "add"),
+            _normalize_kind(r.get("kind")),
+            str(r.get("text") or "")[:MEMORY_TEXT_LIMIT],
+            now,
+        )
+        for r in rows
+    ]
+    with connect(account_id) as conn:
+        conn.executemany(
+            "INSERT INTO memory_deltas(id, account_id, qa_event_id, memory_id, op, kind, text, seen, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?)",
+            payload,
+        )
+    return len(payload)
+
+
+def recent_deltas(
+    *, account_id: str = "", unseen_only: bool = True, since: str = "", limit: int = 50
+) -> list[dict]:
+    """Per-turn delta feed for the in-chat "这次更了解你了" chip (passive pull)."""
+    account_id = _account_id(account_id)
+    sql = (
+        "SELECT id, memory_id, op, kind, text, qa_event_id, created_at "
+        "FROM memory_deltas WHERE account_id=?"
+    )
+    params: list = [account_id]
+    if unseen_only:
+        sql += " AND seen=0"
+    if since:
+        sql += " AND created_at > ?"
+        params.append(since)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(max(1, min(limit, 200)))
+    with connect(account_id) as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_deltas_seen(ids: list[str], *, account_id: str = "") -> int:
+    """Best-effort debounce (M8): mark deltas seen so the chip isn't re-shown.
+    Not an idempotency guarantee — the UI tolerates an occasional repeat."""
+    account_id = _account_id(account_id)
+    ids = [i for i in (ids or []) if i]
+    if not ids:
+        return 0
+    placeholders = ",".join("?" * len(ids))
+    with connect(account_id) as conn:
+        cur = conn.execute(
+            f"UPDATE memory_deltas SET seen=1 WHERE account_id=? AND id IN ({placeholders})",
+            (account_id, *ids),
+        )
+    return cur.rowcount
+
+
+async def restore_guard(memory_id: str, *, account_id: str = "") -> dict:
+    """Validate a soft-deleted memory can be restored to active (M6).
+
+    Returns {"ok": True} if restore is safe, else {"ok": False, "reason": ...}:
+      - "missing":   memory does not exist for this account
+      - "capacity":  restoring would exceed MAX_MEMORIES_PER_ACCOUNT
+      - "duplicate": a near-duplicate active memory already exists (>= DEDUPE_COSINE)
+    The actual flip to status=active stays in set_status; this only gates it.
+    """
+    account_id = _account_id(account_id)
+    with connect(account_id) as conn:
+        target = conn.execute(
+            "SELECT id, text, embedding, status FROM agent_memories WHERE id=? AND account_id=?",
+            (memory_id, account_id),
+        ).fetchone()
+        if target is None:
+            return {"ok": False, "reason": "missing"}
+        if target["status"] == "active":
+            # Already active: restore is a no-op, allow it.
+            return {"ok": True}
+        active_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM agent_memories WHERE account_id=? AND status='active'",
+            (account_id,),
+        ).fetchone()["c"]
+        if active_count + 1 > MAX_MEMORIES_PER_ACCOUNT:
+            return {"ok": False, "reason": "capacity"}
+        target_vec = _decode_embedding(target["embedding"])
+        active = conn.execute(
+            "SELECT id, embedding FROM agent_memories WHERE account_id=? AND status='active'",
+            (account_id,),
+        ).fetchall()
+    if target_vec:
+        for r in active:
+            if r["id"] == memory_id:
+                continue
+            mvec = _decode_embedding(r["embedding"])
+            if not mvec:
+                continue
+            if embeddings.cosine(target_vec, mvec) >= DEDUPE_COSINE:
+                return {"ok": False, "reason": "duplicate"}
+    return {"ok": True}

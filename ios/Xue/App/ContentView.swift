@@ -481,6 +481,9 @@ private struct LandscapeLearningWorkbench: View {
                             )
                         }
 
+                        // 三期：本轮记忆增量 chip（最近 assistant 气泡下方；本轮无增量则不渲染）。
+                        MemoryDeltaCard(state: state)
+
                         if state.chatMessages.isEmpty,
                            !state.recognizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             UserTextBubble(text: state.recognizedText)
@@ -1459,6 +1462,9 @@ private struct AssistantChatPanel: View {
                                         onOpenWorkspace: { withAnimation(.easeInOut(duration: 0.2)) { showContext = true } }
                                     )
                                 }
+
+                                // 三期：本轮记忆增量 chip（本轮无增量则不渲染）。
+                                MemoryDeltaCard(state: state)
 
                                 if state.chatMessages.isEmpty,
                                    !state.recognizedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -3040,6 +3046,8 @@ private struct SubmissionContextStrip: View {
     var onClose: () -> Void = {}
     var onSelectContext: (ContextBadgeItem) -> Void = { _ in }
 
+    @State private var showLearningProfile = false
+
     private var pendingItems: [ContextBadgeItem] {
         state.pendingContextItems(draft: draft)
     }
@@ -3106,6 +3114,16 @@ private struct SubmissionContextStrip: View {
                     .disabled(state.longTermMemories.isEmpty && state.userInputMemory.isEmpty)
                 }
 
+                // 三期：进入「我的学习档案」（持久记忆，可纠正/删除/撤销）。
+                Button {
+                    showLearningProfile = true
+                } label: {
+                    Label("我的学习档案", systemImage: "person.text.rectangle")
+                }
+                .buttonStyle(.plain)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.tint)
+
                 if state.memoryDigestSummary.isEmpty {
                     Text("系统会根据语音转文字和纯文字输入自动整理；服务器每小时汇总一次，相关时作为上下文候选。")
                         .font(.caption2)
@@ -3133,6 +3151,11 @@ private struct SubmissionContextStrip: View {
         .padding(10)
         .background(Color(.secondarySystemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        .sheet(isPresented: $showLearningProfile) {
+            NavigationStack {
+                LearningProfileView(state: state)
+            }
+        }
     }
 }
 
@@ -6271,6 +6294,14 @@ final class AppState: ObservableObject {
     @Published var memoryProfileUpdatedAt = ""
     @Published var memoryEvents: [MemoryEvent] = []
     @Published var isLoadingMemoryDigest = false
+    // 三期·滚动记忆数字人 — UI 驱动状态（编排逻辑在 Memory/MemoryProfileState.swift 的 extension AppState）。
+    @Published var agentMemories: [AgentMemory] = []           // 档案页持久记忆（仅 active）
+    @Published var lastTurnMemoryDelta: MemoryDeltaBatch? = nil // 驱动对话内增量 chip；nil=不渲染
+    @Published var isLoadingAgentMemories = false
+    @Published var memoryUndoToastVisible = false              // 5s 撤销吐司可见
+    // 纯内部、非 UI 驱动：撤销快照 + 吐司去抖 token（不需 @Published）。
+    var lastMutatedMemory: MemoryMutationSnapshot? = nil
+    var currentMemoryUndoToastToken: UUID? = nil
     @Published var reviewQueueState = "复习队列待刷新"
     @Published var isPreparingReview = false
     @Published var historySessions: [HistorySessionSummary] = []
@@ -9646,6 +9677,9 @@ final class AppState: ObservableObject {
                 visualization: visualization
             )
             updateLongTermMemories(question: question, answer: answer)
+            // 三期：真实 QA 路径收尾后被动拉取本轮记忆增量（异步、不阻塞答案渲染/播报）。
+            // 抽取是 fire-and-forget，本轮可能尚未写入 delta；拉不到则下一轮补显。
+            Task { await pullMemoryDeltas() }
             isThinking = false
             closeTransientCameraPreviewAfterQuestion()
             qaStateText = "正在回答"
