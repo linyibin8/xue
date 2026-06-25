@@ -18,6 +18,7 @@ struct iPadSettingsView: View {
         NavigationStack {
             Form {
                 preferenceSection
+                questionSection
                 contextSection
                 voiceSection
                 studentSection
@@ -47,6 +48,18 @@ struct iPadSettingsView: View {
             Picker("讲解深度", selection: Binding(get: { state.coachDepth }, set: { state.coachDepth = $0; state.coachPreferenceDidChange() })) {
                 ForEach(CoachDepthPreference.allCases) { Text($0.title).tag($0) }
             }
+        }
+    }
+
+    private var questionSection: some View {
+        Section {
+            Toggle(isOn: Binding(get: { state.textOnlyQuestion }, set: { state.textOnlyQuestionDidChange($0) })) {
+                Label("纯文字提问（不开相机）", systemImage: "keyboard")
+            }
+        } header: {
+            Text("提问")
+        } footer: {
+            Text("开启后打字/快捷追问不会打开相机或抓取画面，按纯文字理解。拍题、语音、智能观察不受影响。")
         }
     }
 

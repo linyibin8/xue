@@ -28,6 +28,7 @@ private let voicePlaybackEnabledDefaultsKey = "xue.voicePlaybackEnabled"
 private let voicePlaybackRateDefaultsKey = "xue.voicePlaybackRate"
 private let learningModeDefaultsKey = "xue.learningMode"
 private let coachDepthDefaultsKey = "xue.coachDepth"
+private let textOnlyQuestionDefaultsKey = "xue.textOnlyQuestion"
 private let longTermInstructionDefaultsKey = "xue.longTermInstruction"
 private let longTermMemoriesDefaultsKey = "xue.longTermMemories"
 private let userInputMemoryDefaultsKey = "xue.userInputMemory"
@@ -3957,6 +3958,15 @@ private struct ContextWorkspaceSettingsTab: View {
         ContextSectionCard(title: "发送配置", systemImage: "switch.2") {
             VStack(alignment: .leading, spacing: 10) {
                 ContextToggleRow(
+                    title: "纯文字提问（不开相机）",
+                    detail: "开启后打字/快捷追问不会打开相机或抓取画面，按纯文字理解；拍题、语音、智能观察不受影响。",
+                    systemImage: "keyboard",
+                    isOn: Binding(
+                        get: { state.textOnlyQuestion },
+                        set: { state.textOnlyQuestionDidChange($0) }
+                    )
+                )
+                ContextToggleRow(
                     title: "当前画面",
                     detail: "控制是否抓拍或复用题图；关闭后本轮按文字和对话理解。",
                     systemImage: "camera.metering.center.weighted",
@@ -5908,6 +5918,12 @@ final class AppState: ObservableObject {
     @Published var lastSubmittedContextItems: [ContextBadgeItem] = []
     /// Memories the server semantically retrieved into the most recent answer (with score breakdown).
     @Published var lastTurnMemories: [RetrievedMemory] = []
+    @Published var textOnlyQuestion: Bool = {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["XUE_TEXT_ONLY"] == "1" { return true }
+        #endif
+        return UserDefaults.standard.bool(forKey: textOnlyQuestionDefaultsKey)
+    }()
     @Published var learningMode = LearningModePreference(rawValue: UserDefaults.standard.string(forKey: learningModeDefaultsKey) ?? "") ?? .singleProblem
     @Published var coachDepth = CoachDepthPreference(rawValue: UserDefaults.standard.string(forKey: coachDepthDefaultsKey) ?? "") ?? .hintFirst
     @Published var contextInclusionSettings = ContextInclusionSettings.load()
@@ -7549,6 +7565,13 @@ final class AppState: ObservableObject {
         voicePlaybackEnabledDidChange(!voicePlaybackEnabled)
     }
 
+    // 纯文字提问（不开相机）：开启后打字提问不再打开相机/抓取画面，按纯文字理解
+    func textOnlyQuestionDidChange(_ on: Bool) {
+        textOnlyQuestion = on
+        UserDefaults.standard.set(on, forKey: textOnlyQuestionDefaultsKey)
+        log(on ? "纯文字提问已开启：打字提问不再开相机" : "纯文字提问已关闭：打字提问会结合当前画面")
+    }
+
     func voicePlaybackEnabledDidChange(_ enabled: Bool) {
         let savedEnabled = UserDefaults.standard.object(forKey: voicePlaybackEnabledDefaultsKey) as? Bool
         guard voicePlaybackEnabled != enabled || savedEnabled != enabled || (!enabled && ttsPlaybackPhase.isActive) else { return }
@@ -7720,10 +7743,12 @@ final class AppState: ObservableObject {
         pendingQAQuestion = question
         recognizedText = question
         qaAnswer = ""
-        if cameraTaskKind != .burst {
-            cameraTaskKind = .qaFrame
+        if !textOnlyQuestion {
+            if cameraTaskKind != .burst {
+                cameraTaskKind = .qaFrame
+            }
+            cameraPreviewVisible = true
         }
-        cameraPreviewVisible = true
         qaOverlayVisible = true
         lastSubmittedContextItems = pendingContextItems(draft: question)
         appendUserChatMessage(question)
@@ -8233,6 +8258,10 @@ final class AppState: ObservableObject {
 
     private func shouldCaptureVisualContext(intentHint: String) -> Bool {
         if !contextInclusionSettings.visual {
+            return false
+        }
+        // 纯文字提问：打字/快捷追问不抓画面（语音、拍题、观察不受影响）
+        if textOnlyQuestion && (pendingQATrigger == "typed_chat" || pendingQATrigger.hasPrefix("quick_followup")) {
             return false
         }
         if pendingQATrigger == "review_today" {

@@ -4,10 +4,11 @@ import XCTest
 final class iPhoneUITests: XCTestCase {
     override func setUpWithError() throws { continueAfterFailure = true }
 
-    private func makeApp() -> XCUIApplication {
+    private func makeApp(textOnly: Bool = false) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["XUE_AUTOLOGIN_EMAIL"] = "ipadqa@evowit.com"
         app.launchEnvironment["XUE_AUTOLOGIN_PW"] = "ipadqa2026"
+        if textOnly { app.launchEnvironment["XUE_TEXT_ONLY"] = "1" }
         return app
     }
     private func snap(_ app: XCUIApplication, _ name: String) {
@@ -44,7 +45,7 @@ final class iPhoneUITests: XCTestCase {
 
     // 3) 文字问答 + #7 实质回答出动作
     func testIPhone_03_textQA() {
-        let app = makeApp()
+        let app = makeApp(textOnly: true)
         XCUIDevice.shared.orientation = .landscapeLeft
         app.launch()
         XCTAssertTrue(el(app, "immersive-workbench").waitForExistence(timeout: 25))
@@ -62,7 +63,7 @@ final class iPhoneUITests: XCTestCase {
 
     // 4) 闲聊不出动作（#7 反向）
     func testIPhone_04_trivialChat() {
-        let app = makeApp()
+        let app = makeApp(textOnly: true)
         XCUIDevice.shared.orientation = .landscapeLeft
         app.launch()
         XCTAssertTrue(el(app, "immersive-workbench").waitForExistence(timeout: 25))

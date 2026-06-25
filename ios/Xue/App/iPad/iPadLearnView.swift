@@ -270,7 +270,9 @@ struct iPadLearnView: View {
                     .accessibilityIdentifier("ipad-composer-field")
                     .focused($composerFocused)
                     .padding(.horizontal, 14).padding(.vertical, 10)
+                    .frame(maxWidth: .infinity)
                     .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+                    .contentShape(Rectangle())
                     .onSubmit(send)
                 Button(action: send) {
                     Image(systemName: "paperplane.fill").font(.title3).frame(width: 44, height: 44)

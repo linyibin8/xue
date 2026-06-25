@@ -4,11 +4,12 @@ import XCTest
 final class iPadUITests: XCTestCase {
     override func setUpWithError() throws { continueAfterFailure = true }
 
-    private func makeApp(section: String? = nil) -> XCUIApplication {
+    private func makeApp(section: String? = nil, textOnly: Bool = false) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["XUE_AUTOLOGIN_EMAIL"] = "ipadqa@evowit.com"
         app.launchEnvironment["XUE_AUTOLOGIN_PW"] = "ipadqa2026"
         if let section { app.launchEnvironment["XUE_IPAD_SECTION"] = section }
+        if textOnly { app.launchEnvironment["XUE_TEXT_ONLY"] = "1" }  // 纯文字模式：模拟器无相机也能跑通问答
         return app
     }
     private func snap(_ name: String) {
@@ -39,9 +40,10 @@ final class iPadUITests: XCTestCase {
 
     // 2) 文字问答（诊断键盘/发送 + 思考器#5 + 动作#7）
     func testIPad_02_textQA() {
-        let app = makeApp()
+        let app = makeApp(textOnly: true)
         app.launch()
         XCTAssertTrue(waitLearn(app), "未进入学习页")
+        XCUIDevice.shared.orientation = .landscapeLeft; sleep(1)
         let field = el(app, "ipad-composer-field")
         XCTAssertTrue(field.waitForExistence(timeout: 8), "输入框未出现")
         field.tap()
@@ -62,9 +64,10 @@ final class iPadUITests: XCTestCase {
 
     // 3) 闲聊不出动作(#7 反向)
     func testIPad_03_trivialChat() {
-        let app = makeApp()
+        let app = makeApp(textOnly: true)
         app.launch()
         XCTAssertTrue(waitLearn(app), "未进入学习页")
+        XCUIDevice.shared.orientation = .landscapeLeft; sleep(1)
         let field = el(app, "ipad-composer-field")
         XCTAssertTrue(field.waitForExistence(timeout: 8))
         field.tap(); field.typeText("你好")
