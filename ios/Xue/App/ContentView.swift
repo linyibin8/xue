@@ -1890,7 +1890,7 @@ private struct CollapsedVoiceButton: View {
     }
 }
 
-private struct VoiceHoldArea: View {
+struct VoiceHoldArea: View {
     @ObservedObject var state: AppState
     var allowsCollapse = true
     var transparentSurface = false
@@ -2633,7 +2633,7 @@ private struct ContextStatusBubble: View {
     }
 }
 
-private struct ChatStatusChip: View {
+struct ChatStatusChip: View {
     let text: String
     let systemImage: String
 
@@ -3102,7 +3102,7 @@ private struct ContextChip: View {
     }
 }
 
-private struct AttachmentStrip: View {
+struct AttachmentStrip: View {
     let attachments: [ChatAttachment]
     let onSelect: (ChatAttachment) -> Void
 
@@ -3289,7 +3289,7 @@ private struct ContextDetailSheet: View {
     }
 }
 
-private struct AssistantTextBubble: View {
+struct AssistantTextBubble: View {
     let title: String
     let text: String
     let systemImage: String
@@ -3323,7 +3323,7 @@ private struct AssistantTextBubble: View {
     }
 }
 
-private struct UserTextBubble: View {
+struct UserTextBubble: View {
     let text: String
 
     var body: some View {
@@ -3340,7 +3340,7 @@ private struct UserTextBubble: View {
     }
 }
 
-private struct AssistantAnswerBubble: View {
+struct AssistantAnswerBubble: View {
     let answer: String
     var visualizationCandidate = false
     var visualizationReason = ""
@@ -3395,7 +3395,7 @@ private struct AssistantAnswerBubble: View {
     }
 }
 
-private struct QuickFollowUpActions: View {
+struct QuickFollowUpActions: View {
     let preferenceTitle: String
     let preferencePrompt: String
     let onSubmit: (String) -> Void

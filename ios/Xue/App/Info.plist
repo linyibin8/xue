@@ -29,7 +29,7 @@
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>知进伴学 需要使用语音识别把你的学习问题转换成文字并发送给 AI。</string>
 	<key>UIRequiresFullScreen</key>
-	<true/>
+	<false/>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>
@@ -39,6 +39,8 @@
 	</array>
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
