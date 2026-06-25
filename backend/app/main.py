@@ -9919,3 +9919,10 @@ async def stream_logs(request: Request, session_id: str | None = None, after_id:
             await asyncio.sleep(1)
 
     return StreamingResponse(events(), media_type="text/event-stream")
+
+
+# 二期·自然语言配置管家（intent_router）。独立 router，account-scoped，
+# 端点内部复用 principal_from_request / effective_llm_settings / run_with_llm_gate（惰性导入规避循环）。
+from . import intent_router as _intent_router  # noqa: E402
+
+app.include_router(_intent_router.router)

@@ -235,6 +235,7 @@ struct ContextInclusionSettings: Equatable {
 struct ContentView: View {
     @StateObject private var state = AppState()
     @State private var chatDraft = ""
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     var body: some View {
         ZStack {
@@ -265,6 +266,42 @@ struct ContentView: View {
         .onChange(of: state.coachPreferenceText) { _ in
             state.coachPreferenceDidChange()
         }
+        // 二期·自然语言配置确认卡片：iPhone(compact) 走 sheet，iPad(regular) 走 overlay；卡片本体同一份。
+        .sheet(isPresented: Binding(
+            get: { horizontalSizeClass != .regular && state.pendingIntentProposal != nil },
+            set: { if !$0 { state.dismissProposal() } }
+        )) {
+            if let proposal = state.pendingIntentProposal {
+                intentCard(proposal)
+                    .padding()
+                    .presentationDetents([.medium])
+                    // confirm/undo 在途时禁止下滑关闭，避免丢撤销入口、状态机与 UI 不一致（与 overlay 守护对齐）。
+                    .interactiveDismissDisabled(state.intentPhase == .applying || state.intentPhase == .undoing)
+            }
+        }
+        .overlay {
+            if horizontalSizeClass == .regular, let proposal = state.pendingIntentProposal {
+                ZStack {
+                    Color.black.opacity(0.25).ignoresSafeArea()
+                        .onTapGesture { if state.intentPhase != .applying && state.intentPhase != .undoing { state.dismissProposal() } }
+                    intentCard(proposal)
+                        .frame(maxWidth: 420)
+                        .padding()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func intentCard(_ proposal: IntentProposal) -> some View {
+        IntentProposalCard(
+            proposal: proposal,
+            phase: state.intentPhase,
+            onConfirm: { Task { await state.confirmProposal() } },
+            onCancel: { state.dismissProposal() },
+            onUndo: { Task { await state.undoLastIntent() } },
+            onAskInstead: { state.askInsteadOfConfig() }
+        )
     }
 }
 
@@ -606,12 +643,17 @@ private struct LandscapeLearningWorkbench: View {
                     Button {
                         sendDraft()
                     } label: {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.title2)
-                            .frame(width: 38, height: 38)
+                        if state.intentRouteInFlight {
+                            ProgressView()
+                                .frame(width: 38, height: 38)
+                        } else {
+                            Image(systemName: "arrow.up.circle.fill")
+                                .font(.title2)
+                                .frame(width: 38, height: 38)
+                        }
                     }
                     .buttonStyle(.plain)
-                    .disabled(state.questionSubmissionInFlight)
+                    .disabled(state.questionSubmissionInFlight || state.intentRouteInFlight)
                     .accessibilityLabel("发送文字问题")
                     .accessibilityIdentifier("send-chat")
                 }
@@ -722,7 +764,8 @@ private struct LandscapeLearningWorkbench: View {
 
     private func sendDraft() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !state.questionSubmissionInFlight else { return }
+        // 配置探测在途也算忙：先于 draft="" 拦截，避免清空输入框却没发出去。
+        guard !text.isEmpty, !state.questionSubmissionInFlight, !state.intentRouteInFlight else { return }
         draft = ""
         composerMode = .voice
         voiceDockExpanded = true
@@ -1597,12 +1640,17 @@ private struct AssistantChatPanel: View {
                         Button {
                             sendDraft()
                         } label: {
-                            Image(systemName: "arrow.up.circle.fill")
-                                .font(.title2)
-                                .frame(width: 38, height: 38)
+                            if state.intentRouteInFlight {
+                                ProgressView()
+                                    .frame(width: 38, height: 38)
+                            } else {
+                                Image(systemName: "arrow.up.circle.fill")
+                                    .font(.title2)
+                                    .frame(width: 38, height: 38)
+                            }
                         }
                         .buttonStyle(.plain)
-                        .disabled(state.questionSubmissionInFlight)
+                        .disabled(state.questionSubmissionInFlight || state.intentRouteInFlight)
                         .accessibilityLabel("发送文字问题")
                         .accessibilityIdentifier("send-chat")
                     }
@@ -1679,7 +1727,8 @@ private struct AssistantChatPanel: View {
 
     private func sendDraft() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !state.questionSubmissionInFlight else { return }
+        // 配置探测在途也算忙：先于 draft="" 拦截，避免清空输入框却没发出去。
+        guard !text.isEmpty, !state.questionSubmissionInFlight, !state.intentRouteInFlight else { return }
         draft = ""
         composerMode = .voice
         state.submitTypedQuestion(text)
@@ -6209,6 +6258,12 @@ final class AppState: ObservableObject {
     @Published var coachPrompts: [CoachPromptRecord] = []
     @Published var isLoadingPrompts = false
     @Published var contextInclusionSettings = ContextInclusionSettings.load()
+    // 二期·自然语言配置管家（逻辑在 Intent/IntentRouting.swift；UI 在 Intent/IntentProposalCard.swift）。
+    @Published var pendingIntentProposal: IntentProposal?
+    @Published var lastAppliedProposal: IntentProposal?          // 持 echo_state.before 供就地撤销
+    @Published var intentRouteInFlight = false
+    @Published var intentPhase: IntentPhase = .proposed
+    var pendingIntentOriginalQuestion: String?                   // 误判逃生时回填原文
     @Published var longTermInstruction = UserDefaults.standard.string(forKey: longTermInstructionDefaultsKey) ?? ""
     @Published var longTermMemories = UserDefaults.standard.stringArray(forKey: longTermMemoriesDefaultsKey) ?? []
     @Published var userInputMemory = UserDefaults.standard.stringArray(forKey: userInputMemoryDefaultsKey) ?? []
@@ -8122,6 +8177,20 @@ final class AppState: ObservableObject {
     }
 
     func submitTypedQuestion(_ text: String) {
+        let question = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // intentRouteInFlight：配置探测窗口（route timeout 内）也算"忙"，防 12s 内重复 send → 双卡片/重复 LLM 往返。
+        guard !question.isEmpty, !isSubmittingQuestion, !intentRouteInFlight else { return }
+        // 二期：仅文本路径做自然语言配置探测。命中 → 弹确认卡片，不进 QA；
+        // 失败/超时/非配置一律降级为普通 QA（proceedTypedQuestion 即原逻辑）。
+        Task { @MainActor in
+            if await maybeInterceptAsIntent(question) { return }
+            proceedTypedQuestion(question)
+        }
+    }
+
+    // internal（非 private）：供同文件 submitTypedQuestion 与 Intent/IntentRouting.swift 的逃生口调用。
+    @MainActor
+    func proceedTypedQuestion(_ text: String) {
         let question = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !question.isEmpty, !isSubmittingQuestion else { return }
         suppressObservationDanmakuBriefly(seconds: 4.0)
