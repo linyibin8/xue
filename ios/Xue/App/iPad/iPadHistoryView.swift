@@ -5,6 +5,7 @@ import SwiftUI
 
 struct iPadHistoryView: View {
     @ObservedObject var state: AppState
+    var onContinue: () -> Void = {}
     @State private var selectedId: String?
     @State private var report: HistoryReportDetail?
     @State private var loadingReport = false
@@ -99,13 +100,17 @@ struct iPadHistoryView: View {
                         }
 
                         Button {
-                            Task { await state.startConversationFromHistory(session) }
+                            Task {
+                                await state.startConversationFromHistory(session)
+                                await MainActor.run { onContinue() }
+                            }
                         } label: {
-                            Label("从此对话继续", systemImage: "arrow.uturn.forward")
+                            Label("进入对话 · 接着这次学习继续", systemImage: "arrow.uturn.forward")
                                 .frame(maxWidth: .infinity)
-                                .padding(.vertical, 10)
+                                .padding(.vertical, 12)
                         }
                         .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
                     }
                     .padding(24)
                     .frame(maxWidth: 820, alignment: .leading)

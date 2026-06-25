@@ -1,22 +1,26 @@
 import SwiftUI
 
-// iPad 学习工作台：左栏相机舞台 + 拍题/观察/语音控制，右栏对话流 + 输入器。
-// 复用 iPhone 已验证的相机管线（CameraView）、语音按钮（VoiceHoldArea）、
-// 回答气泡（AssistantAnswerBubble 等），仅重排为 iPad 横向双栏。
+enum iPadInputMode { case text, voice }
+
+// iPad 学习工作台：左栏相机舞台 + 智能观察；右栏对话流 + 底部统一输入条
+// （拍题 / 文字 / 语音 三合一，右下角切换语音⇄文字）。复用 iPhone 已验证的
+// 相机管线、语音按钮、回答气泡，仅重排为 iPad 双栏。
 
 struct iPadLearnView: View {
     @ObservedObject var state: AppState
     @Environment(\.openURL) private var openURL
 
     @State private var draft = ""
+    @State private var inputMode: iPadInputMode = .text
     @State private var previewAttachment: ChatAttachment?
+    @State private var contextDetail: ContextBadgeItem?
     @FocusState private var composerFocused: Bool
 
     var body: some View {
         NavigationStack {
             HStack(spacing: 0) {
                 captureColumn
-                    .frame(width: 440)
+                    .frame(width: 360)
                     .background(Color(.secondarySystemBackground))
                 Divider()
                 conversationColumn
@@ -32,9 +36,8 @@ struct iPadLearnView: View {
         .onDisappear {
             if !state.isBursting { state.hideInlineCameraPreview() }
         }
-        .sheet(item: $previewAttachment) { attachment in
-            iPadAttachmentPreview(attachment: attachment)
-        }
+        .sheet(item: $previewAttachment) { iPadAttachmentPreview(attachment: $0) }
+        .sheet(item: $contextDetail) { iPadContextDetailSheet(item: $0) }
     }
 
     // MARK: 工具栏
@@ -61,14 +64,12 @@ struct iPadLearnView: View {
         }
     }
 
-    // MARK: 左栏 — 相机 + 控制
+    // MARK: 左栏 — 相机 + 智能观察
 
     private var captureColumn: some View {
         VStack(spacing: 16) {
             cameraStage
-            controlRow
-            VoiceHoldArea(state: state, allowsCollapse: false)
-                .frame(maxWidth: .infinity)
+            observationButton
             statusLine
             Spacer(minLength: 0)
         }
@@ -77,17 +78,16 @@ struct iPadLearnView: View {
 
     private var cameraStage: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 18)
-                .fill(Color.black)
+            RoundedRectangle(cornerRadius: 18).fill(Color.black)
             if state.cameraPreviewVisible {
                 CameraView(state: state)
                     .clipShape(RoundedRectangle(cornerRadius: 18))
             } else {
                 VStack(spacing: 10) {
                     Image(systemName: "camera.viewfinder")
-                        .font(.system(size: 44))
+                        .font(.system(size: 40))
                         .foregroundStyle(.white.opacity(0.7))
-                    Text("点击下方「拍题」打开相机")
+                    Text("点击下方相机按钮拍题")
                         .font(.callout)
                         .foregroundStyle(.white.opacity(0.7))
                 }
@@ -97,8 +97,7 @@ struct iPadLearnView: View {
                     HStack {
                         Label("智能观察中", systemImage: "dot.radiowaves.left.and.right")
                             .font(.caption.weight(.semibold))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
+                            .padding(.horizontal, 10).padding(.vertical, 6)
                             .background(.red.opacity(0.85), in: Capsule())
                             .foregroundStyle(.white)
                         Spacer()
@@ -112,78 +111,53 @@ struct iPadLearnView: View {
         .frame(maxWidth: .infinity)
     }
 
-    private var controlRow: some View {
-        HStack(spacing: 14) {
-            Button {
-                if state.cameraPreviewVisible {
-                    state.performCameraPrimaryAction()
-                } else {
-                    state.openSingleCaptureCamera()
-                }
-            } label: {
-                Label(state.cameraPreviewVisible ? "拍照" : "拍题",
-                      systemImage: "camera.fill")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-            }
-            .buttonStyle(.borderedProminent)
-            .accessibilityIdentifier("ipad-capture")
-
-            Button {
-                if state.isBursting { state.stopBurst() } else { state.startBurst() }
-            } label: {
-                Label(state.isBursting ? "停止观察" : "智能观察",
-                      systemImage: state.isBursting ? "stop.circle.fill" : "eye")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-            }
-            .buttonStyle(.bordered)
-            .tint(state.isBursting ? .red : .accentColor)
+    private var observationButton: some View {
+        Button {
+            if state.isBursting { state.stopBurst() } else { state.startBurst() }
+        } label: {
+            Label(state.isBursting ? "停止观察" : "智能观察",
+                  systemImage: state.isBursting ? "stop.circle.fill" : "eye")
+                .font(.headline)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
         }
+        .buttonStyle(.bordered)
+        .tint(state.isBursting ? .red : .accentColor)
     }
 
     private var statusLine: some View {
         HStack(spacing: 8) {
-            if state.isThinking || state.isPreparingVoiceInput {
-                ProgressView().scaleEffect(0.8)
-            }
-            Image(systemName: state.qaSystemImage)
-                .foregroundStyle(.tint)
+            Image(systemName: state.qaSystemImage).foregroundStyle(.tint)
             Text(state.uploadState == "待机" ? state.qaStateText : state.uploadState)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
+                .font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
             Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    // MARK: 右栏 — 对话流 + 输入器
+    // MARK: 右栏 — 对话流 + 底部统一输入条
 
     private var conversationColumn: some View {
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
-                        if state.chatMessages.isEmpty {
+                        if state.chatMessages.isEmpty && !state.isThinking {
                             emptyConversationHint
                         }
                         ForEach(state.chatMessages) { message in
-                            chatRow(message)
-                                .id(message.id)
+                            chatRow(message).id(message.id)
+                        }
+                        if state.isThinking {
+                            thinkingRow.id("thinking-indicator")
                         }
                     }
                     .padding(20)
                     .frame(maxWidth: 760, alignment: .leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .onChange(of: state.chatMessages.count) { _ in
-                    if let last = state.chatMessages.last {
-                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                    }
-                }
+                .onChange(of: state.chatMessages.count) { _ in scrollToBottom(proxy) }
+                .onChange(of: state.isThinking) { thinking in if thinking { scrollToBottom(proxy) } }
             }
             Divider()
             composer
@@ -191,19 +165,44 @@ struct iPadLearnView: View {
         .background(Color(.systemGroupedBackground))
     }
 
+    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+        withAnimation {
+            if state.isThinking {
+                proxy.scrollTo("thinking-indicator", anchor: .bottom)
+            } else if let last = state.chatMessages.last {
+                proxy.scrollTo(last.id, anchor: .bottom)
+            }
+        }
+    }
+
     private var emptyConversationHint: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("开始学习")
-                .font(.title3.weight(.semibold))
-            Text("拍下题目，或直接在下方输入问题。AI 会结合你的学习目标、错题和记忆来辅导。")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+            Text("开始学习").font(.title3.weight(.semibold))
+            Text("拍下题目，或在下方输入 / 按住说话提问。AI 会结合你的学习目标、错题和记忆来辅导。")
+                .font(.callout).foregroundStyle(.secondary)
         }
         .padding(.vertical, 40)
     }
 
+    // 思考等待器（#5）
+    private var thinkingRow: some View {
+        HStack(alignment: .center, spacing: 10) {
+            ProgressView()
+            Text("AI 正在思考你的问题…")
+                .font(.callout).foregroundStyle(.secondary)
+            Spacer(minLength: 24)
+        }
+        .padding(12)
+        .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 10))
+    }
+
     private var latestAssistantId: UUID? {
         state.chatMessages.last(where: { $0.role == .assistant })?.id
+    }
+
+    // 仅在「有题目/有实质回答」时展示举一反三/加入错题本/形成记忆/可视化（#7）
+    private func messageHasActions(_ m: ChatMessage) -> Bool {
+        m.visualizationCandidate || m.text.count >= 50
     }
 
     @ViewBuilder
@@ -217,50 +216,85 @@ struct iPadLearnView: View {
                 }
             }
         case .assistant:
+            let acts = messageHasActions(message)
             AssistantAnswerBubble(
                 answer: message.text,
                 visualizationCandidate: message.visualizationCandidate,
                 visualizationReason: message.visualizationReason,
                 visualization: message.visualization,
-                showFollowUpActions: message.id == latestAssistantId,
+                showFollowUpActions: message.id == latestAssistantId && acts,
+                showAnswerActions: acts,
                 onQuickFollowUp: { state.submitQuickFollowUp($0) },
                 onAddMistake: { state.addLatestAnswerToMistakeBook() },
                 onFormMemory: { state.formMemoryFromLatestAnswer() },
                 onSmartCapture: { state.smartCaptureFromMessage(message) },
                 onGenerateVisualization: { state.generateVisualization(for: message) },
-                onOpenVisualization: { viz in
-                    if let url = viz.absoluteURL { openURL(url) }
-                }
+                onOpenVisualization: { viz in if let url = viz.absoluteURL { openURL(url) } }
             )
         case .status:
-            AssistantTextBubble(
-                title: message.title ?? "状态",
-                text: message.text,
-                systemImage: message.systemImage ?? "info.circle",
-                showsProgress: message.showsProgress
-            )
+            if !message.contextItems.isEmpty {
+                iPadContextStatusRow(message: message) { contextDetail = $0 }
+            } else {
+                AssistantTextBubble(
+                    title: message.title ?? "状态",
+                    text: message.text,
+                    systemImage: message.systemImage ?? "info.circle",
+                    showsProgress: message.showsProgress
+                )
+            }
         }
     }
 
+    // MARK: 底部统一输入条（拍题 / 文字 / 语音 三合一，右下角切换）（#4）
+
     private var composer: some View {
         HStack(spacing: 12) {
-            TextField("输入问题，或先拍题…", text: $draft, axis: .vertical)
-                .lineLimit(1...4)
-                .textFieldStyle(.plain)
-                .focused($composerFocused)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
-                .onSubmit(send)
-            Button(action: send) {
-                Image(systemName: "paperplane.fill")
+            Button {
+                if state.cameraPreviewVisible {
+                    state.performCameraPrimaryAction()
+                } else {
+                    state.openSingleCaptureCamera()
+                }
+            } label: {
+                Image(systemName: "camera.fill")
                     .font(.title3)
                     .frame(width: 44, height: 44)
             }
-            .buttonStyle(.borderedProminent)
-            .clipShape(Circle())
-            .accessibilityIdentifier("ipad-composer-send")
-            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || state.isThinking)
+            .buttonStyle(.bordered)
+            .accessibilityIdentifier("ipad-capture")
+
+            if inputMode == .text {
+                TextField("输入问题，或先拍题…", text: $draft, axis: .vertical)
+                    .lineLimit(1...4)
+                    .textFieldStyle(.plain)
+                    .focused($composerFocused)
+                    .padding(.horizontal, 14).padding(.vertical, 10)
+                    .background(Color(.tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+                    .onSubmit(send)
+                Button(action: send) {
+                    Image(systemName: "paperplane.fill").font(.title3).frame(width: 44, height: 44)
+                }
+                .buttonStyle(.borderedProminent)
+                .clipShape(Circle())
+                .accessibilityIdentifier("ipad-composer-send")
+                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || state.isThinking)
+            } else {
+                VoiceHoldArea(state: state, allowsCollapse: false)
+                    .frame(maxWidth: .infinity)
+            }
+
+            // 右下角：语音⇄文字 切换
+            Button {
+                composerFocused = false
+                withAnimation { inputMode = inputMode == .text ? .voice : .text }
+            } label: {
+                Image(systemName: inputMode == .text ? "mic.fill" : "keyboard")
+                    .font(.title3)
+                    .frame(width: 44, height: 44)
+            }
+            .buttonStyle(.bordered)
+            .tint(inputMode == .voice ? .accentColor : .secondary)
+            .accessibilityIdentifier("ipad-input-toggle")
         }
         .padding(16)
         .background(.bar)
@@ -275,6 +309,81 @@ struct iPadLearnView: View {
     }
 }
 
+// MARK: - 上下文：本次携带的上下文（可点击查看）（#6）
+
+struct iPadContextStatusRow: View {
+    let message: ChatMessage
+    let onTap: (ContextBadgeItem) -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: message.systemImage ?? "tray.full")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.tint)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 8) {
+                Text(message.title ?? "随本次发送")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                if !message.text.isEmpty {
+                    Text(message.text)
+                        .font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                let columns = [GridItem(.adaptive(minimum: 110), spacing: 8)]
+                LazyVGrid(columns: columns, alignment: .leading, spacing: 8) {
+                    ForEach(message.contextItems) { item in
+                        Button { onTap(item) } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: item.systemImage).font(.caption2)
+                                Text(item.title).font(.caption.weight(.medium)).lineLimit(1)
+                                Image(systemName: "chevron.right").font(.system(size: 9))
+                            }
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .background(item.tone.color.opacity(0.12), in: Capsule())
+                            .foregroundStyle(item.tone.color)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(11)
+            .background(Color(.systemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            Spacer(minLength: 24)
+        }
+    }
+}
+
+struct iPadContextDetailSheet: View {
+    let item: ContextBadgeItem
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    Label(item.title, systemImage: item.systemImage)
+                        .font(.headline)
+                        .foregroundStyle(item.tone.color)
+                    Text((item.fullDetail ?? item.detail).isEmpty ? "（无更多详情）" : (item.fullDetail ?? item.detail))
+                        .font(.body)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(20)
+            }
+            .navigationTitle("上下文详情")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("完成") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
 // MARK: - 附件预览
 
 struct iPadAttachmentPreview: View {
@@ -286,9 +395,7 @@ struct iPadAttachmentPreview: View {
             ZStack {
                 Color.black.ignoresSafeArea()
                 if let image = attachment.image {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFit()
+                    Image(uiImage: image).resizable().scaledToFit()
                 } else if let url = attachment.fullURL ?? attachment.thumbnailURL {
                     AsyncImage(url: url) { phase in
                         switch phase {

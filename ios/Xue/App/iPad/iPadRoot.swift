@@ -86,7 +86,7 @@ struct iPadRootView: View {
     private var detail: some View {
         switch section ?? .learn {
         case .learn: iPadLearnView(state: state)
-        case .history: iPadHistoryView(state: state)
+        case .history: iPadHistoryView(state: state, onContinue: { section = .learn })
         case .mistakes: iPadMistakesView(state: state)
         case .memory: iPadMemoryView(state: state)
         case .settings: iPadSettingsView(state: state, auth: auth)

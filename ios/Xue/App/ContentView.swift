@@ -3346,6 +3346,7 @@ struct AssistantAnswerBubble: View {
     var visualizationReason = ""
     var visualization: TeachingVisualization?
     var showFollowUpActions = false
+    var showAnswerActions = true
     var preferenceFollowUpTitle = "按偏好"
     var preferenceFollowUpPrompt = "请按我的学习偏好，基于上面的回答继续安排下一步。"
     var onQuickFollowUp: (String) -> Void = { _ in }
@@ -3381,11 +3382,13 @@ struct AssistantAnswerBubble: View {
                         onSubmit: onQuickFollowUp
                     )
                 }
-                AssistantAnswerActionRow(
-                    onSmartCapture: onSmartCapture,
-                    onAddMistake: onAddMistake,
-                    onFormMemory: onFormMemory
-                )
+                if showAnswerActions {
+                    AssistantAnswerActionRow(
+                        onSmartCapture: onSmartCapture,
+                        onAddMistake: onAddMistake,
+                        onFormMemory: onFormMemory
+                    )
+                }
             }
             .padding(11)
             .background(Color(.systemBackground))
@@ -8737,44 +8740,59 @@ final class AppState: ObservableObject {
             systemImage: "cube.transparent",
             showsProgress: true
         )
+        // 可视化是后端「空闲时异步生成」：POST 立即返回 status=running（无 url），
+        // 真正生成完才有可打开页面。这里轮询直到就绪再自动打开；只有真异常才算失败。
+        let vizSessionId = sessionId
         Task {
-            do {
-                let data = try await postJSON(
-                    path: "/api/visualizations",
-                    payload: [
-                        "source_type": "qa_event",
-                        "source_id": sourceId,
-                        "session_id": sessionId
-                    ],
-                    timeout: 180
-                )
-                let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-                let visualizationJSON = json?["visualization"] as? [String: Any]
-                guard let visualization = TeachingVisualization(json: visualizationJSON), visualization.absoluteURL != nil else {
-                    appendStatusChatMessage(title: "可视化生成失败", text: "服务器没有返回可打开的页面，请稍后重试。", systemImage: "exclamationmark.triangle")
+            let maxAttempts = 8
+            for attempt in 0..<maxAttempts {
+                do {
+                    let data = try await postJSON(
+                        path: "/api/visualizations",
+                        payload: [
+                            "source_type": "qa_event",
+                            "source_id": sourceId,
+                            "session_id": vizSessionId
+                        ],
+                        timeout: 60
+                    )
+                    let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    let visualizationJSON = json?["visualization"] as? [String: Any]
+                    if let visualization = TeachingVisualization(json: visualizationJSON),
+                       visualization.absoluteURL != nil,
+                       visualization.status != "running" {
+                        if let index = chatMessages.firstIndex(where: { $0.id == message.id }) {
+                            chatMessages[index].visualization = visualization
+                            chatMessages[index].visualizationCandidate = true
+                            if chatMessages[index].visualizationReason.isEmpty {
+                                chatMessages[index].visualizationReason = visualization.triggerReason
+                            }
+                        }
+                        appendStatusChatMessage(
+                            title: "可视化已生成",
+                            text: "页面已打开。稍后也可以回到这条 AI 回复下点“打开可视化”。",
+                            systemImage: "checkmark.circle"
+                        )
+                        openVisualization(visualization)
+                        return
+                    }
+                    // 仍在排队/生成中：后台空闲时才生成，继续等待。
+                } catch {
+                    if let index = chatMessages.firstIndex(where: { $0.id == message.id }) {
+                        chatMessages[index].visualizationCandidate = true
+                    }
+                    appendStatusChatMessage(title: "可视化生成失败", text: networkErrorUserMessage(error), systemImage: "exclamationmark.triangle")
+                    log("可视化生成失败：\(networkErrorDescription(error))", level: "error")
                     return
                 }
-                if let index = chatMessages.firstIndex(where: { $0.id == message.id }) {
-                    chatMessages[index].visualization = visualization
-                    chatMessages[index].visualizationCandidate = true
-                    if chatMessages[index].visualizationReason.isEmpty {
-                        chatMessages[index].visualizationReason = visualization.triggerReason
-                    }
-                }
-                appendStatusChatMessage(
-                    title: "可视化已生成",
-                    text: "页面已打开。稍后也可以回到这条 AI 回复下点“打开可视化”。",
-                    systemImage: "checkmark.circle"
-                )
-                openVisualization(visualization)
-            } catch {
-                if let index = chatMessages.firstIndex(where: { $0.id == message.id }) {
-                    chatMessages[index].visualization = nil
-                    chatMessages[index].visualizationCandidate = true
-                }
-                appendStatusChatMessage(title: "可视化生成失败", text: networkErrorUserMessage(error), systemImage: "exclamationmark.triangle")
-                log("可视化生成失败：\(networkErrorDescription(error))", level: "error")
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
             }
+            // 轮询结束仍未就绪：保留 running 状态，提示用户稍后手动打开（不算失败）。
+            appendStatusChatMessage(
+                title: "可视化仍在生成",
+                text: "已加入空闲生成队列，可能需要稍等。稍后回到这条 AI 回复点“打开可视化”即可查看。",
+                systemImage: "clock"
+            )
         }
     }
 
