@@ -100,6 +100,7 @@ async def retrieve(
     k: int = DEFAULT_TOP_K,
     min_score: float = DEFAULT_MIN_SCORE,
     mark_used: bool = True,
+    exclude_ids: set[str] = frozenset(),
 ) -> list[dict]:
     """Return the top-k durable memories for `query`, each with a score breakdown.
 
@@ -156,6 +157,10 @@ async def retrieve(
 
     scored.sort(key=lambda m: m["score"], reverse=True)
     selected = [m for m in scored if m["score"] >= min_score][: max(1, min(k, 50))]
+    if exclude_ids:
+        # Drop client-excluded memories *before* mark_used so their use_count is not
+        # incremented for a turn the user opted out of (MUST-3 side-effect fix).
+        selected = [m for m in selected if m["id"] not in exclude_ids]
 
     if mark_used and selected:
         ids = [m["id"] for m in selected]
@@ -204,11 +209,16 @@ async def retrieve_for_turn(
     account_id: str = "",
     recall_k: int = DEFAULT_TOP_K,
     persona_n: int = 2,
+    exclude_ids: set[str] = frozenset(),
 ) -> list[dict]:
     """What actually goes into a QA turn: the always-on persona slice + the
-    semantically-recalled memories, persona first, de-duplicated by id."""
-    persona = persona_memories(account_id=account_id, n=persona_n)
-    recalled = await retrieve(query, account_id=account_id, k=recall_k)
+    semantically-recalled memories, persona first, de-duplicated by id.
+
+    `exclude_ids` are memories the client opted out of for this turn: they are
+    filtered from both the persona slice and the recalled slice, and (via
+    `retrieve`) are never marked used. Defaults to no exclusions (back-compat)."""
+    persona = [m for m in persona_memories(account_id=account_id, n=persona_n) if m["id"] not in exclude_ids]
+    recalled = await retrieve(query, account_id=account_id, k=recall_k, exclude_ids=exclude_ids)
     seen = {m["id"] for m in persona}
     return persona + [m for m in recalled if m["id"] not in seen]
 

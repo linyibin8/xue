@@ -439,7 +439,8 @@ private struct LandscapeLearningWorkbench: View {
                                 onGenerateVisualization: { state.generateVisualization(for: $0) },
                                 onOpenVisualization: { state.openVisualization($0) },
                                 onSelectContext: { selectedContextItem = $0 },
-                                onSelectAttachment: { selectedAttachment = $0 }
+                                onSelectAttachment: { selectedAttachment = $0 },
+                                onOpenWorkspace: { showContext = true }
                             )
                         }
 
@@ -1411,7 +1412,8 @@ private struct AssistantChatPanel: View {
                                         onGenerateVisualization: { state.generateVisualization(for: $0) },
                                         onOpenVisualization: { state.openVisualization($0) },
                                         onSelectContext: { selectedContextItem = $0 },
-                                        onSelectAttachment: { selectedAttachment = $0 }
+                                        onSelectAttachment: { selectedAttachment = $0 },
+                                        onOpenWorkspace: { withAnimation(.easeInOut(duration: 0.2)) { showContext = true } }
                                     )
                                 }
 
@@ -2621,6 +2623,7 @@ private struct ChatMessageBubble: View {
     let onOpenVisualization: (TeachingVisualization) -> Void
     let onSelectContext: (ContextBadgeItem) -> Void
     let onSelectAttachment: (ChatAttachment) -> Void
+    var onOpenWorkspace: (() -> Void)? = nil
 
     var body: some View {
         switch message.role {
@@ -2664,7 +2667,8 @@ private struct ChatMessageBubble: View {
                     items: message.contextItems,
                     attachments: message.attachments,
                     onSelectContext: onSelectContext,
-                    onSelectAttachment: onSelectAttachment
+                    onSelectAttachment: onSelectAttachment,
+                    onOpenWorkspace: onOpenWorkspace
                 )
             }
         }
@@ -2679,12 +2683,27 @@ private struct ContextStatusBubble: View {
     let attachments: [ChatAttachment]
     let onSelectContext: (ContextBadgeItem) -> Void
     let onSelectAttachment: (ChatAttachment) -> Void
+    var onOpenWorkspace: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label(title, systemImage: systemImage)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+            HStack {
+                Label(title, systemImage: systemImage)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if onOpenWorkspace != nil {
+                    Button {
+                        onOpenWorkspace?()
+                    } label: {
+                        Label("查看上下文", systemImage: "tray.full")
+                            .font(.caption2.weight(.semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.tint)
+                    .accessibilityLabel("打开上下文面板")
+                }
+            }
 
             if !text.isEmpty {
                 Text(text)
@@ -3059,7 +3078,7 @@ private struct SubmissionContextStrip: View {
 
             if !state.lastTurnMemories.isEmpty {
                 Divider()
-                ContextRetrievedMemorySection(memories: state.lastTurnMemories)
+                ContextRetrievedMemorySection(state: state)
             }
         }
         .padding(10)
@@ -3071,7 +3090,20 @@ private struct SubmissionContextStrip: View {
 /// Shows the durable memories the server semantically retrieved into the latest answer,
 /// each with its score breakdown — the concrete answer to "which memories entered this turn".
 private struct ContextRetrievedMemorySection: View {
-    let memories: [RetrievedMemory]
+    @ObservedObject var state: AppState
+
+    /// 命中记忆的真相源：本轮 manifest（来自 context_trace）；无 manifest 时回退 lastTurnMemories。
+    private var memories: [RetrievedMemory] {
+        state.lastTurnManifest?.retrievedMemories ?? state.lastTurnMemories
+    }
+
+    /// 空态/降级态（MUST-4）：区分「已关闭」「暂无相关」「首轮未问」。
+    private var emptyStateText: String? {
+        if !memories.isEmpty { return nil }
+        if !state.contextInclusionSettings.memory { return "你已关闭长期记忆，本轮未调用任何记忆。" }
+        if state.lastTurnManifest != nil { return "暂无与本轮问题相关的记忆。" }
+        return "本轮未调用长期记忆（先提问，问答后这里显示命中的记忆）。"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -3084,12 +3116,19 @@ private struct ContextRetrievedMemorySection: View {
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
 
-            Text("服务器按 语义+新近度+重要性 检索；「常驻」= 始终带入的偏好/目标/习惯。")
+            Text("服务器按 语义+新近度+重要性 检索；「常驻」= 始终带入的偏好/目标/习惯。关掉某条 → 下一轮不带入（且不计入使用次数）。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
+            if let emptyStateText {
+                Text(emptyStateText)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             ForEach(memories) { memory in
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         Text(memory.kindLabel)
                             .font(.caption2.weight(.semibold))
@@ -3104,13 +3143,61 @@ private struct ContextRetrievedMemorySection: View {
                         Text(memory.isPersona ? "常驻" : String(format: "%.2f", memory.score ?? 0))
                             .font(.caption2.weight(.semibold).monospacedDigit())
                             .foregroundStyle(memory.isPersona ? Color.purple : Color.accentColor)
+                        // 逐条开关：写 memoryOverrides，下一轮进 memory_excludes。
+                        Toggle("", isOn: Binding(
+                            get: { !state.memoryOverrides.contains(memory.id) },
+                            set: { isOn in
+                                if isOn { state.memoryOverrides.remove(memory.id) }
+                                else { state.memoryOverrides.insert(memory.id) }
+                            }
+                        ))
+                        .labelsHidden()
+                        .scaleEffect(0.72)
+                        .frame(width: 40)
                     }
                     if !memory.isPersona {
-                        Text(String(format: "语义 %.2f · 新近 %.2f · 重要 %.2f · 用过 %.2f",
-                                    memory.semantic, memory.recency, memory.importance, memory.usage))
-                            .font(.system(size: 9).monospacedDigit())
-                            .foregroundStyle(.tertiary)
+                        MemoryBreakdownBars(memory: memory)
                     }
+                    if state.memoryOverrides.contains(memory.id) {
+                        Text("已关闭 · 下一轮不带入")
+                            .font(.system(size: 9).weight(.semibold))
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 4 维相关度条：语义/新近/重要/用过，直观展示记忆为何被检索（含数值）。
+private struct MemoryBreakdownBars: View {
+    let memory: RetrievedMemory
+
+    private var rows: [(String, Double)] {
+        [("语义", memory.semantic), ("新近", memory.recency), ("重要", memory.importance), ("用过", memory.usage)]
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(rows, id: \.0) { row in
+                HStack(spacing: 5) {
+                    Text(row.0)
+                        .font(.system(size: 9).monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 22, alignment: .leading)
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Color(.tertiarySystemBackground))
+                            Capsule()
+                                .fill(Color.accentColor.opacity(0.55))
+                                .frame(width: max(0, min(1, row.1)) * geo.size.width)
+                        }
+                    }
+                    .frame(height: 4)
+                    Text(String(format: "%.2f", row.1))
+                        .font(.system(size: 9).monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 28, alignment: .trailing)
                 }
             }
         }
@@ -3731,7 +3818,7 @@ private struct ActivityLogPanel: View {
     }
 }
 
-private struct ContextWorkspaceSheet: View {
+struct ContextWorkspaceSheet: View {
     @ObservedObject var state: AppState
     let draft: String
     let onClose: () -> Void
@@ -3930,26 +4017,86 @@ private struct ContextWorkspaceOverviewTab: View {
     let draft: String
     let contextItems: [ContextBadgeItem]
 
+    /// 真相源：本轮已发送的通道（来自 context_trace）；首轮/无 manifest 时回退到提交前的猜测。
+    private var displayItems: [ContextBadgeItem] {
+        if let manifest = state.lastTurnManifest, !manifest.sentItems.isEmpty {
+            return manifest.sentItems
+        }
+        return contextItems
+    }
+
+    private var usingTurnTruth: Bool {
+        (state.lastTurnManifest?.sentItems.isEmpty == false)
+    }
+
     var body: some View {
         ChatSettingsPanel(state: state)
 
-        ContextSectionCard(title: "将带上的上下文", systemImage: "tray.full") {
-            if contextItems.isEmpty {
-                Text("暂无上下文")
+        ContextSectionCard(title: usingTurnTruth ? "本轮实际带上的上下文" : "将带上的上下文", systemImage: "tray.full") {
+            if displayItems.isEmpty {
+                Text(usingTurnTruth ? "本轮未带任何上下文" : "暂无上下文（先提问，问答后这里显示本轮真实通道）")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
                 VStack(spacing: 8) {
-                    ForEach(contextItems) { item in
-                        ContextWorkspaceRow(item: item, compact: true)
+                    ForEach(displayItems) { item in
+                        ContextWorkspaceToggleRow(state: state, item: item)
                     }
                 }
             }
         }
 
+        ContextSectionCard(title: "本轮带入的长期记忆", systemImage: "brain.head.profile") {
+            ContextRetrievedMemorySection(state: state)
+        }
+
         ContextSectionCard(title: "使用策略", systemImage: "flowchart") {
             SelectableTextBlock(text: state.contextUsePolicyPreview(draft: draft), lineLimit: 8)
         }
+    }
+}
+
+/// 概览页每行：图标 + 标题 + reason 副标题，可切换的通道带类级 Toggle（下一轮生效）。
+private struct ContextWorkspaceToggleRow: View {
+    @ObservedObject var state: AppState
+    let item: ContextBadgeItem
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: item.systemImage)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(item.tone.color)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(item.title)
+                    .font(.caption.weight(.semibold))
+                if !item.detail.isEmpty {
+                    Text(item.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let reason = item.reason, !reason.isEmpty {
+                    Text(reason)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 8)
+            if let keyPath = state.inclusionKeyPath(forBadgeId: item.id) {
+                Toggle("", isOn: Binding(
+                    get: { state.contextInclusionSettings[keyPath: keyPath] },
+                    set: { state.updateContextInclusion(keyPath, to: $0) }
+                ))
+                .labelsHidden()
+            }
+        }
+        .padding(9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(item.tone.color.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 }
 
@@ -4620,6 +4767,20 @@ struct ContextBadgeItem: Identifiable, Equatable {
     let systemImage: String
     let tone: CaptureQualityTone
     var fullDetail: String? = nil
+    /// "为何这一类上下文被本轮调用" — client-generated explanation (CUT-6: not from backend).
+    var reason: String? = nil
+}
+
+/// The single source of truth for "what this turn actually carried", reconciled from the
+/// server's `context_trace` after the answer returns (MUST-5: fixes the one-turn lag).
+/// Deliberately holds only the current turn — no per-turn history dictionary (CUT-2).
+struct TurnContextManifest {
+    let id: UUID
+    let turn: Int
+    var sentItems: [ContextBadgeItem]
+    var retrievedMemories: [RetrievedMemory]
+    var usedImageContext: Bool
+    var imageContextMode: String
 }
 
 /// A durable memory the server retrieved (semantically) into the most recent QA turn,
@@ -6030,6 +6191,10 @@ final class AppState: ObservableObject {
     @Published var lastSubmittedContextItems: [ContextBadgeItem] = []
     /// Memories the server semantically retrieved into the most recent answer (with score breakdown).
     @Published var lastTurnMemories: [RetrievedMemory] = []
+    /// Reconciled truth for the current turn (from server `context_trace`); the panel reads this.
+    @Published var lastTurnManifest: TurnContextManifest?
+    /// Memory ids the user turned off for the *next* turn; sent as `memory_excludes`.
+    @Published var memoryOverrides: Set<String> = []
     @Published var textOnlyQuestion: Bool = {
         #if DEBUG
         if ProcessInfo.processInfo.environment["XUE_TEXT_ONLY"] == "1" { return true }
@@ -6558,6 +6723,24 @@ final class AppState: ObservableObject {
 
     func setContextDebugEnabled(_ enabled: Bool) {
         updateContextInclusion(\.debug, to: enabled)
+    }
+
+    /// Maps a trace-derived badge (id == "trace-<channel>") to its class-level inclusion
+    /// keypath, so the panel can offer a per-row toggle that flows through the single
+    /// write entry point `updateContextInclusion` (二期 NL 配置同源)。Returns nil for
+    /// non-toggleable rows (e.g. the question itself).
+    func inclusionKeyPath(forBadgeId id: String) -> WritableKeyPath<ContextInclusionSettings, Bool>? {
+        guard id.hasPrefix("trace-") else { return nil }
+        switch String(id.dropFirst("trace-".count)) {
+        case "visual": return \.visual
+        case "observation": return \.observation
+        case "history": return \.history
+        case "mistakes": return \.mistakes
+        case "knowledge": return \.knowledge
+        case "memory": return \.memory
+        case "strategy": return \.strategy
+        default: return nil
+        }
     }
 
     private func contextAssetKindEnabled(_ kind: String) -> Bool {
@@ -7899,6 +8082,7 @@ final class AppState: ObservableObject {
         qaAnswer = ""
         chatMessages.removeAll()
         lastSubmittedContextItems.removeAll()
+        lastTurnManifest = nil
         activeReviewItem = nil
         if shouldResetReviewContext {
             studentGoal = ""
@@ -8815,6 +8999,120 @@ final class AppState: ObservableObject {
         return attachments
     }
 
+    // MARK: - 上下文真相源 finalize（I-3）
+
+    /// 客户端为每个通道生成的「为何被调用」说明（CUT-6：不依赖后端 why）。
+    private func contextChannelReason(_ key: String) -> String {
+        switch key {
+        case "visual": return "本轮带上了当前画面/题图，用于看清题目"
+        case "history": return "携带了本轮对话历史，保持追问连贯"
+        case "mistakes": return "结合了相关错题/复习内容"
+        case "knowledge": return "命中了相关知识点"
+        case "memory": return "按语义+新近度+重要性检索到的长期记忆"
+        case "observation": return "结合了后台智能观察的画面"
+        case "strategy": return "带上了你的辅导偏好与动态策略"
+        default: return ""
+        }
+    }
+
+    private func contextChannelMeta(_ key: String) -> (title: String, systemImage: String) {
+        switch key {
+        case "visual": return ("画面", "photo")
+        case "history": return ("对话历史", "bubble.left.and.bubble.right")
+        case "mistakes": return ("错题复习", "book.closed")
+        case "knowledge": return ("知识点", "lightbulb")
+        case "memory": return ("长期记忆", "brain.head.profile")
+        case "observation": return ("智能观察", "rectangle.stack")
+        case "strategy": return ("动态策略", "slider.horizontal.3")
+        default: return (key, "tray.full")
+        }
+    }
+
+    /// 把后端 `context_trace.channels` 重建为本轮真实徽章（仅 included 的通道）。
+    private func badges(fromTrace trace: [String: Any]?) -> [ContextBadgeItem] {
+        guard let channels = trace?["channels"] as? [[String: Any]] else { return [] }
+        var items: [ContextBadgeItem] = []
+        for channel in channels {
+            guard let key = channel["key"] as? String,
+                  (channel["included"] as? Bool) == true else { continue }
+            let meta = contextChannelMeta(key)
+            let detail = channel["detail"] as? [String: Any] ?? [:]
+            var detailText = ""
+            switch key {
+            case "visual":
+                let mode = (detail["mode"] as? String) ?? ""
+                detailText = mode.isEmpty ? "已带上画面" : "模式：\(mode)"
+            case "history":
+                if let chars = detail["chars"] as? Int { detailText = "约 \(chars) 字" }
+            case "mistakes":
+                if let count = detail["count"] as? Int { detailText = "\(count) 条" }
+            case "knowledge":
+                if let hits = detail["semantic_hits"] as? [[String: Any]] { detailText = "命中 \(hits.count) 条" }
+            case "memory":
+                let mems = detail["memories"] as? [[String: Any]] ?? []
+                detailText = "\(mems.count) 条（语义检索）"
+            case "strategy":
+                detailText = "偏好/策略已带上"
+            default:
+                detailText = ""
+            }
+            items.append(ContextBadgeItem(
+                id: "trace-\(key)",
+                title: meta.title,
+                detail: detailText,
+                systemImage: meta.systemImage,
+                tone: .neutral,
+                reason: contextChannelReason(key)
+            ))
+        }
+        return items
+    }
+
+    /// 收到 QA 响应后用 `context_trace` finalize 本轮真相（修「滞后一轮」，MUST-5）。
+    /// 重建本轮徽章与命中记忆，写 `lastTurnManifest`，并回挂到对应 status 消息的 contextItems。
+    private func finalizeTurnContext(
+        trace: [String: Any]?,
+        fallbackMemories: [RetrievedMemory],
+        turn: Int,
+        usedImageContext: Bool,
+        imageContextMode: String
+    ) {
+        // 命中记忆：优先用 trace 的 memory 通道（含 breakdown），否则回退 agent_memories。
+        var memories = fallbackMemories
+        if let channels = trace?["channels"] as? [[String: Any]],
+           let memoryChannel = channels.first(where: { ($0["key"] as? String) == "memory" }),
+           let detail = memoryChannel["detail"] as? [String: Any] {
+            let parsed = RetrievedMemory.list(from: detail["memories"])
+            if (memoryChannel["included"] as? Bool) == true || !parsed.isEmpty {
+                memories = parsed
+            } else {
+                memories = []
+            }
+        }
+        lastTurnMemories = memories
+
+        let traceBadges = badges(fromTrace: trace)
+        // trace 为空（旧后端/降级）时回退到提交前已记录的徽章，保证不空白。
+        let sentItems = traceBadges.isEmpty ? lastSubmittedContextItems : traceBadges
+        lastSubmittedContextItems = sentItems
+
+        let manifest = TurnContextManifest(
+            id: UUID(),
+            turn: turn,
+            sentItems: sentItems,
+            retrievedMemories: memories,
+            usedImageContext: usedImageContext,
+            imageContextMode: imageContextMode
+        )
+        lastTurnManifest = manifest
+
+        // 回挂到最近一条「随本次发送」status 消息，让那条徽章显示真实通道（而非提交前猜测）。
+        if !sentItems.isEmpty,
+           let index = chatMessages.lastIndex(where: { $0.role == .status && !$0.contextItems.isEmpty && ($0.title ?? "") == "随本次发送" }) {
+            chatMessages[index].contextItems = sentItems
+        }
+    }
+
     func longTermInstructionDidChange() {
         UserDefaults.standard.set(trimmedLongTermInstruction, forKey: longTermInstructionDefaultsKey)
     }
@@ -9263,7 +9561,13 @@ final class AppState: ObservableObject {
             let imageContextMode = (json?["image_context_mode"] as? String) ?? (image != nil ? "current_frame" : "text_only")
             qaTurnIndex = currentTurn
             qaAnswer = answer
-            lastTurnMemories = RetrievedMemory.list(from: json?["agent_memories"])
+            finalizeTurnContext(
+                trace: json?["context_trace"] as? [String: Any],
+                fallbackMemories: RetrievedMemory.list(from: json?["agent_memories"]),
+                turn: currentTurn,
+                usedImageContext: usedImageContext,
+                imageContextMode: imageContextMode
+            )
             appendAssistantChatMessage(
                 answer,
                 question: question,
@@ -9532,6 +9836,10 @@ final class AppState: ObservableObject {
             ]
         }
         payload["device_interaction_presence"] = userOperationPresencePayload()
+        // Per-memory opt-outs for this turn (I-4): backend filters these before mark_used (B-2).
+        if !memoryOverrides.isEmpty {
+            payload["memory_excludes"] = Array(memoryOverrides)
+        }
         return payload
     }
 

@@ -14,6 +14,7 @@ struct iPadLearnView: View {
     @State private var inputMode: iPadInputMode = .text
     @State private var previewAttachment: ChatAttachment?
     @State private var contextDetail: ContextBadgeItem?
+    @State private var showContextWorkspace = false
     @FocusState private var composerFocused: Bool
 
     var body: some View {
@@ -42,6 +43,14 @@ struct iPadLearnView: View {
         }
         .sheet(item: $previewAttachment) { iPadAttachmentPreview(attachment: $0) }
         .sheet(item: $contextDetail) { iPadContextDetailSheet(item: $0) }
+        .sheet(isPresented: $showContextWorkspace) {
+            // 两端共用同一上下文面板（MUST-8：iPad 不做三栏 inspector）。
+            ContextWorkspaceSheet(state: state, draft: draft) {
+                showContextWorkspace = false
+            }
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+        }
     }
 
     // MARK: 工具栏
@@ -237,7 +246,11 @@ struct iPadLearnView: View {
             )
         case .status:
             if !message.contextItems.isEmpty {
-                iPadContextStatusRow(message: message) { contextDetail = $0 }
+                iPadContextStatusRow(
+                    message: message,
+                    onTap: { contextDetail = $0 },
+                    onOpenWorkspace: { showContextWorkspace = true }
+                )
             } else {
                 AssistantTextBubble(
                     title: message.title ?? "状态",
@@ -321,6 +334,7 @@ struct iPadLearnView: View {
 struct iPadContextStatusRow: View {
     let message: ChatMessage
     let onTap: (ContextBadgeItem) -> Void
+    var onOpenWorkspace: (() -> Void)? = nil
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -329,9 +343,23 @@ struct iPadContextStatusRow: View {
                 .foregroundStyle(.tint)
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 8) {
-                Text(message.title ?? "随本次发送")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                HStack {
+                    Text(message.title ?? "随本次发送")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if onOpenWorkspace != nil {
+                        Button {
+                            onOpenWorkspace?()
+                        } label: {
+                            Label("查看上下文", systemImage: "tray.full")
+                                .font(.caption2.weight(.semibold))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.tint)
+                        .accessibilityLabel("打开上下文面板")
+                    }
+                }
                 if !message.text.isEmpty {
                     Text(message.text)
                         .font(.callout)

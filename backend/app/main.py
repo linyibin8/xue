@@ -2344,6 +2344,133 @@ def qa_prompt_context(context: dict, *, current_image_rejected: bool) -> dict:
     return prompt_context
 
 
+def build_context_trace(
+    *,
+    prompt_context: dict,
+    context_payload: dict,
+    student_intent: str,
+    turn: int,
+    image_filename: str,
+    image_id: str,
+    image_context_mode: str,
+    current_image_rejected: bool,
+    retrieved_memories: list,
+    memory_gated_off: bool,
+) -> dict:
+    """Read-only observability side-channel: a per-turn snapshot of *which context
+    channels the prompt actually carried* and the durable-memory score breakdown.
+
+    Pure: derives everything from already-computed turn signals, mutates nothing, and
+    never affects the answer. `included` = "this channel made it into this turn's prompt"
+    (inferred from the assembled `prompt_context`, which only contains a channel's keys
+    when the client did not toggle it off). No `requested` dimension, no subject field
+    (MUST-2 / MUST-7). New top-level QA key; old clients ignore it."""
+    ctx = prompt_context if isinstance(prompt_context, dict) else {}
+    raw = context_payload if isinstance(context_payload, dict) else {}
+
+    # visual: a frame was actually selected into the prompt for this turn.
+    visual_included = bool(image_filename)
+    visual_detail: dict = {}
+    if visual_included or current_image_rejected:
+        visual_detail = {
+            "image_id": image_id or "",
+            "filename": image_filename or "",
+            "mode": image_context_mode or "",
+            "rejected": bool(current_image_rejected),
+        }
+
+    # history: carried conversation context present in the prompt.
+    history_text = ctx.get("carried_history_context")
+    if isinstance(history_text, dict):
+        history_chars = len(str(history_text.get("text") or json_dumps(history_text)))
+    else:
+        history_chars = len(str(history_text or ""))
+    history_included = bool(history_text)
+
+    # mistakes: review context carried for this turn.
+    mistakes_assets = [
+        a for a in (ctx.get("structured_context_assets") or [])
+        if isinstance(a, dict) and a.get("kind") == "mistake"
+    ]
+    mistakes_included = bool(ctx.get("review_context")) or bool(mistakes_assets)
+    mistakes_count = len(mistakes_assets) + (1 if ctx.get("review_context") else 0)
+
+    # knowledge: semantic knowledge hits attached server-side this turn.
+    semantic_knowledge = ctx.get("semantic_knowledge") if isinstance(ctx.get("semantic_knowledge"), list) else []
+    knowledge_assets = [
+        a for a in (ctx.get("structured_context_assets") or [])
+        if isinstance(a, dict) and a.get("kind") == "knowledge"
+    ]
+    knowledge_included = bool(semantic_knowledge) or bool(knowledge_assets)
+    knowledge_hits = [
+        {
+            "kind": str(h.get("kind") or ""),
+            "score": h.get("score"),
+            "preview": truncate_text(str(h.get("text") or ""), 80),
+        }
+        for h in semantic_knowledge[:5]
+        if isinstance(h, dict)
+    ]
+
+    # memory: durable agent memories retrieved for this turn (with breakdown).
+    memory_list = retrieved_memories if isinstance(retrieved_memories, list) else []
+    memory_items = [
+        {
+            "id": str(m.get("id") or ""),
+            "kind": str(m.get("kind") or ""),
+            "text": truncate_text(str(m.get("text") or ""), 120),
+            "score": m.get("score"),
+            "breakdown": m.get("breakdown") if isinstance(m.get("breakdown"), dict) else {},
+        }
+        for m in memory_list
+        if isinstance(m, dict) and m.get("text")
+    ]
+    memory_included = (not memory_gated_off) and bool(memory_items)
+
+    # observation: background observation context carried this turn.
+    observation = ctx.get("observation_context") if isinstance(ctx.get("observation_context"), dict) else {}
+    observation_included = bool(observation)
+
+    # strategy: dynamic strategy / coach preference carried this turn.
+    # 只用受开关约束的 dynamic_strategy 判定 included；strategy_context 恒在顶层不能作依据(否则关策略仍误报)
+    strategy_included = bool(ctx.get("dynamic_strategy"))
+
+    return {
+        "version": 1,
+        "turn": turn,
+        "student_intent": student_intent,
+        "channels": [
+            {"key": "visual", "included": visual_included, "detail": visual_detail},
+            {"key": "history", "included": history_included, "detail": {"chars": history_chars} if history_included else {}},
+            {"key": "mistakes", "included": mistakes_included, "detail": {"count": mistakes_count} if mistakes_included else {}},
+            {"key": "knowledge", "included": knowledge_included, "detail": {"semantic_hits": knowledge_hits} if knowledge_included else {}},
+            {
+                "key": "memory",
+                "included": memory_included,
+                "detail": {
+                    "gated_off": bool(memory_gated_off),
+                    "weights": {
+                        "semantic": memory_store.W_SEMANTIC,
+                        "recency": memory_store.W_RECENCY,
+                        "importance": memory_store.W_IMPORTANCE,
+                        "usage": memory_store.W_USAGE,
+                    },
+                    "memories": [] if memory_gated_off else memory_items,
+                },
+            },
+            {"key": "observation", "included": observation_included, "detail": {} if not observation_included else {"frames": observation.get("buffered_frame_count") or 0}},
+            {
+                "key": "strategy",
+                "included": strategy_included,
+                "detail": {
+                    "learning_mode": raw.get("learning_mode") or None,
+                    "coach_depth": raw.get("coach_depth") or None,
+                } if strategy_included else {},
+            },
+        ],
+    }
+
+
 def dynamic_strategy_context(
     session: dict,
     context: dict,
@@ -9200,14 +9327,48 @@ async def ask_session_question(
                 prompt_context_payload["semantic_knowledge"] = relevant
     except Exception:
         pass
+    # Memory gate (B-2): the client may turn long-term memory off for this turn
+    # (context_inclusion.memory == false), or exclude individual memories by id
+    # (memory_excludes). Off -> skip retrieval entirely (so nothing is mark_used);
+    # otherwise retrieve but never mark_used the excluded ids. Old clients omit both
+    # keys -> full retrieval, unchanged behaviour.
+    inclusion = context_payload.get("context_inclusion")
+    memory_enabled = True
+    if isinstance(inclusion, dict) and inclusion.get("memory") is False:
+        memory_enabled = False
+    memory_excludes = context_payload.get("memory_excludes")
+    exclude_ids = {str(x) for x in memory_excludes if isinstance(x, (str, int))} if isinstance(memory_excludes, list) else set()
     retrieved_memories: list = []
+    if memory_enabled:
+        try:
+            retrieved_memories = await memory_store.retrieve_for_turn(
+                cleaned_question,
+                account_id=principal["account_id"],
+                exclude_ids=exclude_ids,
+            )
+            if retrieved_memories:
+                prompt_context_payload = dict(prompt_context_payload)
+                prompt_context_payload["agent_memories"] = retrieved_memories
+        except Exception:
+            retrieved_memories = []
+    # Read-only observability trace of this turn's assembled context (B-1). Computed
+    # once from the final prompt context so both the success and failure returns can
+    # surface it. Failure here must never break QA, so it is best-effort.
     try:
-        retrieved_memories = await memory_store.retrieve_for_turn(cleaned_question, account_id=principal["account_id"])
-        if retrieved_memories:
-            prompt_context_payload = dict(prompt_context_payload)
-            prompt_context_payload["agent_memories"] = retrieved_memories
+        context_trace = build_context_trace(
+            prompt_context=prompt_context_payload,
+            context_payload=context_payload,
+            student_intent=student_intent,
+            turn=qa_turn_index(context_payload),
+            image_filename=image_filename or "",
+            image_id=image_id or "",
+            image_context_mode=image_context_mode,
+            current_image_rejected=current_image_rejected,
+            retrieved_memories=retrieved_memories,
+            memory_gated_off=not memory_enabled,
+        )
     except Exception:
-        retrieved_memories = []
+        context_trace = {}
     prompt = build_qa_prompt(
         session,
         question=cleaned_question,
@@ -9317,6 +9478,7 @@ async def ask_session_question(
             "student_intent": student_intent,
             "dialog_state": context_payload.get("dialog_state", {}),
             "agent_memories": retrieved_memories,
+            "context_trace": context_trace,
         }
     except Exception as exc:
         answer = f"AI 问答失败：{llm.format_llm_error(exc)}"
@@ -9337,6 +9499,7 @@ async def ask_session_question(
             "frame_quality": uploaded_frame_quality or client_rejected_frame_quality or {},
             "student_intent": student_intent,
             "dialog_state": context_payload.get("dialog_state", {}),
+            "context_trace": context_trace,
         }
 
 
