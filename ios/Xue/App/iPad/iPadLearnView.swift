@@ -20,7 +20,7 @@ struct iPadLearnView: View {
         NavigationStack {
             HStack(spacing: 0) {
                 captureColumn
-                    .frame(width: 360)
+                    .frame(width: 320)
                     .background(Color(.secondarySystemBackground))
                 Divider()
                 conversationColumn
@@ -32,6 +32,9 @@ struct iPadLearnView: View {
         }
         .task {
             if state.sessionId == nil { state.startNewConversation() }
+            #if DEBUG
+            state.debugSeedChatIfRequested()
+            #endif
         }
         .onDisappear {
             if !state.isBursting { state.hideInlineCameraPreview() }
@@ -152,8 +155,8 @@ struct iPadLearnView: View {
                             thinkingRow.id("thinking-indicator")
                         }
                     }
-                    .padding(20)
-                    .frame(maxWidth: 760, alignment: .leading)
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 18)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .onChange(of: state.chatMessages.count) { _ in scrollToBottom(proxy) }

@@ -39,6 +39,9 @@ struct iPadRootView: View {
 
     init() {
         #if DEBUG
+        if ProcessInfo.processInfo.environment["XUE_IPAD_COLLAPSE"] == "1" {
+            _columnVisibility = State(initialValue: .detailOnly)
+        }
         if let s = ProcessInfo.processInfo.environment["XUE_IPAD_SECTION"],
            let sec = iPadSection(rawValue: s) {
             _section = State(initialValue: sec)

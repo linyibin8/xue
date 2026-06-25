@@ -1891,6 +1891,12 @@ private struct CollapsedVoiceButton: View {
     }
 }
 
+enum VoiceHoldAction: Equatable {
+    case sendWithPhoto   // 默认：捎带当前照片
+    case sendTextOnly    // 上滑一点：只纯文字
+    case cancel          // 上滑更多：取消
+}
+
 struct VoiceHoldArea: View {
     @ObservedObject var state: AppState
     var allowsCollapse = true
@@ -1905,9 +1911,18 @@ struct VoiceHoldArea: View {
     @State private var lastQuickTapAt: Date?
     @State private var quickTapHintVisible = false
     @State private var cancelOnRelease = false
+    @State private var holdAction: VoiceHoldAction = .sendWithPhoto
 
     private var disabled: Bool {
         state.voiceInputDisabled
+    }
+
+    private var debugForceVoiceMenu: Bool {
+        #if DEBUG
+        return ProcessInfo.processInfo.environment["XUE_FORCE_VOICE_MENU"] == "1"
+        #else
+        return false
+        #endif
     }
 
     var body: some View {
@@ -1918,6 +1933,13 @@ struct VoiceHoldArea: View {
                     transcript: state.recognizedText
                 )
                 .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+
+            if (pressActive && holdStarted) || debugForceVoiceMenu {
+                VoiceHoldOptionsMenu(active: debugForceVoiceMenu ? .sendTextOnly : holdAction)
+                    .padding(.bottom, 52)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+                    .animation(.easeOut(duration: 0.12), value: holdAction)
             }
 
             HStack(spacing: 8) {
@@ -2103,10 +2125,14 @@ struct VoiceHoldArea: View {
                     pressActive = true
                     quickTapHintVisible = false
                     cancelOnRelease = false
+                    holdAction = .sendWithPhoto
                     pressBeganAt = Date()
                     scheduleHoldStart()
                 }
-                cancelOnRelease = value.translation.height < -42
+                // 上滑分三档：默认捎带照片 → 只纯文字 → 取消
+                let h = value.translation.height
+                holdAction = h <= -150 ? .cancel : (h <= -70 ? .sendTextOnly : .sendWithPhoto)
+                cancelOnRelease = (holdAction == .cancel)
             }
             .onEnded { _ in
                 cancelPendingHoldStart()
@@ -2118,12 +2144,13 @@ struct VoiceHoldArea: View {
                 if holdStarted {
                     holdStarted = false
                     lastQuickTapAt = nil
-                    if cancelOnRelease {
-                        state.cancelHoldToTalk()
-                    } else {
-                        state.endHoldToTalk()
+                    switch holdAction {
+                    case .cancel: state.cancelHoldToTalk()
+                    case .sendTextOnly: state.endHoldToTalk(textOnly: true)
+                    case .sendWithPhoto: state.endHoldToTalk()
                     }
                     cancelOnRelease = false
+                    holdAction = .sendWithPhoto
                 } else {
                     handleQuickTap(endedAt: endedAt, pressDuration: pressDuration)
                 }
@@ -2215,8 +2242,12 @@ struct VoiceHoldArea: View {
     }
 
     private var labelText: String {
-        if cancelOnRelease {
-            return "松手取消"
+        if pressActive && holdStarted {
+            switch holdAction {
+            case .cancel: return "松手取消"
+            case .sendTextOnly: return "松手只发文字"
+            case .sendWithPhoto: return "上滑可选 · 松手发送"
+            }
         }
         if quickTapHintVisible {
             return "再点发送画面"
@@ -2234,6 +2265,47 @@ struct VoiceHoldArea: View {
             return "等待回答"
         }
         return state.isListening || state.isPreparingVoiceInput ? "松开发送当前画面" : "按住说话"
+    }
+}
+
+// 长按语音上滑出现的选项菜单：取消 / 只纯文字 / 捎带当前照片（高亮当前选中档）
+private struct VoiceHoldOptionsMenu: View {
+    let active: VoiceHoldAction
+
+    var body: some View {
+        VStack(spacing: 6) {
+            row(.cancel, "取消", "xmark.circle.fill", .red)
+            row(.sendTextOnly, "只发文字", "text.bubble.fill", .blue)
+            row(.sendWithPhoto, "捎带当前照片", "camera.fill", .accentColor)
+        }
+        .padding(8)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color(.separator).opacity(0.35), lineWidth: 1))
+        .shadow(color: .black.opacity(0.18), radius: 10, y: 3)
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+
+    private func row(_ a: VoiceHoldAction, _ title: String, _ icon: String, _ tint: Color) -> some View {
+        let on = active == a
+        return HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.subheadline)
+                .foregroundStyle(on ? Color.white : tint)
+                .frame(width: 22)
+            Text(title)
+                .font(.subheadline.weight(on ? .bold : .regular))
+                .foregroundStyle(on ? Color.white : Color.primary)
+            Spacer(minLength: 6)
+            if on {
+                Image(systemName: "hand.point.up.left.fill")
+                    .font(.caption)
+                    .foregroundStyle(Color.white)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .frame(width: 200)
+        .background(on ? tint : Color.clear, in: RoundedRectangle(cornerRadius: 10))
     }
 }
 
@@ -7457,8 +7529,11 @@ final class AppState: ObservableObject {
         beginListening()
     }
 
+    private var pendingVoiceTextOnly = false
+
     func beginHoldToTalk() {
         guard !voiceInputDisabled else { return }
+        pendingVoiceTextOnly = false
         suppressObservationDanmakuBriefly()
         recordUserOperation("hold_to_talk")
         if continuousVoiceActive {
@@ -7505,13 +7580,19 @@ final class AppState: ObservableObject {
         }
     }
 
-    func endHoldToTalk() {
+    func endHoldToTalk(textOnly: Bool = false) {
         suppressObservationDanmakuBriefly(seconds: 4.0)
         if isPreparingVoiceInput {
             cancelHoldToTalk()
             return
         }
         guard isListening else { return }
+        // 上滑选了「只纯文字」：本次语音提交不带当前画面
+        pendingVoiceTextOnly = textOnly
+        if textOnly {
+            cameraTaskKind = .none
+            cameraPreviewVisible = false
+        }
         holdToTalkActive = false
         scheduleVoiceSubmitAfterRecognitionGrace(maxWait: 3.4)
     }
@@ -7571,6 +7652,22 @@ final class AppState: ObservableObject {
         UserDefaults.standard.set(on, forKey: textOnlyQuestionDefaultsKey)
         log(on ? "纯文字提问已开启：打字提问不再开相机" : "纯文字提问已关闭：打字提问会结合当前画面")
     }
+
+    #if DEBUG
+    // 仅 DEBUG：注入示例对话，便于布局/截图回归（无网络、无相机）
+    func debugSeedChatIfRequested() {
+        guard ProcessInfo.processInfo.environment["XUE_SEED_CHAT"] == "1", chatMessages.isEmpty else { return }
+        chatMessages = [
+            ChatMessage(role: .user, text: "请讲解：一个长方形长8宽5，面积和周长各是多少？另外正方形和长方形有什么区别？"),
+            ChatMessage(role: .assistant,
+                        text: "好的，我们一步一步来看这道题。\n\n【面积】长方形面积 = 长 × 宽 = 8 × 5 = 40（平方单位）。\n【周长】长方形周长 = (长 + 宽) × 2 = (8 + 5) × 2 = 26（长度单位）。\n\n正方形是四条边都相等的特殊长方形；长方形对边相等、相邻边不一定相等。要点：面积是“铺满平面”的大小，周长是“绕一圈”的长度，两者单位不同，别混淆。\n\n再来一道变式题练练手：如果一个长方形的周长是 30，宽是 6，那么它的长是多少？试着先自己算一算。",
+                        question: "请讲解长方形面积和周长",
+                        visualizationCandidate: true,
+                        visualizationReason: "适合用图形演示长与宽")
+        ]
+        qaTurnIndex = 1
+    }
+    #endif
 
     func voicePlaybackEnabledDidChange(_ enabled: Bool) {
         let savedEnabled = UserDefaults.standard.object(forKey: voicePlaybackEnabledDefaultsKey) as? Bool
@@ -8262,6 +8359,10 @@ final class AppState: ObservableObject {
         }
         // 纯文字提问：打字/快捷追问不抓画面（语音、拍题、观察不受影响）
         if textOnlyQuestion && (pendingQATrigger == "typed_chat" || pendingQATrigger.hasPrefix("quick_followup")) {
+            return false
+        }
+        // 长按语音上滑选了「只纯文字」：本次不抓画面
+        if pendingVoiceTextOnly && pendingQATrigger.hasPrefix("hold_to_talk") {
             return false
         }
         if pendingQATrigger == "review_today" {
