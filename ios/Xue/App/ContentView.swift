@@ -1901,6 +1901,7 @@ struct VoiceHoldArea: View {
     @ObservedObject var state: AppState
     var allowsCollapse = true
     var transparentSurface = false
+    var pressHeight: CGFloat = 32
     var onBegin: () -> Void = {}
     var onCollapse: () -> Void = {}
     @State private var pressActive = false
@@ -1977,7 +1978,7 @@ struct VoiceHoldArea: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(.horizontal, 8)
-            .frame(height: 32)
+            .frame(height: pressHeight)
             .frame(maxWidth: .infinity)
             .background(pressActive ? Color.accentColor.opacity(0.18) : Color(.systemBackground).opacity(transparentSurface ? 0.18 : 0.0))
             .clipShape(RoundedRectangle(cornerRadius: 7))
@@ -7246,31 +7247,67 @@ final class AppState: ObservableObject {
         stopSpeaking()
         stopListening(submit: false)
         completePendingQAFrame(nil)
-        let context: HistoryCarryContext
+        var detail: [String: Any] = [:]
         do {
             let data = try await getData(path: "/api/sessions/\(session.id)")
-            let object = (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-            context = makeHistoryCarryContext(summary: session, detail: object)
+            detail = (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
         } catch {
             log("历史回合详情读取失败，使用列表摘要：\(networkErrorDescription(error))", level: "error")
-            context = makeHistoryCarryContext(summary: session, detail: [:])
         }
+        let context = makeHistoryCarryContext(summary: session, detail: detail)
         startNewConversation()
         carriedHistoryContext = context
         studentGoal = "接着历史回合：\(context.title)"
         lastSubmittedContextItems = [context.badge]
+        // 进入历史是「回看+接着聊」，不主动开相机
         if cameraTaskKind != .burst {
-            cameraTaskKind = .qaFrame
+            cameraTaskKind = .none
+            cameraPreviewVisible = false
         }
-        cameraPreviewVisible = true
         appendStatusChatMessage(
-            title: "历史上下文已带入",
-            text: "已新开对话，并压缩带入：\(context.summary)",
+            title: "已接入历史回合",
+            text: "下面回看「\(context.title)」的历史内容，你可以直接接着提问。",
             systemImage: "clock.arrow.circlepath",
-            contextItems: [context.badge],
-            attachments: submittedContextAttachments(submittedFrame: nil, reusedAnchorFrame: false)
+            contextItems: [context.badge]
         )
-        log("已从历史回合新开对话：\(session.id)")
+        replayHistoryMessages(detail: detail, session: session)
+        log("已从历史回合新开对话并回放历史：\(session.id)")
+    }
+
+    // 把历史回合的问答/观察内容回放到对话流，让用户看得见（#4）
+    private func replayHistoryMessages(detail: [String: Any], session: HistorySessionSummary) {
+        var replay: [ChatMessage] = []
+        if let qaEvents = detail["qa_events"] as? [[String: Any]], !qaEvents.isEmpty {
+            let sorted = qaEvents.sorted { ($0["created_at"] as? String ?? "") < ($1["created_at"] as? String ?? "") }
+            for ev in sorted {
+                let q = (ev["question"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let a = (ev["answer"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !q.isEmpty { replay.append(ChatMessage(role: .user, text: q)) }
+                if !a.isEmpty {
+                    replay.append(ChatMessage(role: .assistant, text: a, question: q,
+                                              qaEventId: ev["id"] as? String ?? ""))
+                }
+            }
+        }
+        // 观察回合（或无问答）：回放报告/分析摘要
+        if replay.isEmpty {
+            let reports = (detail["report_events"] as? [[String: Any]]) ?? []
+            let analyses = (detail["analyses"] as? [[String: Any]]) ?? []
+            let texts: [String] = (reports + analyses).compactMap { row in
+                for key in ["summary", "content", "text", "report", "analysis"] {
+                    if let s = row[key] as? String, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return s }
+                }
+                return nil
+            }
+            for t in texts.prefix(6) {
+                replay.append(ChatMessage(role: .assistant, text: t, title: "历史观察", systemImage: "eye"))
+            }
+            if replay.isEmpty && !session.summaryPreview.isEmpty {
+                replay.append(ChatMessage(role: .assistant, text: session.summaryPreview, title: "历史摘要", systemImage: "doc.text"))
+            }
+        }
+        guard !replay.isEmpty else { return }
+        chatMessages.append(contentsOf: replay)
     }
 
     private func makeHistoryCarryContext(summary: HistorySessionSummary, detail: [String: Any]) -> HistoryCarryContext {
@@ -11039,7 +11076,8 @@ final class AppState: ObservableObject {
         let boundary = "xue-\(UUID().uuidString)"
         var request = URLRequest(url: serverBaseURL.appending(path: path))
         request.httpMethod = "POST"
-        request.timeoutInterval = files.isEmpty ? 45 : 120
+        // 问答常因「上下文构建+模型生成」较慢（纯文字也可能十几秒~几十秒），放宽超时避免误报「问答失败」
+        request.timeoutInterval = files.isEmpty ? 90 : 180
         if let auth = AuthSession.shared.authHeader { request.setValue(auth, forHTTPHeaderField: "Authorization") }
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         request.httpBody = makeMultipartBody(boundary: boundary, fields: fields, files: files)

@@ -31,7 +31,8 @@ struct iPadLearnView: View {
             .toolbar { toolbarContent }
         }
         .task {
-            if state.sessionId == nil { state.startNewConversation() }
+            // 仅在真正空白时才新建对话；从历史「进入对话」已回放消息(chatMessages 非空)，不要清掉
+            if state.sessionId == nil && state.chatMessages.isEmpty { state.startNewConversation() }
             #if DEBUG
             state.debugSeedChatIfRequested()
             #endif
@@ -252,21 +253,20 @@ struct iPadLearnView: View {
 
     private var composer: some View {
         HStack(spacing: 12) {
-            Button {
-                if state.cameraPreviewVisible {
-                    state.performCameraPrimaryAction()
-                } else {
-                    state.openSingleCaptureCamera()
-                }
-            } label: {
-                Image(systemName: "camera.fill")
-                    .font(.title3)
-                    .frame(width: 44, height: 44)
-            }
-            .buttonStyle(.bordered)
-            .accessibilityIdentifier("ipad-capture")
-
             if inputMode == .text {
+                // 拍题
+                Button {
+                    if state.cameraPreviewVisible {
+                        state.performCameraPrimaryAction()
+                    } else {
+                        state.openSingleCaptureCamera()
+                    }
+                } label: {
+                    Image(systemName: "camera.fill").font(.title3).frame(width: 44, height: 44)
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("ipad-capture")
+
                 TextField("输入问题，或先拍题…", text: $draft, axis: .vertical)
                     .lineLimit(1...4)
                     .textFieldStyle(.plain)
@@ -285,7 +285,8 @@ struct iPadLearnView: View {
                 .accessibilityIdentifier("ipad-composer-send")
                 .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || state.isThinking)
             } else {
-                VoiceHoldArea(state: state, allowsCollapse: false)
+                // 语音模式：占满整条，按钮更大更好按
+                VoiceHoldArea(state: state, allowsCollapse: false, pressHeight: 52)
                     .frame(maxWidth: .infinity)
             }
 
@@ -296,7 +297,7 @@ struct iPadLearnView: View {
             } label: {
                 Image(systemName: inputMode == .text ? "mic.fill" : "keyboard")
                     .font(.title3)
-                    .frame(width: 44, height: 44)
+                    .frame(width: 44, height: 52)
             }
             .buttonStyle(.bordered)
             .tint(inputMode == .voice ? .accentColor : .secondary)

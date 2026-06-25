@@ -97,7 +97,7 @@ final class iPadUITests: XCTestCase {
     func testIPad_05_historyContinue() {
         let app = makeApp(section: "history")
         app.launch()
-        let firstRow = app.cells.firstMatch
+        let firstRow = app.staticTexts.containing(NSPredicate(format: "label CONTAINS '回合'")).firstMatch
         if firstRow.waitForExistence(timeout: 15) {
             snap("12-history-list")
             firstRow.tap(); sleep(3); snap("13-history-report")
