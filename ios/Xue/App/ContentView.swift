@@ -29,6 +29,7 @@ private let voicePlaybackRateDefaultsKey = "xue.voicePlaybackRate"
 private let learningModeDefaultsKey = "xue.learningMode"
 private let coachDepthDefaultsKey = "xue.coachDepth"
 private let textOnlyQuestionDefaultsKey = "xue.textOnlyQuestion"
+private let coachPreferenceTextDefaultsKey = "xue.coachPreferenceText"
 private let longTermInstructionDefaultsKey = "xue.longTermInstruction"
 private let longTermMemoriesDefaultsKey = "xue.longTermMemories"
 private let userInputMemoryDefaultsKey = "xue.userInputMemory"
@@ -261,10 +262,7 @@ struct ContentView: View {
         .onChange(of: state.studentGoal) { _ in
             state.studentGoalDidChange()
         }
-        .onChange(of: state.learningMode) { _ in
-            state.coachPreferenceDidChange()
-        }
-        .onChange(of: state.coachDepth) { _ in
+        .onChange(of: state.coachPreferenceText) { _ in
             state.coachPreferenceDidChange()
         }
     }
@@ -3632,6 +3630,11 @@ private struct AssistantAnswerActionRow: View {
 private struct ChatSettingsPanel: View {
     @ObservedObject var state: AppState
 
+    // 编辑时仅更新 published 值（实时显示），持久化与策略同步在 onSubmit 触发。
+    private var coachPreferenceBinding: Binding<String> {
+        Binding(get: { state.coachPreferenceText }, set: { state.coachPreferenceText = $0 })
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Label("本轮偏好", systemImage: "slider.horizontal.3")
@@ -3643,19 +3646,14 @@ private struct ChatSettingsPanel: View {
                 .lineLimit(1...3)
                 .submitLabel(.done)
 
-            Picker("学习场景", selection: $state.learningMode) {
-                ForEach(LearningModePreference.allCases) { mode in
-                    Text(mode.title).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-
-            Picker("回答方式", selection: $state.coachDepth) {
-                ForEach(state.availableCoachDepths) { depth in
-                    Text(depth.title).tag(depth)
-                }
-            }
-            .pickerStyle(.segmented)
+            Text("一句话辅导偏好")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+            TextField("例如：先给提示别直接报答案，讲慢一点", text: coachPreferenceBinding, axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+                .lineLimit(1...4)
+                .submitLabel(.done)
+                .onSubmit { state.coachPreferenceTextDidChange(state.coachPreferenceText) }
 
             HStack {
                 Label(state.strategySyncState, systemImage: "icloud")
@@ -3668,6 +3666,11 @@ private struct ChatSettingsPanel: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 8) {
+                Toggle(isOn: Binding(get: { state.textOnlyQuestion }, set: { state.textOnlyQuestionDidChange($0) })) {
+                    Label("纯文字提问（不开相机）", systemImage: "keyboard")
+                }
+                .font(.caption.weight(.semibold))
+
                 Toggle(isOn: $state.voicePlaybackEnabled) {
                     Label("朗读回答", systemImage: state.voicePlaybackEnabled ? "speaker.wave.2.fill" : "speaker.slash")
                 }
@@ -4870,6 +4873,42 @@ struct HistorySessionSummary: Identifiable, Decodable {
     }
 }
 
+// 提示词记录：对应 GET /api/prompts 返回的每条记录（只读预览 + 是否自定义）。
+struct CoachPromptRecord: Identifiable, Decodable {
+    let key: String
+    let label: String
+    let description: String
+    let content: String
+    let isCustom: Bool
+
+    var id: String { key }
+
+    enum CodingKeys: String, CodingKey {
+        case key
+        case label
+        case description
+        case content
+        case isCustom = "is_custom"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        key = (try? container.decode(String.self, forKey: .key)) ?? ""
+        label = (try? container.decode(String.self, forKey: .label)) ?? ""
+        description = (try? container.decode(String.self, forKey: .description)) ?? ""
+        content = (try? container.decode(String.self, forKey: .content)) ?? ""
+        isCustom = (try? container.decode(Bool.self, forKey: .isCustom)) ?? false
+    }
+}
+
+private struct CoachPromptsResponse: Decodable {
+    let prompts: [CoachPromptRecord]
+}
+
+private struct CoachPromptResetResponse: Decodable {
+    let prompt: CoachPromptRecord
+}
+
 private enum HistoryDateFormatter {
     private static let outputFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -5999,6 +6038,11 @@ final class AppState: ObservableObject {
     }()
     @Published var learningMode = LearningModePreference(rawValue: UserDefaults.standard.string(forKey: learningModeDefaultsKey) ?? "") ?? .singleProblem
     @Published var coachDepth = CoachDepthPreference(rawValue: UserDefaults.standard.string(forKey: coachDepthDefaultsKey) ?? "") ?? .hintFirst
+    /// 一句话辅导偏好（自然语言）。非空时直接作为教练偏好主体；为空时回退中性默认。独立持久化，不复用 studentGoal。
+    @Published var coachPreferenceText = UserDefaults.standard.string(forKey: coachPreferenceTextDefaultsKey) ?? ""
+    /// 提示词列表（GET /api/prompts，只读预览 + 一键恢复默认）。
+    @Published var coachPrompts: [CoachPromptRecord] = []
+    @Published var isLoadingPrompts = false
     @Published var contextInclusionSettings = ContextInclusionSettings.load()
     @Published var longTermInstruction = UserDefaults.standard.string(forKey: longTermInstructionDefaultsKey) ?? ""
     @Published var longTermMemories = UserDefaults.standard.stringArray(forKey: longTermMemoriesDefaultsKey) ?? []
@@ -6116,35 +6160,27 @@ final class AppState: ObservableObject {
         studentGoal.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private var trimmedCoachPreferenceText: String {
+        coachPreferenceText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // 用户未填偏好时的默认辅导风格 = 原"先给提示"默认（保证默认问答质量不退化）
+    private static let defaultCoachStyle = "默认辅导风格：先给提示、循序渐进地引导学生自己想，必要时再完整讲解"
+
     private var coachReportStyle: String {
-        [
-            "学习教练偏好",
-            "学习场景=\(learningMode.rawValue)",
-            learningMode.reportPhrase,
-            "回答方式=\(coachDepth.rawValue)",
-            coachDepth.reportPhrase,
-            "输出要保留错题、知识点、过程线索、家长三句话和下一步复习建议"
-        ].joined(separator: "；")
+        let preference = trimmedCoachPreferenceText
+        let base = preference.isEmpty ? AppState.defaultCoachStyle : "家长/学生偏好：\(preference)"
+        return "\(base)；输出要保留错题、知识点、过程线索、家长三句话和下一步复习建议"
     }
 
     private var coachAssistantFocus: String {
-        [
-            "学习教练偏好",
-            learningMode.focusPhrase,
-            coachDepth.focusPhrase,
-            "每次回答尽量给一个下一步小任务，帮助学生继续自己做"
-        ].joined(separator: "；")
+        let preference = trimmedCoachPreferenceText
+        let base = preference.isEmpty ? AppState.defaultCoachStyle : "家长/学生偏好：\(preference)"
+        return "\(base)；每次回答尽量给一个下一步小任务，帮助学生继续自己做"
     }
 
     private var strategySignature: String {
-        [trimmedStudentGoal, coachReportStyle, coachAssistantFocus].joined(separator: "|")
-    }
-
-    var availableCoachDepths: [CoachDepthPreference] {
-        if learningMode == .answerCheck {
-            return [.checkOnly, .stepByStep, .fullExplain]
-        }
-        return CoachDepthPreference.allCases
+        [trimmedStudentGoal, trimmedCoachPreferenceText, coachReportStyle, coachAssistantFocus].joined(separator: "|")
     }
 
     var hasChatStarted: Bool {
@@ -7688,6 +7724,43 @@ final class AppState: ObservableObject {
         textOnlyQuestion = on
         UserDefaults.standard.set(on, forKey: textOnlyQuestionDefaultsKey)
         log(on ? "纯文字提问已开启：打字提问不再开相机" : "纯文字提问已关闭：打字提问会结合当前画面")
+    }
+
+    // 一句话辅导偏好：失焦/提交时持久化并触发策略同步（不复用 studentGoal）
+    func coachPreferenceTextDidChange(_ text: String) {
+        coachPreferenceText = text
+        UserDefaults.standard.set(text, forKey: coachPreferenceTextDefaultsKey)
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        log(trimmed.isEmpty ? "辅导偏好已清空，回到默认策略" : "辅导偏好已更新：\(trimmed)")
+        coachPreferenceDidChange()
+    }
+
+    // 提示词：加载列表（GET /api/prompts）。已加载且非空时不重复拉取。
+    func loadCoachPrompts() async {
+        guard !isLoadingPrompts, coachPrompts.isEmpty else { return }
+        isLoadingPrompts = true
+        defer { isLoadingPrompts = false }
+        do {
+            let data = try await getData(path: "/api/prompts")
+            let decoded = try JSONDecoder().decode(CoachPromptsResponse.self, from: data)
+            coachPrompts = decoded.prompts
+        } catch {
+            log("加载提示词失败：\(networkErrorDescription(error))", level: "error")
+        }
+    }
+
+    // 提示词：恢复某条默认（POST /api/prompts/{key}/reset），成功后刷新该条。
+    func resetCoachPrompt(key: String) async {
+        do {
+            let data = try await postJSON(path: "/api/prompts/\(key)/reset", payload: [String: Any]())
+            let decoded = try JSONDecoder().decode(CoachPromptResetResponse.self, from: data)
+            if let index = coachPrompts.firstIndex(where: { $0.key == key }) {
+                coachPrompts[index] = decoded.prompt
+            }
+            log("已恢复默认提示词：\(decoded.prompt.label)")
+        } catch {
+            log("恢复默认提示词失败：\(networkErrorDescription(error))", level: "error")
+        }
     }
 
     #if DEBUG
@@ -10302,10 +10375,7 @@ final class AppState: ObservableObject {
     }
 
     func coachPreferenceDidChange() {
-        normalizeCoachPreferenceForMode()
-        UserDefaults.standard.set(learningMode.rawValue, forKey: learningModeDefaultsKey)
-        UserDefaults.standard.set(coachDepth.rawValue, forKey: coachDepthDefaultsKey)
-        log("学习教练已切换：\(learningMode.title) · \(coachDepth.title)")
+        // 偏好改为自然语言文本（coachPreferenceText），通过 strategySignature 触发同步。
         studentGoalDidChange()
     }
 
@@ -10888,7 +10958,7 @@ final class AppState: ObservableObject {
             if !goal.isEmpty {
                 log("学习目标已同步：\(goal)")
             } else {
-                log("学习教练偏好已同步：\(learningMode.title) · \(coachDepth.title)")
+                log("学习教练偏好已同步：\(trimmedCoachPreferenceText.isEmpty ? "默认策略" : trimmedCoachPreferenceText)")
             }
         } catch {
             strategySyncState = "同步失败"

@@ -1,7 +1,8 @@
 import SwiftUI
 
-// iPad 设置：表单式。学习偏好 / 上下文开关 / 语音 / 学生档案 / 账号。
+// iPad 设置：表单式。一句话辅导偏好 / 提问开关 / 提示词 / 学生档案 / 账号。
 // 全部复用 AppState 与 AuthSession 现有的已持久化 setter。
+// 学习模式/讲解深度 Picker 与 AI 上下文 7 开关已移除（上下文能力归到上下文面板）。
 
 struct iPadSettingsView: View {
     @ObservedObject var state: AppState
@@ -17,10 +18,10 @@ struct iPadSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                preferenceSection
+                coachPreferenceSection
                 questionSection
-                contextSection
                 voiceSection
+                PromptsSettingsSection(state: state)
                 studentSection
                 accountSection
             }
@@ -40,17 +41,23 @@ struct iPadSettingsView: View {
         }
     }
 
-    private var preferenceSection: some View {
-        Section("学习偏好") {
-            Picker("学习模式", selection: Binding(get: { state.learningMode }, set: { state.learningMode = $0; state.coachPreferenceDidChange() })) {
-                ForEach(LearningModePreference.allCases) { Text($0.title).tag($0) }
-            }
-            Picker("讲解深度", selection: Binding(get: { state.coachDepth }, set: { state.coachDepth = $0; state.coachPreferenceDidChange() })) {
-                ForEach(CoachDepthPreference.allCases) { Text($0.title).tag($0) }
-            }
+    // 1. 一句话辅导偏好：多行 TextField，失焦/提交时持久化 + 触发策略同步。
+    private var coachPreferenceSection: some View {
+        Section {
+            TextField("例如：先给提示别直接报答案，讲慢一点，多举例子",
+                      text: Binding(get: { state.coachPreferenceText }, set: { state.coachPreferenceText = $0 }),
+                      axis: .vertical)
+                .lineLimit(2...5)
+                .submitLabel(.done)
+                .onSubmit { state.coachPreferenceTextDidChange(state.coachPreferenceText) }
+        } header: {
+            Text("一句话辅导偏好")
+        } footer: {
+            Text("用一句话告诉 AI 你希望它怎么辅导。留空则使用中性默认策略。提交后随上下文发送。")
         }
     }
 
+    // 2. 提问开关
     private var questionSection: some View {
         Section {
             Toggle(isOn: Binding(get: { state.textOnlyQuestion }, set: { state.textOnlyQuestionDidChange($0) })) {
@@ -60,30 +67,6 @@ struct iPadSettingsView: View {
             Text("提问")
         } footer: {
             Text("开启后打字/快捷追问不会打开相机或抓取画面，按纯文字理解。拍题、语音、智能观察不受影响。")
-        }
-    }
-
-    private var contextSection: some View {
-        Section {
-            contextToggle("视觉画面", systemImage: "photo", keyPath: \.visual, value: state.contextInclusionSettings.visual)
-            contextToggle("智能观察", systemImage: "eye", keyPath: \.observation, value: state.contextInclusionSettings.observation)
-            contextToggle("历史记录", systemImage: "clock", keyPath: \.history, value: state.contextInclusionSettings.history)
-            contextToggle("错题本", systemImage: "exclamationmark.bubble", keyPath: \.mistakes, value: state.contextInclusionSettings.mistakes)
-            contextToggle("知识库", systemImage: "books.vertical", keyPath: \.knowledge, value: state.contextInclusionSettings.knowledge)
-            contextToggle("长期记忆", systemImage: "brain.head.profile", keyPath: \.memory, value: state.contextInclusionSettings.memory)
-            contextToggle("学习策略", systemImage: "target", keyPath: \.strategy, value: state.contextInclusionSettings.strategy)
-        } header: {
-            Text("AI 上下文")
-        } footer: {
-            Text("控制 AI 回答时参考哪些信息。关闭某项可让回答更聚焦当前题目。")
-        }
-    }
-
-    private func contextToggle(_ title: String, systemImage: String,
-                               keyPath: WritableKeyPath<ContextInclusionSettings, Bool>,
-                               value: Bool) -> some View {
-        Toggle(isOn: Binding(get: { value }, set: { state.updateContextInclusion(keyPath, to: $0) })) {
-            Label(title, systemImage: systemImage)
         }
     }
 
@@ -147,5 +130,60 @@ struct iPadSettingsView: View {
                 Label("退出登录", systemImage: "rectangle.portrait.and.arrow.right")
             }
         }
+    }
+}
+
+// 3. 提示词：复用 GET /api/prompts 列表；每条只读预览 + 「恢复默认」按钮调 POST /api/prompts/{key}/reset。
+// 不新增端点、不做自由编辑。
+private struct PromptsSettingsSection: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        Section {
+            if state.isLoadingPrompts && state.coachPrompts.isEmpty {
+                HStack {
+                    ProgressView()
+                    Text("加载提示词…").font(.caption).foregroundStyle(.secondary)
+                }
+            } else if state.coachPrompts.isEmpty {
+                Button {
+                    Task { await state.loadCoachPrompts() }
+                } label: {
+                    Label("加载提示词", systemImage: "arrow.clockwise")
+                }
+            } else {
+                ForEach(state.coachPrompts) { prompt in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(prompt.label).font(.subheadline.weight(.semibold))
+                            if prompt.isCustom {
+                                Text("已自定义").font(.caption2).foregroundStyle(.tint)
+                            }
+                            Spacer()
+                            if prompt.isCustom {
+                                Button("恢复默认") {
+                                    Task { await state.resetCoachPrompt(key: prompt.key) }
+                                }
+                                .font(.caption)
+                                .buttonStyle(.borderless)
+                            }
+                        }
+                        if !prompt.description.isEmpty {
+                            Text(prompt.description).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Text(prompt.content)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+        } header: {
+            Text("提示词")
+        } footer: {
+            Text("查看 AI 使用的提示词。自定义过的可一键恢复默认。如需编辑请在后台管理台操作。")
+        }
+        .task { await state.loadCoachPrompts() }
     }
 }
