@@ -65,7 +65,33 @@ llm_gate_waiters: dict[str, dict] = {}
 llm_gate_inflight_realtime = 0
 llm_gate_inflight_background = 0
 llm_gate_last_realtime_at = 0.0
+# 每个经过 llm_gate 的任务的注册表（按 task_id），用于「按账号查看在跑的后台任务并取消」。
+# 受 llm_gate_lock 保护。记录：account_id/user_id/label/lane/session_id/state/created/cancel_requested/future。
+llm_tasks: dict[str, dict] = {}
 task_dispatcher_task: asyncio.Task | None = None
+
+
+class LLMTaskCancelled(Exception):
+    """用户在任务等待或运行阶段主动取消（账号内取消自己的后台任务）。"""
+
+
+def task_display_title(label: str) -> str:
+    text = (label or "").lower()
+    table = (
+        ("teaching_visualization", "生成可视化讲解"),
+        ("final_report", "生成学习报告"),
+        ("qa_session_summary", "生成问答小结"),
+        ("memory_consolidation", "整理长期记忆"),
+        ("memory_extract", "整理长期记忆"),
+        ("distill", "提炼学习要点"),
+        ("vision", "分析题目画面"),
+        ("profile", "更新学习画像"),
+        ("observation", "智能观察分析"),
+    )
+    for key, name in table:
+        if key in text:
+            return name
+    return "后台生成任务"
 THUMBNAIL_MAX_SIDE = 640
 THUMBNAIL_QUALITY = 82
 FINAL_REPORT_WAIT_SECONDS = 90
@@ -1244,14 +1270,31 @@ async def run_with_llm_gate(
     idle_notified = False
     waiter_id = uuid.uuid4().hex
     registered_waiter = False
+    acquired_slot = False   # 取消语义：拿到放行槽前后清理 llm_tasks 的位置不同
     usage_event_id = ""
     usage_started_at: float | None = None
     started_waiting = asyncio.get_running_loop().time()
+    # 注册到任务表（等待阶段就可见、可取消）。
+    llm_tasks[waiter_id] = {
+        "id": waiter_id,
+        "account_id": account_id,
+        "user_id": user_id,
+        "label": label,
+        "lane": lane,
+        "session_id": session_id or "",
+        "state": "waiting",
+        "created": started_waiting,
+        "cancel_requested": False,
+        "future": None,
+    }
     try:
         while True:
             async with llm_gate_lock:
                 loop = asyncio.get_running_loop()
                 now = loop.time()
+                # 等待阶段被取消：直接中止（不占用放行槽）。
+                if llm_tasks.get(waiter_id, {}).get("cancel_requested"):
+                    raise LLMTaskCancelled()
                 if not registered_waiter:
                     llm_gate_wait_seq += 1
                     llm_gate_waiters[waiter_id] = {
@@ -1295,6 +1338,10 @@ async def run_with_llm_gate(
                     llm_gate_last_started_at = now
                     if lane == "realtime":
                         llm_gate_last_realtime_at = now
+                    acquired_slot = True
+                    rec = llm_tasks.get(waiter_id)
+                    if rec is not None:
+                        rec["state"] = "running"
                     counts = llm_gate_waiting_counts()
                     emit_llm_gate_log(
                         (
@@ -1330,11 +1377,21 @@ async def run_with_llm_gate(
                         session_id=session_id,
                     )
             await asyncio.sleep(wait_seconds)
+    except LLMTaskCancelled:
+        # 等待阶段被取消：未占放行槽，清理等待者与任务记录后中止。
+        async with llm_gate_lock:
+            llm_gate_waiters.pop(waiter_id, None)
+            llm_gate_waiting = len(llm_gate_waiters)
+            llm_tasks.pop(waiter_id, None)
+        emit_llm_gate_log(f"后台任务已取消（等待中）：{label}", session_id=session_id, level="warning")
+        raise
     finally:
         if registered_waiter:
             async with llm_gate_lock:
                 llm_gate_waiters.pop(waiter_id, None)
                 llm_gate_waiting = len(llm_gate_waiters)
+        if not acquired_slot:
+            llm_tasks.pop(waiter_id, None)
     retries = int(getattr(settings, "llm_realtime_retry", 1) or 0) if lane == "realtime" else 0
     try:
         usage_started_at = asyncio.get_running_loop().time()
@@ -1342,8 +1399,19 @@ async def run_with_llm_gate(
         attempt = 0
         while True:
             try:
-                result = await call()
+                # 用独立 future 包裹本次调用，便于「运行阶段取消」直接 cancel() 打断。
+                inner = asyncio.ensure_future(call())
+                rec = llm_tasks.get(waiter_id)
+                if rec is not None:
+                    rec["future"] = inner
+                    if rec.get("cancel_requested"):
+                        inner.cancel()   # 取消请求落在「拿到槽位~创建 future」窗口内时补刀
+                result = await inner
                 break
+            except asyncio.CancelledError:
+                record_llm_usage_finish(usage_event_id, "cancelled", error="cancelled by user", started_monotonic=usage_started_at)
+                emit_llm_gate_log(f"后台任务已取消（运行中）：{label}", session_id=session_id, level="warning")
+                raise LLMTaskCancelled()
             except Exception:
                 if attempt < retries:
                     attempt += 1
@@ -1357,10 +1425,13 @@ async def run_with_llm_gate(
                 raise
         record_llm_usage_finish(usage_event_id, "done", started_monotonic=usage_started_at)
         return result
+    except LLMTaskCancelled:
+        raise
     except Exception as exc:
         record_llm_usage_finish(usage_event_id, "failed", error=str(exc), started_monotonic=usage_started_at)
         raise
     finally:
+        llm_tasks.pop(waiter_id, None)
         async with llm_gate_lock:
             llm_gate_inflight = max(0, llm_gate_inflight - 1)
             if lane == "realtime":
@@ -8618,6 +8689,65 @@ def get_observability(request: Request) -> dict:
     init_db()
     principal = principal_from_request(request)
     return observability_snapshot(account_id=principal["account_id"], user_id=principal.get("user_id", ""))
+
+
+@app.get("/api/tasks")
+async def list_account_tasks(request: Request) -> dict:
+    """列出本账号正在跑/排队的后台生成任务（账号隔离）。仅返回 background 通道：
+    可视化/报告/记忆整理等耗时任务；实时问答是用户当前请求本身，不在此列。"""
+    init_db()
+    principal = principal_from_request(request)
+    account_id = principal.get("account_id") or DEFAULT_ACCOUNT_ID
+    async with llm_gate_lock:
+        snapshot = [
+            {k: v for k, v in rec.items() if k != "future"}
+            for rec in llm_tasks.values()
+            if rec.get("account_id") == account_id and rec.get("lane") != "realtime"
+        ]
+    now = asyncio.get_running_loop().time()
+    tasks = []
+    for rec in snapshot:
+        if rec.get("cancel_requested"):
+            continue
+        created = float(rec.get("created", now))
+        tasks.append({
+            "id": rec["id"],
+            "label": rec.get("label", ""),
+            "title": task_display_title(rec.get("label", "")),
+            "lane": rec.get("lane", "background"),
+            "state": rec.get("state", "waiting"),
+            "session_id": rec.get("session_id", ""),
+            "age_seconds": max(0, int(now - created)),
+            "cancelable": True,
+        })
+    tasks.sort(key=lambda t: t["age_seconds"], reverse=True)
+    return {"tasks": tasks, "count": len(tasks)}
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+async def cancel_account_task(task_id: str, request: Request) -> dict:
+    """取消本账号自己的后台任务（账号隔离：他人任务一律 404，不泄露存在性）。"""
+    init_db()
+    principal = principal_from_request(request)
+    account_id = principal.get("account_id") or DEFAULT_ACCOUNT_ID
+    fut = None
+    label = ""
+    sess = None
+    async with llm_gate_lock:
+        rec = llm_tasks.get(task_id)
+        if rec is None or rec.get("account_id") != account_id:
+            raise HTTPException(404, "task not found")
+        if rec.get("cancel_requested"):
+            return {"ok": True, "already": True}
+        rec["cancel_requested"] = True
+        rec["state"] = "cancelling"
+        fut = rec.get("future")
+        label = rec.get("label", "")
+        sess = rec.get("session_id") or None
+    if fut is not None and not fut.done():
+        fut.cancel()
+    emit_llm_gate_log(f"用户取消后台任务：{label}（{task_id[:8]}）", session_id=sess, level="warning")
+    return {"ok": True}
 
 
 @app.put("/api/prompts/{prompt_key}")

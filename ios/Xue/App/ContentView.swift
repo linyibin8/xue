@@ -5243,6 +5243,35 @@ struct RuntimeTaskItem: Identifiable, Equatable {
     var closeSystemImage = "xmark.circle"
 }
 
+// #8 后端后台生成任务（GET /api/tasks，账号隔离）。
+struct ServerBackgroundTask: Identifiable, Decodable {
+    let id: String
+    let title: String
+    let label: String
+    let lane: String
+    let state: String          // waiting / running / cancelling
+    let sessionId: String
+    let ageSeconds: Int
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, label, lane, state
+        case sessionId = "session_id"
+        case ageSeconds = "age_seconds"
+    }
+
+    var stateText: String {
+        switch state {
+        case "running": return "生成中"
+        case "cancelling": return "正在取消"
+        default: return "排队中"
+        }
+    }
+}
+
+struct ServerTasksResponse: Decodable {
+    let tasks: [ServerBackgroundTask]
+}
+
 struct TTSGenerateResponse: Decodable {
     let audioBase64: String
 
@@ -6543,6 +6572,7 @@ final class AppState: ObservableObject {
     @Published var cameraPreviewVisible = false
     @Published var isCameraReady = false
     @Published var chatMessages: [ChatMessage] = []
+    @Published var serverTasks: [ServerBackgroundTask] = []   // #8 后端在跑的后台生成任务（账号隔离，可取消）
     @Published var cameraTaskKind = CameraTaskKind.none
     @Published var backgroundCameraEnabled = true
     @Published var lastSubmittedContextItems: [ContextBadgeItem] = []
@@ -10820,6 +10850,27 @@ final class AppState: ObservableObject {
             qualityFeedback = .idle
         default:
             break
+        }
+    }
+
+    // #8 后端后台任务：账号隔离地拉取自己在跑的生成任务，并可取消自己的任务。
+    func refreshServerTasks() async {
+        do {
+            let data = try await getData(path: "/api/tasks")
+            let decoded = try JSONDecoder().decode(ServerTasksResponse.self, from: data)
+            serverTasks = decoded.tasks
+        } catch {
+            // 辅助信息，失败静默（不打扰主流程）。
+        }
+    }
+
+    func cancelServerTask(_ id: String) async {
+        do {
+            _ = try await postJSON(path: "/api/tasks/\(id)/cancel", payload: [:])
+            log("已请求取消后台任务")
+            await refreshServerTasks()
+        } catch {
+            log("取消后台任务失败：\(networkErrorDescription(error))", level: "error")
         }
     }
 

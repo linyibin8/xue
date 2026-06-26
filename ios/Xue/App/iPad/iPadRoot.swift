@@ -239,31 +239,63 @@ struct iPadBackgroundTasksSheet: View {
                     }
                 }
 
-                if auth.bgActive {
-                    Section("后端生成队列") {
-                        HStack(spacing: 10) {
-                            ProgressView()
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(auth.bgAhead > 0 ? "正在生成，前方 \(auth.bgAhead) 个任务" : "正在生成")
-                                    .font(.callout.weight(.semibold))
-                                Text((auth.bgEtaSeconds > 0 ? "预计还需约 \(auth.bgEtaSeconds) 秒。" : "")
-                                     + "可视化/报告在模型空闲时自动生成，会自行完成，无需等待。")
-                                    .font(.caption).foregroundStyle(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
+                Section {
+                    if state.serverTasks.isEmpty {
+                        Text(auth.bgActive ? "后端正在生成，但当前账号下没有可单独取消的任务。"
+                                           : "后端暂无在跑的生成任务。")
+                            .font(.callout).foregroundStyle(.secondary)
+                    } else {
+                        ForEach(state.serverTasks) { task in
+                            serverTaskRow(task)
                         }
-                        .padding(.vertical, 2)
                     }
+                } header: {
+                    Text("后端生成任务（本账号 · 可取消）")
+                } footer: {
+                    Text("可视化/报告/记忆整理在模型空闲时生成；取消只影响你自己账号的任务。"
+                         + (auth.bgEtaSeconds > 0 ? "整体预计约 \(auth.bgEtaSeconds) 秒。" : ""))
                 }
             }
             .navigationTitle("后台任务")
             .navigationBarTitleDisplayMode(.inline)
+            .refreshable { await state.refreshServerTasks() }
+            .task { await state.refreshServerTasks() }
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { Task { await state.refreshServerTasks() } } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("完成") { onClose() }
                 }
             }
         }
+    }
+
+    private func serverTaskRow(_ task: ServerBackgroundTask) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            if task.state == "running" || task.state == "cancelling" {
+                ProgressView().frame(width: 22)
+            } else {
+                Image(systemName: "hourglass").foregroundStyle(.secondary).frame(width: 22)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(task.title).font(.callout.weight(.semibold))
+                Text("\(task.stateText) · 已 \(task.ageSeconds) 秒")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            Button(role: .destructive) {
+                Task { await state.cancelServerTask(task.id) }
+            } label: {
+                Label("取消", systemImage: "xmark.circle")
+                    .labelStyle(.iconOnly).font(.title3)
+            }
+            .buttonStyle(.borderless)
+            .disabled(task.state == "cancelling")
+        }
+        .padding(.vertical, 2)
     }
 
     private func taskRow(_ task: RuntimeTaskItem) -> some View {
