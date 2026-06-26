@@ -49,9 +49,19 @@ struct iPadHistoryView: View {
                 List(selection: $selectedId) {
                     ForEach(state.historySessions) { session in
                         VStack(alignment: .leading, spacing: 4) {
-                            Text(session.displayTitle)
-                                .font(.subheadline.weight(.semibold))
-                                .lineLimit(2)
+                            HStack(spacing: 6) {
+                                Text(session.modeBadge)
+                                    .font(.caption2.weight(.semibold))
+                                    .padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(
+                                        (session.modeBadge == "实时对话" ? Color.accentColor : Color.orange).opacity(0.15),
+                                        in: Capsule()
+                                    )
+                                    .foregroundStyle(session.modeBadge == "实时对话" ? Color.accentColor : Color.orange)
+                                Text(session.displayTitle)
+                                    .font(.subheadline.weight(.semibold))
+                                    .lineLimit(2)
+                            }
                             Text(session.countSummary)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)

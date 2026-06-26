@@ -4276,6 +4276,26 @@ def record_report_event(session_id: str, event_type: str, title: str, content: s
         )
 
 
+# 正在生成中的可视化 (account_id, source_type, source_id)。用于对前端轮询去重，
+# 避免一次点击在后台堆叠多份「生成可视化讲解」。
+_VIZ_INFLIGHT: set[tuple[str, str, str]] = set()
+# 落库为 running 的可视化超过该秒数仍未完成则视为「已失效」，允许重新触发（防卡死）。
+VIZ_INFLIGHT_STALE_SECONDS = 240
+
+
+def _iso_within_seconds(value: object, seconds: float) -> bool:
+    """判断 ISO 时间字符串是否在最近 `seconds` 秒内（用于判定任务是否仍新鲜在跑）。"""
+    if not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - parsed).total_seconds() <= seconds
+
+
 def visualization_dir() -> Path:
     path = get_settings().data_dir / "visualizations"
     path.mkdir(parents=True, exist_ok=True)
@@ -5663,7 +5683,47 @@ def qa_event_row_to_dict(row: dict) -> dict:
     item["rejected_image_filename"] = str(context.get("rejected_image_filename") or "")
     item["answer"] = reflow_qa_answer(item.get("answer") or "")
     item["answer_html"] = qa_answer_html(item.get("answer") or "")
+    item["actionable"] = qa_turn_actionable(item.get("question") or "", item.get("answer") or "")
     return item
+
+
+# 纯闲聊/打招呼/致谢等问题。这类回合不该弹「举一反三/加入错题本/生成可视化」等学习动作。
+_QA_CHITCHAT_PHRASES = {
+    "hi", "hello", "hey", "yo", "ok", "okay", "thanks", "thx", "bye",
+    "你好", "您好", "哈喽", "嗨", "在吗", "在不在", "在么", "你在吗",
+    "早", "早安", "早上好", "中午好", "下午好", "晚上好", "晚安",
+    "谢谢", "谢谢你", "谢啦", "多谢", "辛苦了", "好的", "好滴", "嗯", "哦", "哦哦",
+    "拜拜", "再见", "晚点聊", "哈哈", "哈哈哈", "测试", "test", "你是谁", "你叫什么",
+}
+
+
+def qa_turn_actionable(question: str, answer: str) -> bool:
+    """判断这轮问答是否值得展示学习动作按钮（举一反三/错题本/可视化等）。
+    目的：用户只发「hi/你好/谢谢」这类闲聊时，不要一本正经地给学习按钮。
+    策略保守：默认 True，仅当问题明显是闲聊/过短且无学习信号时才 False，避免误伤真实问题。"""
+    q = (question or "").strip()
+    if not q:
+        # 无问题文本（多为拍题/语音带图）——按真实学习处理。
+        return True
+    core = re.sub(r"[\s，。！？、；：,.!?;:~～…·\-—()（）\"'“”‘’*@#]+", "", q.lower())
+    if not core:
+        return True
+    if core in _QA_CHITCHAT_PHRASES:
+        return False
+    # 学习信号：数字、字母变量、常见学科/求解类词。命中则一定算实质问题。
+    if any(ch.isdigit() for ch in core):
+        return True
+    study_markers = (
+        "为什么", "怎么", "如何", "求", "解", "算", "证明", "推导", "题", "答案", "公式",
+        "讲", "解释", "什么是", "区别", "举例", "例子", "翻译", "单词", "语法", "默写",
+        "+", "-", "×", "÷", "=", "x", "y", "∫", "√",
+    )
+    if any(marker in q.lower() for marker in study_markers):
+        return True
+    # 既无学习信号、问题又很短（≤6 个有效字符），多半是闲聊。
+    if len(core) <= 6:
+        return False
+    return True
 
 
 def qa_answer_is_unhelpful_image_failure(answer: str) -> bool:
@@ -8815,6 +8875,13 @@ def list_sessions(request: Request, include_summary: bool = False) -> dict:
                     id, device_id, mode, title, status, created_at, updated_at,
                     finished_at, report_generated_at, student_goal, assistant_focus, inferred_needs, report_style, {summary_expr},
                     substr(summary, 1, 240) AS summary_preview,
+                    (
+                        SELECT question FROM qa_events
+                        WHERE qa_events.session_id = sessions.id
+                          AND TRIM(COALESCE(question, '')) != ''
+                        ORDER BY created_at ASC
+                        LIMIT 1
+                    ) AS first_question,
                     (SELECT COUNT(*) FROM images WHERE images.session_id = sessions.id) AS image_count,
                     (SELECT COUNT(*) FROM analyses WHERE analyses.session_id = sessions.id) AS analysis_count,
                     (SELECT COUNT(*) FROM qa_events WHERE qa_events.session_id = sessions.id) AS qa_count,
@@ -8934,14 +9001,42 @@ async def create_teaching_visualization(request: Request) -> dict:
             source_id = "custom_" + hashlib.sha256((session_id + "\n" + text).encode("utf-8")).hexdigest()[:32]
     if not source_id:
         raise HTTPException(422, "source_id is required")
+    account_id = principal["account_id"]
     # If it's already generated and ready, return immediately.
     existing = latest_visualization_for_source(source_type, source_id)
     if existing and existing.get("status") == "ready" and existing.get("can_open") and not force:
         return {"visualization": existing}
+
+    def _pending_payload() -> dict:
+        pending = dict(existing) if existing else {
+            "id": "",
+            "source_type": source_type,
+            "source_id": source_id,
+            "session_id": session_id,
+        }
+        pending.update({
+            "status": "running",
+            "queued": True,
+            "message": "已加入空闲生成队列：可视化会在语音/问答空闲时自动生成，完成后可在该回复下点「打开可视化」查看。",
+        })
+        return pending
+
+    # 去重：同一条回答的可视化只跑一份。客户端会轮询本接口（每隔几秒 POST 一次），
+    # 若不去重，每次轮询都会再起一个后台任务，导致「生成可视化讲解」在后台堆叠 5~6 份
+    # （还会挤占模型，拖慢实时问答）。这里在本进程内记录在跑的 (账号, 源)；同时把最近落库
+    # 为 running 的也视为在跑（覆盖进程重启/落库已开始的情况）。命中则直接返回排队态，不再起任务。
+    viz_key = (account_id, source_type, source_id)
+    if not force:
+        already_running = viz_key in _VIZ_INFLIGHT
+        if not already_running and existing and existing.get("status") == "running":
+            already_running = _iso_within_seconds(existing.get("updated_at"), VIZ_INFLIGHT_STALE_SECONDS)
+        if already_running:
+            return {"visualization": _pending_payload()}
+
     # Otherwise generate asynchronously at BACKGROUND priority so it never competes
     # with realtime voice/QA — it runs when the model is idle. Return a "running"
     # status the client already understands and polls (session/QA overview).
-    account_id = principal["account_id"]
+    _VIZ_INFLIGHT.add(viz_key)
 
     async def _generate_in_background() -> None:
         set_current_account(account_id)
@@ -8958,20 +9053,11 @@ async def create_teaching_visualization(request: Request) -> dict:
             )
         except Exception as exc:
             emit_log(f"可视化生成失败：{exc}", session_id=session_id or None, source="visualization", level="error")
+        finally:
+            _VIZ_INFLIGHT.discard(viz_key)
 
     asyncio.create_task(_generate_in_background())
-    pending = dict(existing) if existing else {
-        "id": "",
-        "source_type": source_type,
-        "source_id": source_id,
-        "session_id": session_id,
-    }
-    pending.update({
-        "status": "running",
-        "queued": True,
-        "message": "已加入空闲生成队列：可视化会在语音/问答空闲时自动生成，完成后可在该回复下点「打开可视化」查看。",
-    })
-    return {"visualization": pending}
+    return {"visualization": _pending_payload()}
 
 
 @app.get("/api/sessions/{session_id}/overview")

@@ -150,6 +150,9 @@ enum ContextWorkspaceTab: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    /// 普通用户可见的页卡。#8「调试」是开发者排查用的原始 JSON，家长/学生看不懂，从分段控件里隐藏。
+    static var visibleCases: [ContextWorkspaceTab] { [.overview, .assets, .prompts, .settings] }
+
     var title: String {
         switch self {
         case .overview:
@@ -2694,8 +2697,9 @@ private struct ChatMessageBubble: View {
         case .user:
             UserTextBubble(text: message.text)
         case .assistant:
-            // 仅在有题目/实质回答时才显示举一反三/加入错题本/形成记忆/可视化（"hi" 等闲聊不显示）
-            let hasActions = message.visualizationCandidate || message.text.count >= 50
+            // 仅在有题目/实质回答时才显示举一反三/加入错题本/形成记忆/可视化（"hi" 等闲聊不显示）。
+            // actionable 由后端按问题意图判定（闲聊=false）；再叠加本地的可视化/长度信号。
+            let hasActions = message.actionable && (message.visualizationCandidate || message.text.count >= 50)
             AssistantAnswerBubble(
                 answer: message.text,
                 visualizationCandidate: message.visualizationCandidate,
@@ -3894,7 +3898,7 @@ struct ContextWorkspaceSheet: View {
                     .padding(.bottom, 8)
 
                 Picker("上下文页卡", selection: $selectedTab) {
-                    ForEach(ContextWorkspaceTab.allCases) { tab in
+                    ForEach(ContextWorkspaceTab.visibleCases) { tab in
                         Label(tab.title, systemImage: tab.systemImage).tag(tab)
                     }
                 }
@@ -4079,8 +4083,8 @@ private struct ContextWorkspaceOverviewTab: View {
     }
 
     var body: some View {
-        ChatSettingsPanel(state: state)
-
+        // #7 朗读/纯文字提问/一句话辅导偏好属于「系统设置」，已在「设置」页提供；
+        // 上下文面板只负责「配置本轮发送什么上下文」，不再混入这些开关。
         ContextSectionCard(title: usingTurnTruth ? "这一轮发给 AI 的内容" : "下一轮会发给 AI 的内容", systemImage: "tray.full") {
             VStack(alignment: .leading, spacing: 10) {
                 Text(usingTurnTruth
@@ -4421,15 +4425,7 @@ private struct ContextWorkspaceSettingsTab: View {
     var body: some View {
         ContextSectionCard(title: "发送配置", systemImage: "switch.2") {
             VStack(alignment: .leading, spacing: 10) {
-                ContextToggleRow(
-                    title: "纯文字提问（不开相机）",
-                    detail: "开启后打字/快捷追问不会打开相机或抓取画面，按纯文字理解；拍题、语音、智能观察不受影响。",
-                    systemImage: "keyboard",
-                    isOn: Binding(
-                        get: { state.textOnlyQuestion },
-                        set: { state.textOnlyQuestionDidChange($0) }
-                    )
-                )
+                // #7「纯文字提问」是系统级提问方式，已移到「设置」；这里只保留各类上下文的发送开关。
                 ContextToggleRow(
                     title: "当前画面",
                     detail: "控制是否抓拍或复用题图；关闭后本轮按文字和对话理解。",
@@ -4493,15 +4489,7 @@ private struct ContextWorkspaceSettingsTab: View {
                         set: { state.updateContextInclusion(\.strategy, to: $0) }
                     )
                 )
-                ContextToggleRow(
-                    title: "调试 JSON",
-                    detail: "只影响面板展示完整 JSON；通常关闭以提高打开速度。",
-                    systemImage: "curlybraces",
-                    isOn: Binding(
-                        get: { state.contextInclusionSettings.debug },
-                        set: { state.updateContextInclusion(\.debug, to: $0) }
-                    )
-                )
+                // #8「调试 JSON」开关已随调试页卡一起从普通用户界面隐藏。
             }
         }
     }
@@ -4982,6 +4970,8 @@ struct ChatMessage: Identifiable {
     var visualizationCandidate = false
     var visualizationReason: String = ""
     var visualization: TeachingVisualization?
+    /// 这轮是否值得展示学习动作（举一反三/错题本/可视化等）。闲聊（hi/谢谢）由后端判为 false。
+    var actionable = true
     var title: String?
     var systemImage: String?
     var showsProgress = false
@@ -5351,6 +5341,7 @@ struct HistorySessionSummary: Identifiable, Decodable {
     let updatedAt: String
     let studentGoal: String
     let summaryPreview: String
+    let firstQuestion: String
     let imageCount: Int
     let analysisCount: Int
     let qaCount: Int
@@ -5365,6 +5356,7 @@ struct HistorySessionSummary: Identifiable, Decodable {
         case updatedAt = "updated_at"
         case studentGoal = "student_goal"
         case summaryPreview = "summary_preview"
+        case firstQuestion = "first_question"
         case imageCount = "image_count"
         case analysisCount = "analysis_count"
         case qaCount = "qa_count"
@@ -5381,14 +5373,34 @@ struct HistorySessionSummary: Identifiable, Decodable {
         updatedAt = (try? container.decode(String.self, forKey: .updatedAt)) ?? ""
         studentGoal = (try? container.decode(String.self, forKey: .studentGoal)) ?? ""
         summaryPreview = (try? container.decode(String.self, forKey: .summaryPreview)) ?? ""
+        firstQuestion = (try? container.decode(String.self, forKey: .firstQuestion)) ?? ""
         imageCount = (try? container.decode(Int.self, forKey: .imageCount)) ?? 0
         analysisCount = (try? container.decode(Int.self, forKey: .analysisCount)) ?? 0
         qaCount = (try? container.decode(Int.self, forKey: .qaCount)) ?? 0
         mistakeCount = (try? container.decode(Int.self, forKey: .mistakeCount)) ?? 0
     }
 
+    /// 回合类型徽章：区分「实时对话」与「智能观察」（#4）。
+    var modeBadge: String {
+        switch mode {
+        case "qa", "today_review":
+            return "实时对话"
+        case "burst", "observation":
+            return "智能观察"
+        default:
+            return qaCount > 0 ? "实时对话" : "智能观察"
+        }
+    }
+
+    /// 标题优先取「第一句提问」，让历史一眼能认出聊了什么；纯观察无提问时退回目标/摘要（#4）。
     var displayTitle: String {
-        firstNonEmpty(title, studentGoal, summaryPreview, "历史回合 " + String(id.prefix(8)))
+        let q = firstQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !q.isEmpty {
+            // 取第一句（按中英文句末标点/换行截断），并限制长度。
+            let firstSentence = q.split(whereSeparator: { "。！？!?\n".contains($0) }).first.map(String.init) ?? q
+            return shortText(firstSentence.trimmingCharacters(in: .whitespacesAndNewlines), limit: 30)
+        }
+        return firstNonEmpty(studentGoal, summaryPreview, modeBadge + "回合", "历史回合 " + String(id.prefix(8)))
     }
 
     var countSummary: String {
@@ -6134,7 +6146,13 @@ struct StudyMaterialSignals {
         if maybeCameraCovered {
             return "画面过暗、纹理很低，可能遮挡镜头"
         }
-        return "文字\(textCount) 处、矩形\(rectangleCount) 个、纹理\(String(format: "%.2f", edgeDensity))、\(presenceSummary)"
+        // #6 对话场景下相机多对着题目而非学生，「学生在场未识别」属于无意义噪音，会让人误解。
+        // 仅在真的识别到人时才附带在场信息；否则只报画面信号。
+        var parts = ["文字\(textCount) 处", "矩形\(rectangleCount) 个", "纹理\(String(format: "%.2f", edgeDensity))"]
+        if hasStudentPresence {
+            parts.append(presenceSummary)
+        }
+        return parts.joined(separator: "、")
     }
 }
 
@@ -7780,6 +7798,23 @@ final class AppState: ObservableObject {
         } catch {
             reviewQueueState = "复习队列读取失败"
             log("复习队列读取失败：\(networkErrorDescription(error))", level: "error")
+        }
+    }
+
+    /// 错题本页专用：一次性拉取全部未掌握错题（含未到期），按是否到期在前端分组展示。
+    /// 复用 /api/review-queue（due_only=false），无需新增后端接口。
+    @Published var isLoadingMistakeBook = false
+    func loadMistakeBook() async {
+        guard !isLoadingMistakeBook else { return }
+        isLoadingMistakeBook = true
+        defer { isLoadingMistakeBook = false }
+        do {
+            let all = try await fetchReviewQueue(dueOnly: false, pageSize: 100)
+            recentReviewItems = all.items
+            dueReviewItems = all.items.filter { $0.isDue }
+            reviewDueCount = dueReviewItems.count
+        } catch {
+            log("错题本读取失败：\(networkErrorDescription(error))", level: "error")
         }
     }
 
@@ -9601,7 +9636,8 @@ final class AppState: ObservableObject {
         qaEventId: String = "",
         visualizationCandidate: Bool = false,
         visualizationReason: String = "",
-        visualization: TeachingVisualization? = nil
+        visualization: TeachingVisualization? = nil,
+        actionable: Bool = true
     ) {
         let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanText.isEmpty else { return }
@@ -9613,7 +9649,8 @@ final class AppState: ObservableObject {
                 qaEventId: qaEventId.trimmingCharacters(in: .whitespacesAndNewlines),
                 visualizationCandidate: visualizationCandidate,
                 visualizationReason: visualizationReason.trimmingCharacters(in: .whitespacesAndNewlines),
-                visualization: visualization
+                visualization: visualization,
+                actionable: actionable
             )
         )
     }
@@ -10047,6 +10084,7 @@ final class AppState: ObservableObject {
             let qaEventId = (event?["id"] as? String) ?? ""
             let visualizationCandidate = (event?["visualization_candidate"] as? Bool) ?? false
             let visualizationReason = (event?["visualization_reason"] as? String) ?? ""
+            let actionable = (event?["actionable"] as? Bool) ?? true
             let visualization = TeachingVisualization(json: event?["visualization"] as? [String: Any])
             let usedImageContext = (json?["used_image_context"] as? Bool) ?? (image != nil)
             let imageContextMode = (json?["image_context_mode"] as? String) ?? (image != nil ? "current_frame" : "text_only")
@@ -10065,7 +10103,8 @@ final class AppState: ObservableObject {
                 qaEventId: qaEventId,
                 visualizationCandidate: visualizationCandidate,
                 visualizationReason: visualizationReason,
-                visualization: visualization
+                visualization: visualization,
+                actionable: actionable
             )
             updateLongTermMemories(question: question, answer: answer)
             // 三期：真实 QA 路径收尾后被动拉取本轮记忆增量（异步、不阻塞答案渲染/播报）。
@@ -11965,6 +12004,22 @@ final class AppState: ObservableObject {
         _ = try? await URLSession.shared.data(for: request)
     }
 
+    /// 发送请求，并对「-1005 网络连接被中途断开」自动重试一次。
+    /// 这类错误多发生在复用的 keep-alive 连接被服务器/中间层关闭时，请求通常还没到达服务器，
+    /// 重试一次即可恢复——正是追问偶发「网络连接失败」的主因（#3）。其它错误原样抛出。
+    private func dataWithConnectionLostRetry(for request: URLRequest) async throws -> (Data, URLResponse) {
+        do {
+            return try await URLSession.shared.data(for: request)
+        } catch {
+            let nsError = error as NSError
+            guard nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorNetworkConnectionLost else {
+                throw error
+            }
+            log("网络连接被中途断开（-1005），自动重试一次：\(request.url?.path ?? "")", level: "warning")
+            return try await URLSession.shared.data(for: request)
+        }
+    }
+
     private func postForm(path: String, fields: [String: String], files: [MultipartFile]) async throws -> Data {
         let boundary = "xue-\(UUID().uuidString)"
         var request = URLRequest(url: serverBaseURL.appending(path: path))
@@ -11974,7 +12029,7 @@ final class AppState: ObservableObject {
         if let auth = AuthSession.shared.authHeader { request.setValue(auth, forHTTPHeaderField: "Authorization") }
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         request.httpBody = makeMultipartBody(boundary: boundary, fields: fields, files: files)
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await dataWithConnectionLostRetry(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw NetworkRequestError.missingHTTPResponse
         }
@@ -12011,7 +12066,7 @@ final class AppState: ObservableObject {
         if let auth = AuthSession.shared.authHeader { request.setValue(auth, forHTTPHeaderField: "Authorization") }
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await dataWithConnectionLostRetry(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw NetworkRequestError.missingHTTPResponse
         }

@@ -262,9 +262,10 @@ struct iPadLearnView: View {
         state.chatMessages.last(where: { $0.role == .assistant })?.id
     }
 
-    // 仅在「有题目/有实质回答」时展示举一反三/加入错题本/形成记忆/可视化（#7）
+    // 仅在「有题目/有实质回答」时展示举一反三/加入错题本/形成记忆/可视化（#7）。
+    // actionable 由后端按问题意图判定（闲聊如 hi/谢谢 = false），避免给闲聊也弹一堆学习按钮（#9）。
     private func messageHasActions(_ m: ChatMessage) -> Bool {
-        m.visualizationCandidate || m.text.count >= 50
+        m.actionable && (m.visualizationCandidate || m.text.count >= 50)
     }
 
     @ViewBuilder
@@ -298,6 +299,7 @@ struct iPadLearnView: View {
                 iPadContextStatusRow(
                     message: message,
                     onTap: { contextDetail = $0 },
+                    onSelectAttachment: { previewAttachment = $0 },
                     onOpenWorkspace: { showContextWorkspace = true }
                 )
             } else {
@@ -383,6 +385,7 @@ struct iPadLearnView: View {
 struct iPadContextStatusRow: View {
     let message: ChatMessage
     let onTap: (ContextBadgeItem) -> Void
+    var onSelectAttachment: ((ChatAttachment) -> Void)? = nil
     var onOpenWorkspace: (() -> Void)? = nil
 
     var body: some View {
@@ -413,6 +416,10 @@ struct iPadContextStatusRow: View {
                     Text(message.text)
                         .font(.callout)
                         .fixedSize(horizontal: false, vertical: true)
+                }
+                // #5 随本次发送的抓拍缩略图（iPad 之前漏渲染，只有 iPhone 显示）。
+                if !message.attachments.isEmpty {
+                    AttachmentStrip(attachments: message.attachments) { onSelectAttachment?($0) }
                 }
                 let columns = [GridItem(.adaptive(minimum: 110), spacing: 8)]
                 LazyVGrid(columns: columns, alignment: .leading, spacing: 8) {

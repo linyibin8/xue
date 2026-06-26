@@ -7,39 +7,55 @@ struct iPadMistakesView: View {
     @ObservedObject var state: AppState
     @State private var selectedId: String?
 
-    private var allItems: [ReviewMistakeItem] { state.dueReviewItems + state.recentReviewItems }
+    // 单一数据源：全部未掌握错题（loadMistakeBook 拉取，due_only=false），按是否到期在前端分组，避免重复。
+    private var allItems: [ReviewMistakeItem] { state.recentReviewItems }
+    private var dueItems: [ReviewMistakeItem] { allItems.filter { $0.isDue } }
+    private var laterItems: [ReviewMistakeItem] { allItems.filter { !$0.isDue } }
     private var selected: ReviewMistakeItem? { allItems.first { $0.id == selectedId } }
 
     var body: some View {
         NavigationStack {
-            // #4：错题抓取尚未稳定，先不展示历史数据，避免显示错误内容。待错题管线修好再恢复。
-            ContentUnavailableCompat(
-                title: "错题本完善中",
-                systemImage: "exclamationmark.bubble",
-                message: "错题自动整理正在打磨，暂不展示历史数据，以免给你看到不准确的内容。学习中点「加入错题本」仍会记录，稍后恢复展示。"
-            )
+            HStack(spacing: 0) {
+                list
+                    .frame(width: 360)
+                Divider()
+                detailPane
+                    .frame(maxWidth: .infinity)
+            }
             .navigationTitle("错题本")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        Task { await state.loadMistakeBook() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                }
+            }
         }
+        .task { await state.loadMistakeBook() }
     }
 
     // MARK: 列表（精简）
 
     private var list: some View {
         Group {
-            if allItems.isEmpty {
+            if state.isLoadingMistakeBook && allItems.isEmpty {
+                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if allItems.isEmpty {
                 ContentUnavailableCompat(title: "暂无错题", systemImage: "checkmark.seal",
                                          message: "学习中点「加入错题本」后会出现在这里。")
             } else {
                 List(selection: $selectedId) {
-                    if !state.dueReviewItems.isEmpty {
-                        Section("待复习 (\(state.dueReviewItems.count))") {
-                            ForEach(state.dueReviewItems, id: \.id) { row($0) }
+                    if !dueItems.isEmpty {
+                        Section("待复习 (\(dueItems.count))") {
+                            ForEach(dueItems, id: \.id) { row($0) }
                         }
                     }
-                    if !state.recentReviewItems.isEmpty {
-                        Section("最近") {
-                            ForEach(state.recentReviewItems, id: \.id) { row($0) }
+                    if !laterItems.isEmpty {
+                        Section("全部错题 (\(laterItems.count))") {
+                            ForEach(laterItems, id: \.id) { row($0) }
                         }
                     }
                 }
