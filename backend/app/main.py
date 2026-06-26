@@ -2990,11 +2990,74 @@ def optional_float(value: object) -> float | None:
         raise HTTPException(422, "invalid numeric value")
 
 
+_MISTAKE_METHOD_LABELS = {
+    "manual": "你手动加入",
+    "photo_grading": "拍题批改时自动识别",
+    "observation": "智能观察学习时识别",
+    "qa": "问答中发现",
+}
+_MISTAKE_STATUS_LABELS = {
+    "suspected": "疑似 · 待确认",
+    "incomplete": "疑似未完成",
+    "confirmed": "已确认",
+    "corrected": "已订正",
+    "mastered": "已掌握",
+    "ignored": "已忽略",
+}
+
+
+def build_mistake_provenance(item: dict) -> dict:
+    """给每一道错题生成"它是怎么来的"说明：何时 / 怎么采集 / 为什么判为错 / 判定依据 / 置信度。
+    旧数据没有 detection_method，则从 source_summary 推断，保证每道题都说得清。"""
+    method = (item.get("detection_method") or "").strip()
+    summary = item.get("source_summary") or ""
+    if not method:
+        if "手动" in summary:
+            method = "manual"
+        elif "观察" in summary:
+            method = "observation"
+        elif "问答" in summary:
+            method = "qa"
+        elif summary:
+            method = "photo_grading"
+    method_label = _MISTAKE_METHOD_LABELS.get(method, "自动整理")
+    status = item.get("status") or "suspected"
+    student = (item.get("student_answer") or "").strip()
+    expected = (item.get("expected_answer") or "").strip()
+    reason = (item.get("error_reason") or "").strip()
+    evidence = (item.get("evidence") or "").strip()
+    # 判定依据：优先"作答↔参考答案对比"，其次错因/证据。
+    if status == "incomplete":
+        basis = "这道题留空了、没有作答"
+    elif student and expected and student != expected:
+        basis = f"你的作答与参考答案不一致（作答：{truncate_text(student, 40)}；参考：{truncate_text(expected, 40)}）"
+    elif student:
+        basis = f"基于你的作答判断：{truncate_text(student, 60)}"
+    elif reason and not is_placeholder_mistake_text(reason):
+        basis = truncate_text(reason, 80)
+    elif evidence:
+        basis = truncate_text(evidence, 80)
+    else:
+        basis = "来自批改/学习记录的判断"
+    why = reason if (reason and not is_placeholder_mistake_text(reason)) else basis
+    return {
+        "method": method,
+        "method_label": method_label,
+        "when": item.get("created_at") or item.get("first_seen_at") or "",
+        "why": truncate_text(why, 120),
+        "basis": basis,
+        "confidence_label": _MISTAKE_STATUS_LABELS.get(status, "疑似 · 待确认"),
+        "source_summary": truncate_text(summary, 80),
+        "review_count": int(item.get("review_count") or 0),
+    }
+
+
 def mistake_row_to_dict(row) -> dict:
     item = dict(row)
     item["knowledge_points"] = json_list(item.get("knowledge_points"))
     item["source_image_ids"] = json_list(item.get("source_image_ids"))
     item["source_image_details"] = json_list_of_dicts(item.get("source_image_details"))
+    item["provenance"] = build_mistake_provenance(item)
     return item
 
 
@@ -3729,6 +3792,26 @@ def report_has_student_answer(content: str) -> bool:
     return False
 
 
+# 智能观察报告里的描述性词汇——这些行描述"屏幕上在显示什么/停留多久"，不是批改结果，
+# 绝不能进错题本（之前错题本里满屏"题目耗时线索/差异题目/无新增纸质题目/画面静止"就是它们漏进来的）。
+_MISTAKE_OBSERVATION_NOISE = (
+    "画面", "耗时", "线索", "差异题目", "无新增", "界面", "屏幕", "截图", "静止",
+    "动作证据", "阅读动作", "工作台", "持续显示", "停留", "翻页", "在场", "未检测到",
+    "估计", "本批次", "连续", "秒拍摄", "疑似正在",
+)
+
+_MISTAKE_PLACEHOLDER_VALUES = {"", "无", "未识别", "未知", "暂无", "空白", "未作答", "-", "—", "无内容", "无可分析内容"}
+
+
+def looks_like_observation_noise(text: str) -> bool:
+    return any(marker in (text or "") for marker in _MISTAKE_OBSERVATION_NOISE)
+
+
+def is_placeholder_mistake_text(text: str) -> bool:
+    body = (text or "").strip()
+    return len(body) < 2 or body in _MISTAKE_PLACEHOLDER_VALUES
+
+
 def extract_mistake_items(content: str, learning_items: list[dict] | None = None) -> list[dict]:
     items: list[dict] = []
     seen: set[str] = set()
@@ -3762,12 +3845,23 @@ def extract_mistake_items(content: str, learning_items: list[dict] | None = None
         if status == "incomplete" and not has_student_answer:
             continue
         title_source = recent_question or body or line
+        # 质量门槛（错题本去噪）：一道真正的错题必须有"具体证据"——学生写了作答、
+        # 或明确写了错因、或给了参考答案。只是某行里出现了"错"字（常见于观察报告/泛述）
+        # 不足以判为错题。智能观察的描述性行（画面/耗时/界面…）一律排除。
+        explicit_reason = extract_named_detail(line, ("错因", "错误原因", "疑似错因"), MISTAKE_REASON_LIMIT)
+        has_real_answer = not is_placeholder_mistake_text(recent_answer)
+        has_expected = not is_placeholder_mistake_text(recent_expected)
+        if looks_like_observation_noise(title_source) or looks_like_observation_noise(line):
+            if not (explicit_reason and has_real_answer):
+                continue
+        if status == "suspected" and not (has_real_answer or explicit_reason or has_expected):
+            continue
         digest = short_hash(normalize_learning_content(f"{title_source}\n{line}"))
         if digest in seen:
             continue
         seen.add(digest)
         error_reason = truncate_text(
-            extract_named_detail(line, ("错因", "错误原因", "疑似错因"), MISTAKE_REASON_LIMIT) or body or line,
+            explicit_reason or body or line,
             MISTAKE_REASON_LIMIT,
         )
         correction = extract_named_detail(line, ("订正", "改正", "订正痕迹", "修正"), ASSET_SOURCE_SUMMARY_LIMIT)
@@ -5157,9 +5251,9 @@ def upsert_mistake_item(conn, item: dict, source: dict, learning_item_id: str | 
             knowledge_points, subject, page_ref, question_ref, location_ref,
             error_type, correction, next_action, source_summary, source_image_details,
             status, review_state, next_review_at, evidence, source_image_ids,
-            first_seen_at, last_seen_at, content_hash, created_at, updated_at
+            first_seen_at, last_seen_at, content_hash, detection_method, created_at, updated_at
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             mistake_id,
@@ -5190,6 +5284,7 @@ def upsert_mistake_item(conn, item: dict, source: dict, learning_item_id: str | 
             source.get("first_seen_at") or now,
             source.get("last_seen_at") or source.get("first_seen_at") or now,
             item["content_hash"],
+            source.get("detection_method") or "",
             now,
             now,
         ),
@@ -5264,6 +5359,7 @@ def create_manual_mistake_item(session_id: str, body: dict) -> dict:
             "source_image_details": [],
             "source_summary": clean_user_text(body.get("source_summary") or "来自问答手动加入错题本", ASSET_SOURCE_SUMMARY_LIMIT),
             "confidence": "manual",
+            "detection_method": clean_user_text(body.get("detection_method") or "manual", 40),
             "first_seen_at": utc_now(),
             "last_seen_at": utc_now(),
         }
@@ -5325,6 +5421,7 @@ def store_learning_items_from_analysis(
     analysis_id: str,
     content: str,
     filenames: list[str],
+    detection_method: str = "photo_grading",
 ) -> dict:
     items = extract_learning_items(content)
     mistakes = extract_mistake_items(content, items)
@@ -5348,6 +5445,7 @@ def store_learning_items_from_analysis(
         "first_sequence_index": int(first.get("sequence_index") or 0),
         "last_sequence_index": int(last.get("sequence_index") or first.get("sequence_index") or 0),
         "confidence": "llm",
+        "detection_method": detection_method,
     }
     learning_ids: list[str] = []
     with connect() as conn:
@@ -7713,7 +7811,10 @@ async def run_analysis(
         else:
             conn.execute("UPDATE sessions SET status=?, updated_at=? WHERE id=?", (status, now, session_id))
     if status == "done":
-        counts = store_learning_items_from_analysis(session_id, batch_id, analysis_id, content, filenames)
+        counts = store_learning_items_from_analysis(
+            session_id, batch_id, analysis_id, content, filenames,
+            detection_method="observation" if summarize else "photo_grading",
+        )
         inferred = infer_needs_from_analysis(content)
         if counts["mistake_item_count"]:
             inferred = merge_tags(inferred, ["mistake_book"])

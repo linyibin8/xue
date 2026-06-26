@@ -6234,6 +6234,37 @@ struct ReviewQueueResponse: Decodable {
     }
 }
 
+/// 一道错题的"来历"：何时生成、怎么采集、为什么判为错、判定依据、置信度。后端 build_mistake_provenance 输出。
+struct MistakeProvenance: Decodable {
+    let methodLabel: String
+    let when: String
+    let why: String
+    let basis: String
+    let confidenceLabel: String
+    let sourceSummary: String
+
+    enum CodingKeys: String, CodingKey {
+        case methodLabel = "method_label"
+        case when
+        case why
+        case basis
+        case confidenceLabel = "confidence_label"
+        case sourceSummary = "source_summary"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        methodLabel = (try? c.decode(String.self, forKey: .methodLabel)) ?? ""
+        when = (try? c.decode(String.self, forKey: .when)) ?? ""
+        why = (try? c.decode(String.self, forKey: .why)) ?? ""
+        basis = (try? c.decode(String.self, forKey: .basis)) ?? ""
+        confidenceLabel = (try? c.decode(String.self, forKey: .confidenceLabel)) ?? ""
+        sourceSummary = (try? c.decode(String.self, forKey: .sourceSummary)) ?? ""
+    }
+
+    var whenDisplay: String { HistoryDateFormatter.displayString(from: when) }
+}
+
 struct ReviewMistakeItem: Decodable {
     let id: String
     let title: String
@@ -6254,10 +6285,12 @@ struct ReviewMistakeItem: Decodable {
     let nextReviewAt: String
     let reviewCount: Int
     let isDue: Bool
+    let provenance: MistakeProvenance?
 
     enum CodingKeys: String, CodingKey {
         case id
         case title
+        case provenance
         case subject
         case pageRef = "page_ref"
         case questionRef = "question_ref"
@@ -6298,6 +6331,7 @@ struct ReviewMistakeItem: Decodable {
         nextReviewAt = (try? container.decode(String.self, forKey: .nextReviewAt)) ?? ""
         reviewCount = (try? container.decode(Int.self, forKey: .reviewCount)) ?? 0
         isDue = (try? container.decode(Bool.self, forKey: .isDue)) ?? true
+        provenance = try? container.decode(MistakeProvenance.self, forKey: .provenance)
     }
 
     var displayTitle: String {
@@ -7816,6 +7850,79 @@ final class AppState: ObservableObject {
         } catch {
             log("错题本读取失败：\(networkErrorDescription(error))", level: "error")
         }
+    }
+
+    /// 错题本操作的轻提示（错题本页顶部短暂横幅）。
+    @Published var mistakeActionMessage: String = ""
+
+    private func submitReviewResult(mistakeId: String, result: String, note: String = "") async -> Bool {
+        let id = mistakeId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty else { return false }
+        var payload: [String: Any] = ["result": result]
+        if !note.isEmpty { payload["review_note"] = note }
+        do {
+            _ = try await postJSON(path: "/api/mistakes/\(id)/review-events", payload: payload)
+            await loadMistakeBook()
+            return true
+        } catch {
+            log("错题状态更新失败（\(result)）：\(networkErrorDescription(error))", level: "error")
+            mistakeActionMessage = "操作失败，请检查网络后重试"
+            return false
+        }
+    }
+
+    /// 消灭这道错题：标记已掌握（status=mastered），移出复习队列。
+    func markMistakeMastered(_ mistakeId: String) async {
+        if await submitReviewResult(mistakeId: mistakeId, result: "mastered", note: "学生确认已掌握，不再错") {
+            mistakeActionMessage = "已消灭这道错题 · 不再进入复习"
+            log("错题已标记掌握并移出队列")
+        }
+    }
+
+    /// 还会错：保留并改约下次复习（postpone），让它继续留在错题本里。
+    func keepMistakeForReview(_ mistakeId: String) async {
+        if await submitReviewResult(mistakeId: mistakeId, result: "postpone") {
+            mistakeActionMessage = "已保留，安排稍后再复习"
+        }
+    }
+
+    /// 复习指定错题：切到复习模式，带着这道题进入对话，由 AI 先回忆再检查是否掌握。
+    func startReviewForItem(_ item: ReviewMistakeItem) async {
+        guard !isPreparingReview, !isSubmittingQuestion else { return }
+        isPreparingReview = true
+        defer { isPreparingReview = false }
+        stopSpeaking()
+        stopListening(submit: false)
+        completePendingQAFrame(nil)
+        qaHideTimer?.invalidate()
+        learningMode = .review
+        coachDepth = .hintFirst
+        UserDefaults.standard.set(learningMode.rawValue, forKey: learningModeDefaultsKey)
+        UserDefaults.standard.set(coachDepth.rawValue, forKey: coachDepthDefaultsKey)
+        sessionId = nil
+        qaTurnIndex = 0
+        lastSyncedStrategySignature = ""
+        strategySyncState = "待同步"
+        activeReviewItem = item
+        studentGoal = reviewGoal(for: item, isDue: item.isDue)
+        let question = reviewQuestion(for: item)
+        reviewQueueState = "正在复习：\(reviewQueueSummary(for: item))"
+        qaOverlayVisible = true
+        qaAnswer = ""
+        qaStateText = "准备复习这道错题"
+        qaSystemImage = "arrow.triangle.2.circlepath"
+        uploadState = "准备复习"
+        studentGoalDidChange()
+        pendingQATrigger = "review_today"
+        pendingQAFocus = nil
+        pendingQAQuestion = question
+        recognizedText = question
+        appendUserChatMessage(question)
+        isThinking = true
+        qaStateText = "思考中"
+        qaSystemImage = "brain.head.profile"
+        let generation = beginQuestionSubmissionGeneration()
+        await submitRecognizedQuestion(generation: generation)
     }
 
     func refreshHistorySessions() async {

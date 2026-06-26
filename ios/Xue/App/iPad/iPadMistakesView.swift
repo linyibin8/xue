@@ -5,7 +5,9 @@ import SwiftUI
 
 struct iPadMistakesView: View {
     @ObservedObject var state: AppState
+    var onReview: () -> Void = {}
     @State private var selectedId: String?
+    @State private var working = false
 
     // 单一数据源：全部未掌握错题（loadMistakeBook 拉取，due_only=false），按是否到期在前端分组，避免重复。
     private var allItems: [ReviewMistakeItem] { state.recentReviewItems }
@@ -35,6 +37,7 @@ struct iPadMistakesView: View {
             }
         }
         .task { await state.loadMistakeBook() }
+        .onChange(of: selectedId) { _ in state.mistakeActionMessage = "" }
     }
 
     // MARK: 列表（精简）
@@ -98,6 +101,8 @@ struct iPadMistakesView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         header(item)
+                        actionBar(item)
+                        provenanceCard(item)
                         if !item.questionText.trimmedIsEmpty {
                             labeledCard("题目", systemImage: "doc.text", text: item.questionText)
                         }
@@ -109,6 +114,10 @@ struct iPadMistakesView: View {
                         if !item.correction.trimmedIsEmpty {
                             labeledCard("订正建议", systemImage: "checkmark.circle",
                                         text: item.correction, tint: .green)
+                        }
+                        if !item.nextAction.trimmedIsEmpty {
+                            labeledCard("复习建议", systemImage: "lightbulb",
+                                        text: item.nextAction, tint: .blue)
                         }
                         if !item.knowledgePoints.isEmpty {
                             VStack(alignment: .leading, spacing: 8) {
@@ -135,9 +144,80 @@ struct iPadMistakesView: View {
             HStack(spacing: 8) {
                 if !item.subject.isEmpty { chip(item.subject, .blue) }
                 if !item.locationRef.isEmpty { chip(item.locationRef, .gray) }
+                if let conf = item.provenance?.confidenceLabel, !conf.isEmpty { chip(conf, .purple) }
                 if item.isDue { chip("待复习", .orange) }
                 chip("已复习 \(item.reviewCount) 次", .green)
             }
+        }
+    }
+
+    // 复习 / 消灭 / 保留：怎么用、怎么消灭都从这里发起；掌握后由后端移出复习队列。
+    private func actionBar(_ item: ReviewMistakeItem) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !state.mistakeActionMessage.isEmpty {
+                Label(state.mistakeActionMessage, systemImage: "checkmark.seal.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.green)
+            }
+            HStack(spacing: 10) {
+                Button {
+                    Task { await state.startReviewForItem(item); onReview() }
+                } label: {
+                    Label("复习这道题", systemImage: "arrow.triangle.2.circlepath")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button {
+                    guard !working else { return }
+                    working = true
+                    Task { await state.markMistakeMastered(item.id); working = false }
+                } label: {
+                    Label("我已掌握·消灭", systemImage: "checkmark.circle.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(.green)
+
+                Button {
+                    guard !working else { return }
+                    working = true
+                    Task { await state.keepMistakeForReview(item.id); working = false }
+                } label: {
+                    Label("还会错·保留", systemImage: "clock.arrow.circlepath")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(.orange)
+            }
+            .disabled(working || state.isPreparingReview)
+        }
+    }
+
+    // 这道错题"怎么来的"：何时 / 怎么采集 / 为什么 / 判定依据。让来源透明、不再像是凭空冒出来。
+    @ViewBuilder
+    private func provenanceCard(_ item: ReviewMistakeItem) -> some View {
+        if let p = item.provenance {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("这道错题怎么来的", systemImage: "info.circle").font(.headline).foregroundStyle(.secondary)
+                if !p.whenDisplay.isEmpty { provRow("生成时间", p.whenDisplay, "clock") }
+                if !p.methodLabel.isEmpty { provRow("采集方式", p.methodLabel, "camera.viewfinder") }
+                if !p.confidenceLabel.isEmpty { provRow("当前状态", p.confidenceLabel, "flag") }
+                if !p.why.isEmpty { provRow("判定理由", p.why, "questionmark.circle") }
+                if !p.basis.isEmpty { provRow("判定依据", p.basis, "magnifyingglass") }
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
+        }
+    }
+
+    private func provRow(_ label: String, _ value: String, _ icon: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: icon).font(.caption).foregroundStyle(.tint).frame(width: 18)
+            Text(label).font(.caption.weight(.semibold)).foregroundStyle(.secondary).frame(width: 64, alignment: .leading)
+            Text(value).font(.caption).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
         }
     }
 

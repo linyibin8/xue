@@ -94,7 +94,7 @@ struct iPadRootView: View {
         switch section ?? .learn {
         case .learn: iPadLearnView(state: state)
         case .history: iPadHistoryView(state: state, onContinue: { section = .learn })
-        case .mistakes: iPadMistakesView(state: state)
+        case .mistakes: iPadMistakesView(state: state, onReview: { section = .learn })
         case .memory: iPadMemoryView(state: state)
         case .settings: iPadSettingsView(state: state, auth: auth)
         }

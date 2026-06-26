@@ -618,6 +618,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         ensure_column(conn, "mistake_items", "ignored_at", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "mistake_items", "corrected_at", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "mistake_items", "mastered_at", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "mistake_items", "detection_method", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "review_events", "event_type", "TEXT NOT NULL DEFAULT 'review'")
         ensure_column(conn, "review_events", "note", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "review_events", "source", "TEXT NOT NULL DEFAULT ''")
