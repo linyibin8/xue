@@ -204,7 +204,9 @@ MEMORY_CONSOLIDATION_INTERVAL_SECONDS = 3600
 MEMORY_EVENT_TEXT_LIMIT = 1200
 MEMORY_PROFILE_CHAR_LIMIT = 4000
 MEMORY_PROFILE_RECENT_EVENT_LIMIT = 80
-MISTAKE_STATUS_VALUES = {"suspected", "incomplete", "confirmed", "ignored", "corrected", "mastered"}
+# "candidate" = 智能观察异步提取出的"可疑错题候选"，尚未进正式错题本/复习队列；学生确认(import)
+# 后转 confirmed 才入本，忽略(dismiss)转 ignored。它被刻意排除在 ACTIVE/REVIEW_QUEUE 之外。
+MISTAKE_STATUS_VALUES = {"candidate", "suspected", "incomplete", "confirmed", "ignored", "corrected", "mastered"}
 MISTAKE_STATUS_ALIASES = {"resolved": "mastered"}
 MISTAKE_REVIEW_STATE_VALUES = {"new", "queued", "scheduled", "reviewing", "done", "mastered", "ignored"}
 MISTAKE_REVIEW_STATE_ALIASES = {"archived": "ignored", "due": "scheduled", "later": "scheduled"}
@@ -2997,6 +2999,7 @@ _MISTAKE_METHOD_LABELS = {
     "qa": "问答中发现",
 }
 _MISTAKE_STATUS_LABELS = {
+    "candidate": "候选 · 待导入",
     "suspected": "疑似 · 待确认",
     "incomplete": "疑似未完成",
     "confirmed": "已确认",
@@ -3812,6 +3815,13 @@ def is_placeholder_mistake_text(text: str) -> bool:
     return len(body) < 2 or body in _MISTAKE_PLACEHOLDER_VALUES
 
 
+def is_blank_mistake_value(text: str) -> bool:
+    """按取值（而非长度）判空，用于结构化错题字段：单字符答案如“5”“6”“x”是合法作答，
+    不能像 is_placeholder_mistake_text 那样按 len<2 误杀。"""
+    body = (text or "").strip()
+    return not body or body in _MISTAKE_PLACEHOLDER_VALUES
+
+
 def extract_mistake_items(content: str, learning_items: list[dict] | None = None) -> list[dict]:
     items: list[dict] = []
     seen: set[str] = set()
@@ -3882,6 +3892,167 @@ def extract_mistake_items(content: str, learning_items: list[dict] | None = None
                 "content_hash": digest,
             },
             f"{line}\n{recent_question}\n{recent_answer}\n{content}",
+            context_subject,
+        )
+        items.append(mistake)
+        if len(items) >= 40:
+            break
+    return items
+
+
+# ── 错题本结构化入库（精准识别） ─────────────────────────────────────────────
+# 旧路径用正则反解观察报告散文，导致“差异题目/题目耗时线索/画面静止…”这类小节标题和
+# 画面描述被误判成错题。新路径让“看得见图片”的模型在主动拍题时直接吐机读 JSON
+# （以“错题JSON：”开头），后端只解析它，并要求“学生确有手写作答 + 可见判错证据”才入库。
+_MISTAKE_JSON_MARKER = re.compile(r"错题\s*JSON", re.IGNORECASE)
+# 观察异步候选用独立标记，避免和主动拍题的“错题JSON”混淆。
+_MISTAKE_CANDIDATE_JSON_MARKER = re.compile(r"错题\s*候选\s*JSON", re.IGNORECASE)
+
+_MISTAKE_JSON_FIELD_ALIASES = {
+    "question": ("题目", "题干", "题", "question", "question_text"),
+    "student": ("学生作答", "学生答案", "我的作答", "作答", "student_answer"),
+    "expected": ("正确答案", "参考答案", "标准答案", "应为", "expected_answer"),
+    "reason": ("错因", "错误原因", "疑似错因", "reason", "error_reason"),
+    "error_type": ("错误类型", "错因类型", "类型", "error_type"),
+    "evidence": ("证据", "判错证据", "evidence"),
+    "correction": ("订正", "改正", "修正", "correction"),
+    "knowledge": ("知识点", "考点", "knowledge", "knowledge_points"),
+}
+
+
+def _iter_json_arrays(text: str):
+    """Yield top-level `[...]` substrings via bracket matching (string-aware), so we
+    can recover the JSON array even when the model wraps it in prose or code fences."""
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for index, ch in enumerate(text or ""):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "[":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif ch == "]" and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                yield text[start : index + 1]
+                start = -1
+
+
+def has_mistake_json_block(content: str, marker: re.Pattern = _MISTAKE_JSON_MARKER) -> bool:
+    return bool(marker.search(content or ""))
+
+
+def extract_mistake_json(content: str, marker: re.Pattern = _MISTAKE_JSON_MARKER) -> list[dict]:
+    text = content or ""
+    found = marker.search(text)
+    regions = [text[found.end() :]] if found else []
+    regions.append(text)
+    for region in regions:
+        for candidate in _iter_json_arrays(region):
+            try:
+                data = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, list) and any(isinstance(entry, dict) for entry in data):
+                return [entry for entry in data if isinstance(entry, dict)]
+    return []
+
+
+def _mistake_json_field(entry: dict, key: str) -> object:
+    for alias in _MISTAKE_JSON_FIELD_ALIASES[key]:
+        if alias in entry and entry[alias] not in (None, ""):
+            return entry[alias]
+    return ""
+
+
+def _mistake_json_knowledge(raw: object) -> list[str]:
+    if isinstance(raw, list):
+        return [clean_asset_field(item) for item in raw if clean_asset_field(item)]
+    value = clean_asset_field(raw)
+    return [value] if value else []
+
+
+def parse_structured_mistakes(
+    content: str,
+    learning_items: list[dict] | None = None,
+    *,
+    marker: re.Pattern = _MISTAKE_JSON_MARKER,
+    force_status: str | None = None,
+) -> list[dict]:
+    """解析模型直出的机读错题 JSON。force_status='candidate' 时走观察候选模式：门槛更宽
+    （因为后面有学生人工确认），但仍要求有题面+真实作答/订正证据，并剔除观察画面噪声。"""
+    entries = extract_mistake_json(content, marker)
+    if not entries:
+        return []
+    context_subject = extract_subject_from_text(content)
+    fallback_knowledge = [
+        item["content"] for item in (learning_items or []) if item.get("item_type") == "knowledge"
+    ]
+    items: list[dict] = []
+    seen: set[str] = set()
+    for entry in entries:
+        question = clean_asset_field(_mistake_json_field(entry, "question"))
+        student = clean_asset_field(_mistake_json_field(entry, "student"))
+        expected = clean_asset_field(_mistake_json_field(entry, "expected"))
+        reason = clean_asset_field(_mistake_json_field(entry, "reason"), MISTAKE_REASON_LIMIT)
+        error_type = clean_asset_field(_mistake_json_field(entry, "error_type"))
+        evidence = clean_asset_field(_mistake_json_field(entry, "evidence"), ASSET_SOURCE_SUMMARY_LIMIT)
+        correction = clean_asset_field(_mistake_json_field(entry, "correction"), ASSET_SOURCE_SUMMARY_LIMIT)
+        entry_knowledge = _mistake_json_knowledge(_mistake_json_field(entry, "knowledge"))
+        combined = " ".join((error_type, reason, evidence))
+        is_incomplete = any(token in combined for token in ("未完成", "空白", "未作答", "不会"))
+        has_student = not is_blank_mistake_value(student)
+        has_correction_evidence = bool(correction) or any(
+            token in evidence for token in ("划掉", "订正", "改", "红叉", "错")
+        )
+        if force_status == "candidate":
+            # 候选模式（较宽松）：有题面，且学生确有作答 / 有订正划掉证据 / 明确留空未完成。
+            if not question:
+                continue
+            if not (has_student or has_correction_evidence or is_incomplete):
+                continue
+        else:
+            # 精准门槛：要么学生确有手写作答（疑似做错），要么明确标注留空未完成且有题面。
+            if not has_student and not (is_incomplete and question):
+                continue
+        # 画面/界面/耗时等观察噪声一律不进错题本/候选，哪怕模型误塞进了 JSON。
+        if any(looks_like_observation_noise(value) for value in (question, student, reason, evidence)):
+            continue
+        title_source = question or student or reason
+        if is_blank_mistake_value(title_source):
+            continue
+        status = force_status or ("suspected" if has_student else "incomplete")
+        digest = short_hash(normalize_learning_content(f"{title_source}\n{student}\n{reason}"))
+        if digest in seen:
+            continue
+        seen.add(digest)
+        mistake = enrich_asset_fields_from_text(
+            {
+                "title": title_for_learning_item(title_source),
+                "question_text": question,
+                "student_answer": student,
+                "expected_answer": expected,
+                "error_reason": truncate_text(reason or evidence or title_source, MISTAKE_REASON_LIMIT),
+                "knowledge_points": (entry_knowledge or fallback_knowledge)[:8],
+                "status": status,
+                "evidence": truncate_text(evidence or student or question, ASSET_SOURCE_SUMMARY_LIMIT),
+                "error_type": error_type or extract_error_type(combined),
+                "correction": correction,
+                "next_action": "",
+                "content_hash": digest,
+            },
+            f"{question}\n{student}\n{reason}\n{evidence}\n{content}",
             context_subject,
         )
         items.append(mistake)
@@ -4083,6 +4254,7 @@ def merge_source_details(existing_raw: str | None, incoming: list[dict]) -> list
 
 def merge_mistake_status(existing: str, incoming: str) -> str:
     priority = {
+        "candidate": 0,
         "suspected": 1,
         "incomplete": 2,
         "confirmed": 3,
@@ -5243,6 +5415,10 @@ def upsert_mistake_item(conn, item: dict, source: dict, learning_item_id: str | 
         sync_asset_document(conn, "mistake", existing["id"])
         return existing["id"]
     mistake_id = uuid.uuid4().hex
+    insert_status = item.get("status", "suspected")
+    # 候选不排进复习队列：review_state=new、不设到期时间；导入(confirmed)后才由 update_mistake_item 排程。
+    insert_review_state = "new" if insert_status == "candidate" else "queued"
+    insert_next_review_at = "" if insert_status == "candidate" else review_due_at_for(insert_status, "queued")
     conn.execute(
         """
         INSERT INTO mistake_items(
@@ -5276,9 +5452,9 @@ def upsert_mistake_item(conn, item: dict, source: dict, learning_item_id: str | 
             item.get("next_action", ""),
             source_summary,
             json_dumps(source_image_details),
-            item.get("status", "suspected"),
-            "queued",
-            review_due_at_for(item.get("status", "suspected"), "queued"),
+            insert_status,
+            insert_review_state,
+            insert_next_review_at,
             item.get("evidence", ""),
             json_dumps(source_image_ids),
             source.get("first_seen_at") or now,
@@ -5424,7 +5600,19 @@ def store_learning_items_from_analysis(
     detection_method: str = "photo_grading",
 ) -> dict:
     items = extract_learning_items(content)
-    mistakes = extract_mistake_items(content, items)
+    # 正式错题本只由主动拍题/批改喂养（精准 JSON）。被动智能观察(observation)不直接写错题本，
+    # 而是异步提取“可疑错题候选”(status=candidate)，由学生人工确认后才导入正式错题本，
+    # 避免“题目耗时线索/差异题目/画面静止”这类观察噪声灌入。
+    if detection_method == "observation":
+        mistakes = parse_structured_mistakes(
+            content, items, marker=_MISTAKE_CANDIDATE_JSON_MARKER, force_status="candidate"
+        )
+    else:
+        # 优先解析模型直出的机读 JSON（精准）；模型没吐 JSON 时退回旧启发式（已带去噪门槛），
+        # 避免主动拍题的错题零召回。
+        mistakes = parse_structured_mistakes(content, items)
+        if not mistakes and not has_mistake_json_block(content):
+            mistakes = extract_mistake_items(content, items)
     if not items and not mistakes:
         return {"learning_item_count": 0, "mistake_item_count": 0}
     images = source_images_for_analysis(session_id, batch_id, filenames)
@@ -7214,6 +7402,80 @@ def review_queue_items(
     return {"items": items, "total": total, "due_only": due_only, "page_size": page_size}
 
 
+def mistake_candidate_items(
+    *,
+    account_id: str = "",
+    subject: str = "",
+    q: str = "",
+    page_size: int = ASSET_PAGE_SIZE_DEFAULT,
+) -> dict:
+    """智能观察异步提取出的“可疑错题候选”(status=candidate)，等学生人工确认导入。
+    刻意与正式错题本/复习队列分开：review_queue_items 不含 candidate，这里只含 candidate。"""
+    account_id = account_id or get_settings().default_account_id or DEFAULT_ACCOUNT_ID
+    page_size = normalize_asset_page_size(page_size)
+    where = ["sessions.account_id=?", "mi.status='candidate'"]
+    params: list[object] = [account_id]
+    if subject:
+        where.append("mi.subject LIKE ?")
+        params.append(asset_like_pattern(subject))
+    if q:
+        pattern = asset_like_pattern(q)
+        where.append(
+            "(mi.title LIKE ? OR mi.question_text LIKE ? OR mi.student_answer LIKE ? "
+            "OR mi.error_reason LIKE ? OR mi.evidence LIKE ? OR mi.subject LIKE ?)"
+        )
+        params.extend([pattern] * 6)
+    where_sql = "WHERE " + " AND ".join(where)
+    with connect() as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT mi.*, sessions.title AS session_title, sessions.status AS session_status,
+                       sessions.created_at AS session_created_at
+                FROM mistake_items mi
+                LEFT JOIN sessions ON sessions.id = mi.session_id
+                {where_sql}
+                ORDER BY mi.last_seen_at DESC, mi.created_at DESC
+                LIMIT ?
+                """,
+                [*params, page_size],
+            )
+        ]
+        total = conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM mistake_items mi
+            LEFT JOIN sessions ON sessions.id = mi.session_id
+            {where_sql}
+            """,
+            params,
+        ).fetchone()["count"]
+    return {"items": [mistake_row_to_dict(row) for row in rows], "total": total, "page_size": page_size}
+
+
+def owned_mistake_status(mistake_id: str, account_id: str) -> str | None:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT mi.status
+            FROM mistake_items mi
+            LEFT JOIN sessions ON sessions.id = mi.session_id
+            WHERE mi.id=? AND sessions.account_id=?
+            """,
+            (mistake_id, account_id),
+        ).fetchone()
+    return row["status"] if row else None
+
+
+async def _optional_json_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except Exception:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
 def add_metric(metrics: dict[str, dict], key: str, *, weight: int = 1, **extra) -> None:
     normalized = str(key or "").strip()
     if not normalized:
@@ -7334,7 +7596,8 @@ def student_profile(account_id: str = "") -> dict:
                 SUM(CASE WHEN mi.status IN ('suspected','incomplete','confirmed','corrected')
                           AND mi.review_state NOT IN ('mastered','ignored')
                           AND (mi.next_review_at='' OR mi.next_review_at <= ?) THEN 1 ELSE 0 END) AS due_count,
-                SUM(CASE WHEN mi.status='mastered' OR mi.review_state='mastered' THEN 1 ELSE 0 END) AS mastered_count
+                SUM(CASE WHEN mi.status='mastered' OR mi.review_state='mastered' THEN 1 ELSE 0 END) AS mastered_count,
+                SUM(CASE WHEN mi.status='candidate' THEN 1 ELSE 0 END) AS candidate_count
             FROM mistake_items mi
             LEFT JOIN sessions ON sessions.id = mi.session_id
             WHERE sessions.account_id=?
@@ -7343,6 +7606,9 @@ def student_profile(account_id: str = "") -> dict:
         ).fetchone()
 
     for row in mistake_rows:
+        # 候选还没被学生确认，不计入知识点/错因/科目画像，避免未确认的猜测污染学情。
+        if row.get("status") == "candidate":
+            continue
         is_ignored = row.get("status") == "ignored" or row.get("review_state") == "ignored"
         is_mastered = row.get("status") == "mastered" or row.get("review_state") == "mastered"
         if not is_ignored and not is_mastered:
@@ -7383,6 +7649,7 @@ def student_profile(account_id: str = "") -> dict:
         "active_review_count": int(queue_counts["active_count"] or 0) if queue_counts else 0,
         "due_review_count": int(queue_counts["due_count"] or 0) if queue_counts else 0,
         "mastered_mistake_count": int(queue_counts["mastered_count"] or 0) if queue_counts else 0,
+        "candidate_count": int(queue_counts["candidate_count"] or 0) if queue_counts else 0,
         "correction_efficiency": round(correct_events / total_events, 3) if total_events else 0,
     }
     if review_totals and review_totals["avg_duration_seconds"] is not None:
@@ -8754,6 +9021,58 @@ async def patch_mistake(mistake_id: str, request: Request) -> dict:
     mistake = update_mistake_item(mistake_id, body if isinstance(body, dict) else {})
     emit_log(
         f"更新错题状态：{mistake_id} status={mistake.get('status')} review_state={mistake.get('review_state')}",
+        session_id=mistake.get("session_id"),
+        source="dashboard",
+    )
+    return {"mistake": mistake}
+
+
+@app.get("/api/mistake-candidates")
+def get_mistake_candidates(
+    request: Request,
+    subject: str = Query(""),
+    q: str = Query(""),
+    page_size: int = Query(ASSET_PAGE_SIZE_DEFAULT, ge=1, le=ASSET_PAGE_SIZE_MAX),
+) -> dict:
+    """列出待学生确认的错题候选（观察异步提取）。"""
+    init_db()
+    principal = principal_from_request(request)
+    return mistake_candidate_items(account_id=principal["account_id"], subject=subject, q=q, page_size=page_size)
+
+
+@app.post("/api/mistakes/{mistake_id}/import")
+async def import_mistake_candidate(mistake_id: str, request: Request) -> dict:
+    """学生确认候选→导入正式错题本（status=confirmed，进复习队列）。可带 review_note/correction 等内联订正。"""
+    init_db()
+    principal = principal_from_request(request)
+    status = owned_mistake_status(mistake_id, principal["account_id"])
+    if status is None:
+        raise HTTPException(404, "mistake not found")
+    body = await _optional_json_body(request)
+    updates: dict = {"status": "confirmed", "review_state": "queued"}
+    for key in ("review_note", "correction", "next_action", "error_type"):
+        if key in body:
+            updates[key] = body[key]
+    mistake = update_mistake_item(mistake_id, updates)
+    emit_log(
+        f"导入错题候选→错题本：{mistake_id}",
+        session_id=mistake.get("session_id"),
+        source="dashboard",
+    )
+    return {"mistake": mistake}
+
+
+@app.post("/api/mistakes/{mistake_id}/dismiss")
+async def dismiss_mistake_candidate(mistake_id: str, request: Request) -> dict:
+    """学生忽略候选（status=ignored，不进错题本）。"""
+    init_db()
+    principal = principal_from_request(request)
+    status = owned_mistake_status(mistake_id, principal["account_id"])
+    if status is None:
+        raise HTTPException(404, "mistake not found")
+    mistake = update_mistake_item(mistake_id, {"status": "ignored"})
+    emit_log(
+        f"忽略错题候选：{mistake_id}",
         session_id=mistake.get("session_id"),
         source="dashboard",
     )
