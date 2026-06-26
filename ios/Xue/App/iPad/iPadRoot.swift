@@ -36,6 +36,7 @@ struct iPadRootView: View {
     @ObservedObject private var auth = AuthSession.shared
     @State private var section: iPadSection?
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var showBackgroundTasks = false   // #8 后台任务面板
 
     init() {
         #if DEBUG
@@ -62,6 +63,9 @@ struct iPadRootView: View {
             state.startDeviceControlPolling()
             await auth.refreshOps()
         }
+        .sheet(isPresented: $showBackgroundTasks) {
+            iPadBackgroundTasksSheet(state: state, auth: auth) { showBackgroundTasks = false }
+        }
     }
 
     private var sidebar: some View {
@@ -81,7 +85,7 @@ struct iPadRootView: View {
         .listStyle(.sidebar)
         .navigationTitle("知进伴学")
         .safeAreaInset(edge: .bottom) {
-            iPadAccountFooter(auth: auth)
+            iPadAccountFooter(state: state, auth: auth) { showBackgroundTasks = true }
         }
     }
 
@@ -152,7 +156,18 @@ struct iPadStudentSwitcher: View {
 // MARK: - 账号 + 配额（侧栏底部）
 
 struct iPadAccountFooter: View {
+    @ObservedObject var state: AppState
     @ObservedObject var auth: AuthSession
+    let onOpenTasks: () -> Void
+
+    // #8 指示器文案：本机有正在运行的任务时优先报数量，否则报服务端队列 ETA。
+    private var backgroundIndicatorText: String {
+        let running = state.runtimeTasks.count
+        if running > 0 {
+            return "运行中 \(running) 项" + (auth.bgActive && auth.bgEtaSeconds > 0 ? " · 后台约\(auth.bgEtaSeconds)s" : "")
+        }
+        return "后台生成中" + (auth.bgEtaSeconds > 0 ? " · 约\(auth.bgEtaSeconds)s" : "")
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -176,18 +191,107 @@ struct iPadAccountFooter: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            if auth.bgActive {
-                HStack(spacing: 6) {
-                    ProgressView().scaleEffect(0.7)
-                    Text("后台生成中" + (auth.bgEtaSeconds > 0 ? " · 约\(auth.bgEtaSeconds)s" : ""))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+            // #8 后台/运行中任务：可点击查看在跑的任务并关闭。服务端队列(bgActive)或本机任务(runtimeTasks)任一活跃就显示。
+            if auth.bgActive || !state.runtimeTasks.isEmpty {
+                Button {
+                    onOpenTasks()
+                } label: {
+                    HStack(spacing: 6) {
+                        ProgressView().scaleEffect(0.7)
+                        Text(backgroundIndicatorText)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 2)
+                        Image(systemName: "chevron.up.circle")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
                 }
+                .buttonStyle(.plain)
             }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.bar)
+    }
+}
+
+// MARK: - #8 后台任务面板（看到在跑的任务 + 关闭可取消的任务）
+// 数据源：本机 state.runtimeTasks（观察/语音/朗读/上传/报告等，含可关闭项）+ 服务端生成队列（auth.bgAhead/bgEtaSeconds）。
+// 服务端队列在模型空闲时自动生成（可视化/报告），会自行完成；本机任务里 canClose 的可一键停止。
+struct iPadBackgroundTasksSheet: View {
+    @ObservedObject var state: AppState
+    @ObservedObject var auth: AuthSession
+    let onClose: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("正在运行（本机）") {
+                    if state.runtimeTasks.isEmpty {
+                        Text("本机暂无正在运行的任务。")
+                            .font(.callout).foregroundStyle(.secondary)
+                    } else {
+                        ForEach(state.runtimeTasks) { task in
+                            taskRow(task)
+                        }
+                    }
+                }
+
+                if auth.bgActive {
+                    Section("后端生成队列") {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(auth.bgAhead > 0 ? "正在生成，前方 \(auth.bgAhead) 个任务" : "正在生成")
+                                    .font(.callout.weight(.semibold))
+                                Text((auth.bgEtaSeconds > 0 ? "预计还需约 \(auth.bgEtaSeconds) 秒。" : "")
+                                     + "可视化/报告在模型空闲时自动生成，会自行完成，无需等待。")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+            }
+            .navigationTitle("后台任务")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { onClose() }
+                }
+            }
+        }
+    }
+
+    private func taskRow(_ task: RuntimeTaskItem) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            if task.showsProgress {
+                ProgressView().frame(width: 22)
+            } else {
+                Image(systemName: task.systemImage).foregroundStyle(.tint).frame(width: 22)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(task.title).font(.callout.weight(.semibold))
+                if !task.detail.isEmpty {
+                    Text(task.detail).font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 8)
+            if task.canClose {
+                Button(role: .destructive) {
+                    state.closeRuntimeTask(task.id)
+                } label: {
+                    Label(task.closeTitle, systemImage: task.closeSystemImage)
+                        .labelStyle(.iconOnly)
+                        .font(.title3)
+                }
+                .buttonStyle(.borderless)
+            }
+        }
+        .padding(.vertical, 2)
     }
 }

@@ -92,7 +92,16 @@ struct iPadHistoryView: View {
                             if !report.content.isEmpty {
                                 sectionCard(title: "学习报告", systemImage: report.systemImage, body: report.content)
                             }
-                            if !report.qaPreview.isEmpty {
+                            if !report.qaRounds.isEmpty {
+                                // #5 每个回合一张卡，标题=问题第一句，便于快速回看。
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Label("问答回顾", systemImage: "bubble.left.and.bubble.right")
+                                        .font(.headline)
+                                    ForEach(Array(report.qaRounds.enumerated()), id: \.element.id) { idx, round in
+                                        roundCard(index: idx + 1, round: round)
+                                    }
+                                }
+                            } else if !report.qaPreview.isEmpty {
                                 sectionCard(title: "问答回顾", systemImage: "bubble.left.and.bubble.right", body: report.qaPreview)
                             }
                         } else if !session.summaryPreview.isEmpty {
@@ -121,6 +130,35 @@ struct iPadHistoryView: View {
             }
         }
         .background(Color(.systemGroupedBackground))
+    }
+
+    // #5 单个问答回合卡：序号 + 第一句标题，展开问/答全文。
+    private func roundCard(index: Int, round: HistoryQARound) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("\(index)")
+                    .font(.caption.weight(.bold).monospacedDigit())
+                    .foregroundStyle(.white)
+                    .frame(width: 22, height: 22)
+                    .background(Color.accentColor, in: Circle())
+                Text(round.title.isEmpty ? "第 \(index) 回合" : round.title)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+            }
+            if !round.question.isEmpty {
+                Text("问：\(round.question)")
+                    .font(.footnote).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !round.answer.isEmpty {
+                Text("答：\(round.answer)")
+                    .font(.footnote).foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 12))
     }
 
     private func sectionCard(title: String, systemImage: String, body: String) -> some View {

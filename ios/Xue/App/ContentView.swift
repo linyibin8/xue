@@ -3805,17 +3805,9 @@ private struct ChatSettingsPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label("本轮偏好", systemImage: "slider.horizontal.3")
+            // #4 去掉重复的「本轮偏好」（临时 studentGoal）——本轮要求可直接在对话里说；只保留持久的「一句话辅导偏好」。
+            Label("一句话辅导偏好", systemImage: "slider.horizontal.3")
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-
-            TextField("例如：整理错题本、提炼知识点、检查过程", text: $state.studentGoal, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .lineLimit(1...3)
-                .submitLabel(.done)
-
-            Text("一句话辅导偏好")
-                .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
             TextField("例如：先给提示别直接报答案，讲慢一点", text: coachPreferenceBinding, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
@@ -3846,23 +3838,7 @@ private struct ChatSettingsPanel: View {
                 .onChange(of: state.voicePlaybackEnabled) { enabled in
                     state.voicePlaybackEnabledDidChange(enabled)
                 }
-
-                HStack(spacing: 10) {
-                    Label("速度", systemImage: "speedometer")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    Slider(value: $state.voicePlaybackRate, in: ttsMinimumSpeed...ttsMaximumSpeed, step: ttsSpeedStep) {
-                        Text("朗读速度")
-                    }
-                    Text("\(state.voicePlaybackRate, specifier: "%.2f")x")
-                        .font(.caption2.monospacedDigit().weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 44, alignment: .trailing)
-                }
-                .onChange(of: state.voicePlaybackRate) { rate in
-                    state.voicePlaybackRateDidChange(rate)
-                }
-                .disabled(!state.voicePlaybackEnabled)
+                // #6 朗读语速移出上下文面板——它属于语音播放设置，不是上下文配置；在「设置」里调。
             }
         }
         .padding(12)
@@ -4834,7 +4810,39 @@ private struct HistoryReportSheet: View {
 
                     SelectableTextBlock(text: report.content)
 
-                    if !report.qaPreview.isEmpty {
+                    if !report.qaRounds.isEmpty {
+                        // #5 每回合一张卡，标题=问题第一句。
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("问答回顾", systemImage: "bubble.left.and.bubble.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            ForEach(Array(report.qaRounds.enumerated()), id: \.element.id) { idx, round in
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack(spacing: 6) {
+                                        Text("\(idx + 1)")
+                                            .font(.caption2.weight(.bold).monospacedDigit())
+                                            .foregroundStyle(.white)
+                                            .frame(width: 18, height: 18)
+                                            .background(Color.accentColor, in: Circle())
+                                        Text(round.title.isEmpty ? "第 \(idx + 1) 回合" : round.title)
+                                            .font(.subheadline.weight(.semibold))
+                                            .lineLimit(2)
+                                    }
+                                    if !round.question.isEmpty {
+                                        Text("问：\(round.question)").font(.caption).foregroundStyle(.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                    if !round.answer.isEmpty {
+                                        Text("答：\(round.answer)").font(.caption)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                }
+                                .padding(12)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
+                            }
+                        }
+                    } else if !report.qaPreview.isEmpty {
                         VStack(alignment: .leading, spacing: 6) {
                             Label("最近问答", systemImage: "bubble.left.and.bubble.right")
                                 .font(.caption.weight(.semibold))
@@ -4968,7 +4976,7 @@ enum LearningCaptureSource: Equatable {
 struct ChatMessage: Identifiable {
     let id = UUID()
     let role: ChatMessageRole
-    let text: String
+    var text: String
     var question: String = ""
     var qaEventId: String = ""
     var visualizationCandidate = false
@@ -4977,6 +4985,7 @@ struct ChatMessage: Identifiable {
     var title: String?
     var systemImage: String?
     var showsProgress = false
+    var statusKey: String? = nil   // 同 key 的进度状态可被「就地更新」（spinner→结果），避免重复气泡 + 永久转圈。
     var contextItems: [ContextBadgeItem] = []
     var attachments: [ChatAttachment] = []
 }
@@ -5451,13 +5460,33 @@ private struct HistoryCarryContext {
     }
 }
 
+struct HistoryQARound: Identifiable {
+    let id = UUID()
+    let title: String       // #5 回合标题：取问题第一句（空则取答案第一句）
+    let question: String
+    let answer: String
+}
+
 struct HistoryReportDetail: Identifiable {
     let id = UUID()
     let title: String
     let subtitle: String
     let content: String
     let qaPreview: String
+    let qaRounds: [HistoryQARound]
     let systemImage: String
+}
+
+/// #5 取一段文本的「第一句」作为回合标题：在第一个句末标点（。！？.!?\n）处截断，限长。
+func firstSentenceTitle(_ text: String, limit: Int = 24) -> String {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return "" }
+    let terminators = CharacterSet(charactersIn: "。！？.!?\n")
+    if let range = trimmed.rangeOfCharacter(from: terminators) {
+        let sentence = String(trimmed[trimmed.startIndex..<range.lowerBound]).trimmingCharacters(in: .whitespaces)
+        if !sentence.isEmpty { return shortText(sentence, limit: limit) }
+    }
+    return shortText(trimmed, limit: limit)
 }
 
 struct QAOverlay: View {
@@ -7778,11 +7807,15 @@ final class AppState: ObservableObject {
                 session.summaryPreview,
                 "报告正在生成中，请稍后刷新历史对话后再查看。"
             )
-            let qaPreview = qaEvents.prefix(8).compactMap { event -> String? in
-                let question = event["question"] as? String ?? ""
-                let answer = event["answer"] as? String ?? ""
+            let qaRounds = qaEvents.prefix(12).compactMap { event -> HistoryQARound? in
+                let question = (event["question"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let answer = (event["answer"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !question.isEmpty || !answer.isEmpty else { return nil }
-                return "问：\(shortText(question, limit: 70))\n答：\(shortText(answer, limit: 110))"
+                let title = firstSentenceTitle(question.isEmpty ? answer : question)
+                return HistoryQARound(title: title, question: question, answer: answer)
+            }
+            let qaPreview = qaRounds.prefix(8).map {
+                "问：\(shortText($0.question, limit: 70))\n答：\(shortText($0.answer, limit: 110))"
             }.joined(separator: "\n\n")
             let isObservation = session.imageCount > 0
             return HistoryReportDetail(
@@ -7790,6 +7823,7 @@ final class AppState: ObservableObject {
                 subtitle: isObservation ? "观察报告 · \(session.countSummary)" : "问答总结 · \(session.countSummary)",
                 content: finalContent,
                 qaPreview: qaPreview,
+                qaRounds: qaRounds,
                 systemImage: isObservation ? "doc.text.magnifyingglass" : "text.bubble"
             )
         } catch {
@@ -7799,6 +7833,7 @@ final class AppState: ObservableObject {
                 subtitle: "读取失败",
                 content: networkErrorUserMessage(error),
                 qaPreview: "",
+                qaRounds: [],
                 systemImage: "exclamationmark.triangle"
             )
         }
@@ -9025,24 +9060,27 @@ final class AppState: ObservableObject {
     }
 
     private func shouldSubmitQAFrame(_ frame: QAFrameCandidate, intentHint: String, turn: Int) -> Bool {
-        let hasUsableStudyMaterial = frame.assessment.shouldUpload && frame.analysis.signals.hasStudyMaterial
+        // #1 用户主动拍题/提问（新问题 / 批改检查 / 双击当前画面 / 指向某题）：人已在现场、
+        // 画面就是要问的东西 → 只要画面质量过关就随问发出，不再要求「识别到学习材料/学生在场」
+        // （手/脸/身体的在场检测只服务于智能观察，不卡实时问答）。纯追问仍走「复用首轮题图」。
+        let qualityOK = frame.assessment.shouldUpload
         if pendingQATrigger.hasPrefix("double_tap_current_frame") {
-            return hasUsableStudyMaterial
+            return qualityOK
         }
-        if pendingQATrigger != "review_today" && hasUsableStudyMaterial {
+        if pendingQATrigger != "review_today" && qualityOK && frame.analysis.signals.hasStudyMaterial {
             return true
         }
         if ["correction_check", "answer_check", "visual_check"].contains(intentHint) {
-            return hasUsableStudyMaterial
+            return qualityOK
         }
         if intentHint == "new_question" && turn <= 1 {
-            return hasUsableStudyMaterial
+            return qualityOK
         }
         if intentHint == "new_question" && qaQuestionHasNewProblemReference(qaQuestionTextForSubmission()) {
-            return hasUsableStudyMaterial
+            return qualityOK
         }
         if pendingQATrigger.lowercased().contains("point") && intentHint == "new_question" {
-            return hasUsableStudyMaterial
+            return qualityOK
         }
         return false
     }
@@ -9262,11 +9300,11 @@ final class AppState: ObservableObject {
     }
 
     private func submittedVisualDetail(frame: QAFrameCandidate, submittedCurrentFrame: Bool, reusedAnchorFrame: Bool) -> String {
+        // #1 实时问答的明细不再展示「学生在场/手脸身体」这类在场识别（那是智能观察的概念，
+        // 用户主动提问时人显然在场，写出来只会让人误以为在卡在场检测）。
         [
             submittedVisualSummary(frame: frame, submittedCurrentFrame: submittedCurrentFrame, reusedAnchorFrame: reusedAnchorFrame),
             "质量判断：\(frame.assessment.userMessage)",
-            "画面活动：\(frame.analysis.signals.activitySummary)",
-            "学生识别：\(frame.analysis.signals.presenceSummary)",
             "是否建议上传：\(frame.assessment.shouldUpload ? "是" : "否")",
             "学习材料：\(frame.analysis.signals.hasStudyMaterial ? "已识别" : "未充分识别")"
         ].joined(separator: "\n")
@@ -9573,6 +9611,40 @@ final class AppState: ObservableObject {
         )
     }
 
+    /// 进度类状态气泡的「就地更新」：相同 statusKey 已存在则替换其文案/图标/进度（spinner→结果），
+    /// 否则新增一条。修复「正在生成/加入错题本」转圈不消失、还另起一条结果气泡的重复问题（#2）。
+    @discardableResult
+    private func upsertStatusChatMessage(
+        key: String,
+        title: String,
+        text: String,
+        systemImage: String,
+        showsProgress: Bool = false
+    ) -> Bool {
+        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanText.isEmpty else { return false }
+        if let index = chatMessages.lastIndex(where: { $0.statusKey == key }) {
+            var msg = chatMessages[index]
+            msg.text = cleanText
+            msg.title = title
+            msg.systemImage = systemImage
+            msg.showsProgress = showsProgress
+            chatMessages[index] = msg
+            return true
+        }
+        chatMessages.append(
+            ChatMessage(
+                role: .status,
+                text: cleanText,
+                title: title,
+                systemImage: systemImage,
+                showsProgress: showsProgress,
+                statusKey: key
+            )
+        )
+        return true
+    }
+
     func addLatestAnswerToMistakeBook() {
         guard let message = chatMessages.last(where: { $0.role == .assistant }) else {
             appendStatusChatMessage(title: "加入错题本", text: "还没有可加入错题本的 AI 回答。", systemImage: "book.closed")
@@ -9603,11 +9675,11 @@ final class AppState: ObservableObject {
             appendStatusChatMessage(title: "智能沉淀", text: "当前还没有学习回合，无法保存沉淀内容。", systemImage: "exclamationmark.triangle")
             return
         }
+        // 不带 spinner：下面两个子步骤各自会追加「已沉淀/已形成」结果气泡作为完成信号（避免父气泡永久转圈）。
         appendStatusChatMessage(
             title: "智能沉淀",
             text: "我会把这轮问答同时整理为错题线索和个性化记忆：错题用于复习排队，记忆用于后续上下文优先参考。你不用判断该放哪一类。",
-            systemImage: "wand.and.stars",
-            showsProgress: true
+            systemImage: "wand.and.stars"
         )
         addMessageToMistakeBook(message, source: .smartCapture)
         formMemoryFromMessage(message, source: .smartCapture)
@@ -9632,7 +9704,9 @@ final class AppState: ObservableObject {
             chatMessages[index].visualizationCandidate = true
             chatMessages[index].visualization = TeachingVisualization(status: "running", title: "可视化讲解", triggerReason: message.visualizationReason)
         }
-        appendStatusChatMessage(
+        let vizStatusKey = "viz-\(message.id.uuidString)"
+        upsertStatusChatMessage(
+            key: vizStatusKey,
             title: "正在生成可视化",
             text: "我正在生成交互 HTML 教学页，通常需要几十秒。完成后会自动打开；以后也可以回到这条 AI 回复下点“打开可视化”。",
             systemImage: "cube.transparent",
@@ -9666,7 +9740,8 @@ final class AppState: ObservableObject {
                                 chatMessages[index].visualizationReason = visualization.triggerReason
                             }
                         }
-                        appendStatusChatMessage(
+                        upsertStatusChatMessage(
+                            key: vizStatusKey,
                             title: "可视化已生成",
                             text: "页面已打开。稍后也可以回到这条 AI 回复下点“打开可视化”。",
                             systemImage: "checkmark.circle"
@@ -9679,14 +9754,15 @@ final class AppState: ObservableObject {
                     if let index = chatMessages.firstIndex(where: { $0.id == message.id }) {
                         chatMessages[index].visualizationCandidate = true
                     }
-                    appendStatusChatMessage(title: "可视化生成失败", text: networkErrorUserMessage(error), systemImage: "exclamationmark.triangle")
+                    upsertStatusChatMessage(key: vizStatusKey, title: "可视化生成失败", text: networkErrorUserMessage(error), systemImage: "exclamationmark.triangle")
                     log("可视化生成失败：\(networkErrorDescription(error))", level: "error")
                     return
                 }
                 try? await Task.sleep(nanoseconds: 8_000_000_000)
             }
-            // 轮询结束仍未就绪：保留 running 状态，提示用户稍后手动打开（不算失败）。
-            appendStatusChatMessage(
+            // 轮询结束仍未就绪：把 spinner 收尾为「仍在生成」（就地更新，不再永久转圈）。
+            upsertStatusChatMessage(
+                key: vizStatusKey,
                 title: "可视化仍在生成",
                 text: "已加入空闲生成队列，可能需要稍等。稍后回到这条 AI 回复点“打开可视化”即可查看。",
                 systemImage: "clock"
@@ -9711,8 +9787,9 @@ final class AppState: ObservableObject {
         let answer = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let question = resolvedQuestion(for: message)
         guard !answer.isEmpty || !question.isEmpty else { return }
+        let mistakeStatusKey = "mistake-\(message.id.uuidString)"
         if source == .manualMistake {
-            appendStatusChatMessage(title: "加入错题本", text: "正在把本轮问答沉淀为错题本条目。", systemImage: "book.closed", showsProgress: true)
+            upsertStatusChatMessage(key: mistakeStatusKey, title: "加入错题本", text: "正在把本轮问答沉淀为错题本条目。", systemImage: "book.closed", showsProgress: true)
         }
         Task {
             do {
@@ -9729,14 +9806,27 @@ final class AppState: ObservableObject {
                     "knowledge_points": [source.knowledgeTag, learningMode.title, coachDepth.title]
                 ]
                 _ = try await postJSON(path: "/api/sessions/\(sessionId)/mistakes", payload: payload)
-                appendStatusChatMessage(
-                    title: source == .smartCapture ? "错题线索已沉淀" : "已加入错题本",
-                    text: source == .smartCapture ? "已保存为复习线索，后续会进入错题队列和上下文参考。" : "这轮问答已保存，后续复习和上下文会优先参考。",
-                    systemImage: "checkmark.circle"
-                )
+                if source == .manualMistake {
+                    upsertStatusChatMessage(
+                        key: mistakeStatusKey,
+                        title: "已加入错题本",
+                        text: "这轮问答已保存，后续复习和上下文会优先参考。",
+                        systemImage: "checkmark.circle"
+                    )
+                } else {
+                    appendStatusChatMessage(
+                        title: "错题线索已沉淀",
+                        text: "已保存为复习线索，后续会进入错题队列和上下文参考。",
+                        systemImage: "checkmark.circle"
+                    )
+                }
                 await refreshReviewQueuePreview()
             } catch {
-                appendStatusChatMessage(title: "加入错题本失败", text: networkErrorUserMessage(error), systemImage: "exclamationmark.triangle")
+                if source == .manualMistake {
+                    upsertStatusChatMessage(key: mistakeStatusKey, title: "加入错题本失败", text: networkErrorUserMessage(error), systemImage: "exclamationmark.triangle")
+                } else {
+                    appendStatusChatMessage(title: "加入错题本失败", text: networkErrorUserMessage(error), systemImage: "exclamationmark.triangle")
+                }
                 log("加入错题本失败：\(networkErrorDescription(error))", level: "error")
             }
         }
@@ -9755,8 +9845,9 @@ final class AppState: ObservableObject {
             "应重点记住：\(shortText(answer, limit: 520))"
         ].filter { !$0.isEmpty }.joined(separator: "\n")
         guard !memoryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let memoryStatusKey = "memory-\(message.id.uuidString)"
         if source == .manualMemory {
-            appendStatusChatMessage(title: "形成记忆", text: "正在把这轮问答整理成高优先级记忆。", systemImage: "brain.head.profile", showsProgress: true)
+            upsertStatusChatMessage(key: memoryStatusKey, title: "形成记忆", text: "正在把这轮问答整理成高优先级记忆。", systemImage: "brain.head.profile", showsProgress: true)
         }
         Task {
             do {
@@ -9773,14 +9864,27 @@ final class AppState: ObservableObject {
                 ]
                 _ = try await postJSON(path: "/api/sessions/\(sessionId)/memory", payload: payload)
                 updateLocalFormedMemory(memoryText)
-                appendStatusChatMessage(
-                    title: source == .smartCapture ? "个性化记忆已形成" : "记忆已形成",
-                    text: source == .smartCapture ? "已提炼成后续上下文的重点记忆，回答会优先参考。" : "后续回答会把这条记忆放进重点上下文。",
-                    systemImage: "checkmark.circle"
-                )
+                if source == .manualMemory {
+                    upsertStatusChatMessage(
+                        key: memoryStatusKey,
+                        title: "记忆已形成",
+                        text: "后续回答会把这条记忆放进重点上下文。",
+                        systemImage: "checkmark.circle"
+                    )
+                } else {
+                    appendStatusChatMessage(
+                        title: "个性化记忆已形成",
+                        text: "已提炼成后续上下文的重点记忆，回答会优先参考。",
+                        systemImage: "checkmark.circle"
+                    )
+                }
                 await refreshMemoryDigest()
             } catch {
-                appendStatusChatMessage(title: "形成记忆失败", text: networkErrorUserMessage(error), systemImage: "exclamationmark.triangle")
+                if source == .manualMemory {
+                    upsertStatusChatMessage(key: memoryStatusKey, title: "形成记忆失败", text: networkErrorUserMessage(error), systemImage: "exclamationmark.triangle")
+                } else {
+                    appendStatusChatMessage(title: "形成记忆失败", text: networkErrorUserMessage(error), systemImage: "exclamationmark.triangle")
+                }
                 log("形成记忆失败：\(networkErrorDescription(error))", level: "error")
             }
         }

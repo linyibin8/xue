@@ -11,7 +11,7 @@ struct iPadLearnView: View {
     @Environment(\.openURL) private var openURL
 
     @State private var draft = ""
-    @State private var inputMode: iPadInputMode = .text
+    @State private var inputMode: iPadInputMode = .voice   // #3 默认语音（右下角大麦克风）
     @State private var previewAttachment: ChatAttachment?
     @State private var contextDetail: ContextBadgeItem?
     @State private var showContextWorkspace = false
@@ -83,10 +83,59 @@ struct iPadLearnView: View {
         VStack(spacing: 16) {
             cameraStage
             observationButton
+            if state.isBursting {
+                observationTicker   // #7 智能观察实时滚动文字（对齐 iPhone 的「直播」动态感）
+            }
             statusLine
             Spacer(minLength: 0)
         }
         .padding(20)
+    }
+
+    // #7 智能观察时的实时「弹幕」：随每一帧分析滚动刷新最近动态（数据源 state.logs，与 iPhone 同源）。
+    private var observationTicker: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "dot.radiowaves.left.and.right")
+                    .foregroundStyle(.red)
+                Text("实时观察")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                if !state.uploadState.isEmpty && state.uploadState != "待机" {
+                    Text(state.uploadState)
+                        .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 5) {
+                        let lines = Array(state.logs.suffix(20))
+                        if lines.isEmpty {
+                            Text("正在观察画面…")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(lines) { line in
+                                Text(line.text)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .id(line.id)
+                            }
+                        }
+                        Color.clear.frame(height: 1).id("ticker-bottom")
+                    }
+                    .padding(.vertical, 2)
+                }
+                .frame(height: 132)
+                .onChange(of: state.logs.count) { _ in
+                    withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo("ticker-bottom", anchor: .bottom) }
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
     }
 
     private var cameraStage: some View {
