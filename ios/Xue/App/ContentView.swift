@@ -8,6 +8,15 @@ import UIKit
 import Vision
 
 private let serverBaseURL = URL(string: "https://xue.evowit.com")!
+
+/// 缩略图 URL（供上下文面板的「画面」分类卡显示真实题图缩略图）。
+/// 与 AppState.imageThumbnailURL 同源，但为 free function 以便 SwiftUI 视图直接调用。
+func contextImageThumbnailURL(filename: String) -> URL? {
+    let trimmed = filename.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty,
+          let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else { return nil }
+    return URL(string: "/api/images/\(encoded)/thumbnail", relativeTo: serverBaseURL)?.absoluteURL
+}
 private let ttsPrimarySpeechURL = URL(string: "https://ttsubuntu.evowit.com/v1/audio/speech")!
 private let ttsFallbackGenerateURL = URL(string: "https://ttscc.evowit.com/api/generate")!
 private let ttsFallbackDemoId = "demo-1"
@@ -3923,7 +3932,7 @@ struct ContextWorkspaceSheet: View {
                     LazyVStack(alignment: .leading, spacing: 12) {
                         switch selectedTab {
                         case .overview:
-                            ContextWorkspaceOverviewTab(state: state, draft: draft, contextItems: contextItems)
+                            ContextWorkspaceOverviewTab(state: state, draft: draft)
                         case .assets:
                             ContextWorkspaceAssetsTab(state: state, draft: draft)
                         case .prompts:
@@ -3956,7 +3965,7 @@ struct ContextWorkspaceSheet: View {
     }
 }
 
-private struct ActivityLogSheet: View {
+struct ActivityLogSheet: View {
     @ObservedObject var state: AppState
     let onClose: () -> Void
 
@@ -4087,39 +4096,28 @@ private struct ContextWorkspaceHeader: View {
 private struct ContextWorkspaceOverviewTab: View {
     @ObservedObject var state: AppState
     let draft: String
-    let contextItems: [ContextBadgeItem]
 
-    /// 真相源：本轮已发送的通道（来自 context_trace）；首轮/无 manifest 时回退到提交前的猜测。
-    private var displayItems: [ContextBadgeItem] {
-        if let manifest = state.lastTurnManifest, !manifest.sentItems.isEmpty {
-            return manifest.sentItems
-        }
-        return contextItems
-    }
-
+    /// 是否已有本轮真相（来自 context_trace）；首轮/无 manifest 时仍展示各类开关与说明。
     private var usingTurnTruth: Bool {
-        (state.lastTurnManifest?.sentItems.isEmpty == false)
+        state.lastTurnManifest != nil
     }
 
     var body: some View {
         ChatSettingsPanel(state: state)
 
-        ContextSectionCard(title: usingTurnTruth ? "本轮实际带上的上下文" : "将带上的上下文", systemImage: "tray.full") {
-            if displayItems.isEmpty {
-                Text(usingTurnTruth ? "本轮未带任何上下文" : "暂无上下文（先提问，问答后这里显示本轮真实通道）")
+        ContextSectionCard(title: usingTurnTruth ? "这一轮发给 AI 的内容" : "下一轮会发给 AI 的内容", systemImage: "tray.full") {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(usingTurnTruth
+                     ? "下面按每一类分别说明：这一轮有没有发给 AI、发了什么。绿点=本轮带上了，灰点=本轮没用到。每一类都能关掉，关了下一轮就不发。"
+                     : "先提一个问题，AI 回答后，这里会逐类显示本轮真正发给 AI 的内容。下面是各类开关与说明。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            } else {
-                VStack(spacing: 8) {
-                    ForEach(displayItems) { item in
-                        ContextWorkspaceToggleRow(state: state, item: item)
-                    }
+                    .fixedSize(horizontal: false, vertical: true)
+
+                ForEach(ContextCategory.ordered, id: \.key) { category in
+                    ContextCategoryCard(state: state, category: category)
                 }
             }
-        }
-
-        ContextSectionCard(title: "本轮带入的长期记忆", systemImage: "brain.head.profile") {
-            ContextRetrievedMemorySection(state: state)
         }
 
         ContextSectionCard(title: "使用策略", systemImage: "flowchart") {
@@ -4128,47 +4126,242 @@ private struct ContextWorkspaceOverviewTab: View {
     }
 }
 
-/// 概览页每行：图标 + 标题 + reason 副标题，可切换的通道带类级 Toggle（下一轮生效）。
-private struct ContextWorkspaceToggleRow: View {
+/// 一个「配置开关」对应的上下文类别（与设置页顺序一致）。普通家长/学生看得懂的中文名 +
+/// 一句话大白话说明 + 对应 trace key + 对应类级开关 keyPath。
+struct ContextCategory {
+    let key: String                 // 与 context_trace channel.key / inclusionKeyPath 对应
+    let title: String               // 中文名
+    let blurb: String               // 一句话「这是什么/为什么影响 AI」
+    let systemImage: String
+    let keyPath: WritableKeyPath<ContextInclusionSettings, Bool>
+
+    /// 顺序与「发送配置」设置页一致（视觉画面/智能观察/历史记录/错题本/知识库/长期记忆/学习策略）。
+    static let ordered: [ContextCategory] = [
+        ContextCategory(key: "visual", title: "视觉画面",
+                        blurb: "把当前拍到的题目画面发给 AI，让它看清题再回答。",
+                        systemImage: "camera.metering.center.weighted", keyPath: \.visual),
+        ContextCategory(key: "observation", title: "智能观察",
+                        blurb: "把后台连续观察到的学习画面摘要发给 AI，帮它了解你正在做什么。",
+                        systemImage: "rectangle.stack", keyPath: \.observation),
+        ContextCategory(key: "history", title: "历史记录",
+                        blurb: "把之前对话里相关的内容发给 AI，让追问能接上、不用重复说。",
+                        systemImage: "clock.arrow.circlepath", keyPath: \.history),
+        ContextCategory(key: "mistakes", title: "错题本",
+                        blurb: "把相关的错题、错因和订正线索发给 AI，复习时更有针对性。",
+                        systemImage: "book.closed", keyPath: \.mistakes),
+        ContextCategory(key: "knowledge", title: "知识库",
+                        blurb: "把和这道题相关的知识点发给 AI，方便讲清概念、举一反三。",
+                        systemImage: "lightbulb", keyPath: \.knowledge),
+        ContextCategory(key: "memory", title: "长期记忆",
+                        blurb: "把 AI 记住的你的偏好、常错点、学习目标发给它，让回答更贴合你。",
+                        systemImage: "brain.head.profile", keyPath: \.memory),
+        ContextCategory(key: "strategy", title: "学习策略",
+                        blurb: "把你的辅导偏好（怎么讲、讲多深）和本轮状态发给 AI，决定它怎么回答。",
+                        systemImage: "slider.horizontal.3", keyPath: \.strategy),
+    ]
+}
+
+/// 单类上下文分区卡：中文名 + 大白话说明 + 本轮是否带上（绿/灰点）+ 类级开关 + 可展开真实内容预览。
+/// 两端（iPad/iPhone）共用的 ContextWorkspaceSheet 都走这里。
+private struct ContextCategoryCard: View {
     @ObservedObject var state: AppState
-    let item: ContextBadgeItem
+    let category: ContextCategory
+
+    @State private var expanded = false
+
+    private var trace: ContextChannelTrace? {
+        state.lastTurnManifest?.channel(category.key)
+    }
+    private var hasTurn: Bool { state.lastTurnManifest != nil }
+    private var included: Bool { trace?.included ?? false }
+    private var enabled: Bool { state.contextInclusionSettings[keyPath: category.keyPath] }
+
+    /// 本轮状态文案（绿点=带上了；灰点=没用到 / 已关闭 / 还没提问）。
+    private var statusText: String {
+        if !enabled { return "已关闭，本轮不发" }
+        if !hasTurn { return "等待提问" }
+        return included ? "本轮已带上" : "本轮没用到"
+    }
+    private var statusColor: Color {
+        if !enabled { return .secondary }
+        if !hasTurn { return .orange }
+        return included ? .green : .secondary
+    }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 9) {
-            Image(systemName: item.systemImage)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(item.tone.color)
-                .frame(width: 22)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(item.title)
-                    .font(.caption.weight(.semibold))
-                if !item.detail.isEmpty {
-                    Text(item.detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if let reason = item.reason, !reason.isEmpty {
-                    Text(reason)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 9) {
+                Image(systemName: category.systemImage)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(included && enabled ? Color.green : Color.secondary)
+                    .frame(width: 22)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(statusColor)
+                            .frame(width: 8, height: 8)
+                        Text(category.title)
+                            .font(.caption.weight(.semibold))
+                        Text(statusText)
+                            .font(.caption2)
+                            .foregroundStyle(statusColor)
+                    }
+                    Text(category.blurb)
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-            }
-            Spacer(minLength: 8)
-            if let keyPath = state.inclusionKeyPath(forBadgeId: item.id) {
+                Spacer(minLength: 8)
                 Toggle("", isOn: Binding(
-                    get: { state.contextInclusionSettings[keyPath: keyPath] },
-                    set: { state.updateContextInclusion(keyPath, to: $0) }
+                    get: { state.contextInclusionSettings[keyPath: category.keyPath] },
+                    set: { state.updateContextInclusion(category.keyPath, to: $0) }
                 ))
                 .labelsHidden()
             }
+
+            // 真实内容预览：本轮带上了才展示「实际发给 AI 的内容」。
+            if enabled && included, hasPreviewContent {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+                } label: {
+                    Label(expanded ? "收起实际内容" : "查看实际发给 AI 的内容",
+                          systemImage: expanded ? "chevron.up" : "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.tint)
+
+                if expanded {
+                    previewContent
+                        .padding(.top, 2)
+                }
+            } else if enabled && !included && hasTurn {
+                Text(emptyHint)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
-        .padding(9)
+        .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(item.tone.color.opacity(0.08))
+        .background((included && enabled ? Color.green : Color.secondary).opacity(0.08))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var emptyHint: String {
+        switch category.key {
+        case "visual": return "本轮没有用到画面（可能是纯文字提问，或没拍到题）。"
+        case "observation": return "本轮没有用到智能观察画面。"
+        case "history": return "本轮没有携带历史记录。"
+        case "mistakes": return "本轮没有用到错题本。"
+        case "knowledge": return "本轮没有命中相关知识点。"
+        case "memory": return "本轮没有用到长期记忆。"
+        case "strategy": return "本轮没有带上学习策略。"
+        default: return "本轮没用到。"
+        }
+    }
+
+    private var hasPreviewContent: Bool {
+        guard let trace else { return false }
+        switch category.key {
+        case "visual": return !trace.visualFilename.isEmpty
+        case "history": return !trace.historyPreview.isEmpty
+        case "mistakes": return !trace.mistakeItems.isEmpty
+        case "knowledge": return !trace.knowledgeHits.isEmpty
+        case "memory": return !(state.lastTurnManifest?.retrievedMemories.isEmpty ?? true)
+        case "observation": return trace.observationFrames > 0
+        case "strategy": return !trace.strategyLearningMode.isEmpty || !trace.strategyCoachDepth.isEmpty
+        default: return false
+        }
+    }
+
+    @ViewBuilder
+    private var previewContent: some View {
+        switch category.key {
+        case "visual":
+            if let url = contextImageThumbnailURL(filename: trace?.visualFilename ?? "") {
+                VStack(alignment: .leading, spacing: 4) {
+                    AsyncImage(url: url) { phase in
+                        switch phase {
+                        case .success(let image):
+                            image.resizable().scaledToFill()
+                        case .failure:
+                            Image(systemName: "photo.badge.exclamationmark").foregroundStyle(.secondary)
+                        default:
+                            ProgressView()
+                        }
+                    }
+                    .frame(width: 132, height: 99)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(.separator), lineWidth: 1))
+                    if let mode = trace?.visualMode, !mode.isEmpty {
+                        Text("画面模式：\(mode)")
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        case "history":
+            SelectableTextBlock(text: trace?.historyPreview ?? "", lineLimit: 8)
+        case "mistakes":
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(Array((trace?.mistakeItems ?? []).enumerated()), id: \.offset) { _, item in
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 5) {
+                            if item.active {
+                                Text("本轮复习")
+                                    .font(.system(size: 9).weight(.semibold))
+                                    .padding(.horizontal, 5).padding(.vertical, 1)
+                                    .background(Color.orange.opacity(0.2))
+                                    .clipShape(Capsule())
+                            }
+                            Text(item.title)
+                                .font(.caption2.weight(.semibold))
+                        }
+                        if !item.detail.isEmpty {
+                            Text(item.detail)
+                                .font(.caption2).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+            }
+        case "knowledge":
+            VStack(alignment: .leading, spacing: 5) {
+                ForEach(Array((trace?.knowledgeHits ?? []).enumerated()), id: \.offset) { _, hit in
+                    HStack(alignment: .top, spacing: 5) {
+                        Image(systemName: "lightbulb").font(.caption2).foregroundStyle(.secondary)
+                        Text(hit.preview)
+                            .font(.caption2)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 4)
+                        if let score = hit.score {
+                            Text(String(format: "%.2f", score))
+                                .font(.system(size: 9).monospacedDigit())
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+            }
+        case "memory":
+            // 复用已有命中记忆视图（每条原文 + 4 维相关度条 + 逐条开关 + 进档案纠正）。
+            ContextRetrievedMemorySection(state: state)
+        case "observation":
+            Text("本轮带上了约 \(trace?.observationFrames ?? 0) 帧后台观察画面摘要。")
+                .font(.caption2).foregroundStyle(.secondary)
+        case "strategy":
+            VStack(alignment: .leading, spacing: 3) {
+                if let mode = trace?.strategyLearningMode, !mode.isEmpty {
+                    Text("场景：\(mode)").font(.caption2).foregroundStyle(.secondary)
+                }
+                if let depth = trace?.strategyCoachDepth, !depth.isEmpty {
+                    Text("回答方式：\(depth)").font(.caption2).foregroundStyle(.secondary)
+                }
+                Text("可在「设置」里调整你的一句话辅导偏好。")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+            }
+        default:
+            EmptyView()
+        }
     }
 }
 
@@ -4853,6 +5046,69 @@ struct TurnContextManifest {
     var retrievedMemories: [RetrievedMemory]
     var usedImageContext: Bool
     var imageContextMode: String
+    /// 本轮每个上下文通道的原始 trace（来自后端 context_trace.channels）。
+    /// 让分类卡能直接读「本轮是否带上 + 真实内容预览」，而不再依赖摘要徽章。
+    var channels: [ContextChannelTrace] = []
+
+    func channel(_ key: String) -> ContextChannelTrace? {
+        channels.first { $0.key == key }
+    }
+}
+
+/// 一个上下文通道的本轮真相：是否带上 + 后端给的 detail（含真实内容预览）。
+/// 直接镜像 context_trace.channels 的一项，分类卡按 key 取用。
+struct ContextChannelTrace {
+    let key: String
+    let included: Bool
+    let detail: [String: Any]
+
+    /// 本轮历史回合携带的真实正文预览（后端 history.detail.preview）。
+    var historyPreview: String { (detail["preview"] as? String) ?? "" }
+    var historyChars: Int { (detail["chars"] as? Int) ?? 0 }
+
+    /// 本轮命中的错题列表（后端 mistakes.detail.items：title/detail/active）。
+    var mistakeItems: [(title: String, detail: String, active: Bool)] {
+        guard let raw = detail["items"] as? [[String: Any]] else { return [] }
+        return raw.map {
+            (title: ($0["title"] as? String) ?? "",
+             detail: ($0["detail"] as? String) ?? "",
+             active: ($0["active"] as? Bool) ?? false)
+        }
+    }
+    var mistakeCount: Int { (detail["count"] as? Int) ?? mistakeItems.count }
+
+    /// 本轮命中的知识点条目（后端 knowledge.detail.semantic_hits：kind/score/preview）。
+    var knowledgeHits: [(preview: String, score: Double?)] {
+        guard let raw = detail["semantic_hits"] as? [[String: Any]] else { return [] }
+        return raw.map {
+            (preview: ($0["preview"] as? String) ?? "",
+             score: $0["score"] as? Double)
+        }
+    }
+
+    /// 本轮带入画面的文件名（后端 visual.detail.filename），用于显示缩略图。
+    var visualFilename: String { (detail["filename"] as? String) ?? "" }
+    var visualMode: String { (detail["mode"] as? String) ?? "" }
+    var visualRejected: Bool { (detail["rejected"] as? Bool) ?? false }
+
+    /// 本轮智能观察缓冲帧数（后端 observation.detail.frames）。
+    var observationFrames: Int { (detail["frames"] as? Int) ?? 0 }
+
+    /// 本轮动态策略带上的偏好（后端 strategy.detail）。
+    var strategyLearningMode: String { (detail["learning_mode"] as? String) ?? "" }
+    var strategyCoachDepth: String { (detail["coach_depth"] as? String) ?? "" }
+
+    static func list(from trace: [String: Any]?) -> [ContextChannelTrace] {
+        guard let channels = trace?["channels"] as? [[String: Any]] else { return [] }
+        return channels.compactMap { channel in
+            guard let key = channel["key"] as? String else { return nil }
+            return ContextChannelTrace(
+                key: key,
+                included: (channel["included"] as? Bool) ?? false,
+                detail: channel["detail"] as? [String: Any] ?? [:]
+            )
+        }
+    }
 }
 
 /// A durable memory the server retrieved (semantically) into the most recent QA turn,
@@ -9202,7 +9458,8 @@ final class AppState: ObservableObject {
             sentItems: sentItems,
             retrievedMemories: memories,
             usedImageContext: usedImageContext,
-            imageContextMode: imageContextMode
+            imageContextMode: imageContextMode,
+            channels: ContextChannelTrace.list(from: trace)
         )
         lastTurnManifest = manifest
 

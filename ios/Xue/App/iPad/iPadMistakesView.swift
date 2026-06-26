@@ -12,22 +12,15 @@ struct iPadMistakesView: View {
 
     var body: some View {
         NavigationStack {
-            HStack(spacing: 0) {
-                list.frame(width: 360)
-                Divider()
-                detailPane.frame(maxWidth: .infinity)
-            }
+            // #4：错题抓取尚未稳定，先不展示历史数据，避免显示错误内容。待错题管线修好再恢复。
+            ContentUnavailableCompat(
+                title: "错题本完善中",
+                systemImage: "exclamationmark.bubble",
+                message: "错题自动整理正在打磨，暂不展示历史数据，以免给你看到不准确的内容。学习中点「加入错题本」仍会记录，稍后恢复展示。"
+            )
             .navigationTitle("错题本")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button { Task { await state.refreshReviewQueuePreview() } } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                }
-            }
         }
-        .task { await state.refreshReviewQueuePreview() }
     }
 
     // MARK: 列表（精简）

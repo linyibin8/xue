@@ -2386,6 +2386,26 @@ def build_context_trace(
     else:
         history_chars = len(str(history_text or ""))
     history_included = bool(history_text)
+    # human-readable preview of the actual history text the prompt carried (parents/students
+    # asked to "see the real content", not just a char count). Built from the same dict the
+    # model received; truncated to ~200 chars. (Read-only; no new fields sent to the model.)
+    history_preview = ""
+    if history_included:
+        if isinstance(history_text, dict):
+            parts = []
+            title = str(history_text.get("title") or "").strip()
+            summary = str(history_text.get("summary") or "").strip()
+            if title:
+                parts.append(f"来源：{title}")
+            if summary:
+                parts.append(f"摘要：{summary}")
+            for key in ("recent_questions", "recent_answers", "mistakes", "learning_items"):
+                snippets = history_text.get(key)
+                if isinstance(snippets, list):
+                    parts.extend(str(s).strip() for s in snippets if str(s or "").strip())
+            history_preview = truncate_text("\n".join(p for p in parts if p), 200)
+        else:
+            history_preview = truncate_text(str(history_text or ""), 200)
 
     # mistakes: review context carried for this turn.
     mistakes_assets = [
@@ -2394,6 +2414,40 @@ def build_context_trace(
     ]
     mistakes_included = bool(ctx.get("review_context")) or bool(mistakes_assets)
     mistakes_count = len(mistakes_assets) + (1 if ctx.get("review_context") else 0)
+    # human-readable list of the actual mistakes carried this turn: the active review item
+    # (if any) plus the structured mistake assets the client attached. title/detail only.
+    mistakes_items: list[dict] = []
+    review_ctx = ctx.get("review_context")
+    if isinstance(review_ctx, dict):
+        review_item = review_ctx.get("item") if isinstance(review_ctx.get("item"), dict) else {}
+        review_title = str(
+            review_item.get("title")
+            or review_item.get("question_text")
+            or review_item.get("displayTitle")
+            or "今日复习错题"
+        ).strip()
+        review_detail = str(
+            review_item.get("error_reason")
+            or review_item.get("error_type")
+            or review_item.get("next_action")
+            or review_item.get("location")
+            or ""
+        ).strip()
+        if review_title:
+            mistakes_items.append({
+                "title": truncate_text(review_title, 60),
+                "detail": truncate_text(review_detail, 120),
+                "active": True,
+            })
+    for a in mistakes_assets[:6]:
+        title = str(a.get("title") or "").strip()
+        detail = str(a.get("detail") or "").strip()
+        if title or detail:
+            mistakes_items.append({
+                "title": truncate_text(title or "相关错题", 60),
+                "detail": truncate_text(detail, 120),
+                "active": False,
+            })
 
     # knowledge: semantic knowledge hits attached server-side this turn.
     semantic_knowledge = ctx.get("semantic_knowledge") if isinstance(ctx.get("semantic_knowledge"), list) else []
@@ -2441,8 +2495,8 @@ def build_context_trace(
         "student_intent": student_intent,
         "channels": [
             {"key": "visual", "included": visual_included, "detail": visual_detail},
-            {"key": "history", "included": history_included, "detail": {"chars": history_chars} if history_included else {}},
-            {"key": "mistakes", "included": mistakes_included, "detail": {"count": mistakes_count} if mistakes_included else {}},
+            {"key": "history", "included": history_included, "detail": {"chars": history_chars, "preview": history_preview} if history_included else {}},
+            {"key": "mistakes", "included": mistakes_included, "detail": {"count": mistakes_count, "items": mistakes_items} if mistakes_included else {}},
             {"key": "knowledge", "included": knowledge_included, "detail": {"semantic_hits": knowledge_hits} if knowledge_included else {}},
             {
                 "key": "memory",
@@ -2463,8 +2517,8 @@ def build_context_trace(
                 "key": "strategy",
                 "included": strategy_included,
                 "detail": {
-                    "learning_mode": raw.get("learning_mode") or None,
-                    "coach_depth": raw.get("coach_depth") or None,
+                    "learning_mode": raw.get("learning_mode_title") or raw.get("learning_mode") or None,
+                    "coach_depth": raw.get("coach_depth_title") or raw.get("coach_depth") or None,
                 } if strategy_included else {},
             },
         ],

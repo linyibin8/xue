@@ -15,6 +15,7 @@ struct iPadLearnView: View {
     @State private var previewAttachment: ChatAttachment?
     @State private var contextDetail: ContextBadgeItem?
     @State private var showContextWorkspace = false
+    @State private var showActivity = false
     @FocusState private var composerFocused: Bool
 
     var body: some View {
@@ -43,6 +44,9 @@ struct iPadLearnView: View {
         }
         .sheet(item: $previewAttachment) { iPadAttachmentPreview(attachment: $0) }
         .sheet(item: $contextDetail) { iPadContextDetailSheet(item: $0) }
+        .sheet(isPresented: $showActivity) {
+            ActivityLogSheet(state: state) { showActivity = false }
+        }
         .sheet(isPresented: $showContextWorkspace) {
             // 两端共用同一上下文面板（MUST-8：iPad 不做三栏 inspector）。
             ContextWorkspaceSheet(state: state, draft: draft) {
@@ -58,15 +62,11 @@ struct iPadLearnView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup(placement: .navigationBarTrailing) {
-            Menu {
-                Picker("学习模式", selection: Binding(get: { state.learningMode }, set: { state.learningMode = $0; state.coachPreferenceDidChange() })) {
-                    ForEach(LearningModePreference.allCases) { Text($0.title).tag($0) }
-                }
-                Picker("讲解深度", selection: Binding(get: { state.coachDepth }, set: { state.coachDepth = $0; state.coachPreferenceDidChange() })) {
-                    ForEach(CoachDepthPreference.allCases) { Text($0.title).tag($0) }
-                }
+            // 动态（活动日志），对齐 iPhone 的「动态」(#2)。偏好已移到 设置·一句话辅导偏好(#3 移除旧菜单)
+            Button {
+                showActivity = true
             } label: {
-                Label("偏好", systemImage: "slider.horizontal.3")
+                Label("动态", systemImage: "clock")
             }
             Button {
                 state.startNewConversation()
