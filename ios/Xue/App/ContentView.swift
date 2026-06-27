@@ -304,6 +304,12 @@ struct ContentView: View {
                 }
             }
         }
+        // P0：分题/批改取景层（叠在已运行的相机预览之上，复用同一会话，不另起 CameraView）
+        .overlay {
+            if state.captureAimingVisible {
+                QuestionCaptureOverlay(state: state)
+            }
+        }
     }
 
     @ViewBuilder
@@ -1228,6 +1234,105 @@ struct QuestionSegmentationSheet: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black.ignoresSafeArea())
+    }
+}
+
+// P0：分题/批改「取景—自动快门」叠层。复用底层正在运行的相机预览（透明中心露出相机），
+// 提供取景框 + 实时补光/清晰度提示 + 手电 + 自动/手动快门。点按穿透到相机做对焦。
+struct QuestionCaptureOverlay: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        ZStack {
+            // 顶/底渐变暗角（让控件清晰，中间透明露出相机），不拦截点按
+            VStack(spacing: 0) {
+                LinearGradient(colors: [.black.opacity(0.55), .clear], startPoint: .top, endPoint: .bottom)
+                    .frame(height: 140)
+                Spacer()
+                LinearGradient(colors: [.clear, .black.opacity(0.62)], startPoint: .top, endPoint: .bottom)
+                    .frame(height: 190)
+            }
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+
+            // 取景框
+            GeometryReader { geo in
+                let m: CGFloat = 26
+                let topPad: CGFloat = 96
+                let botPad: CGFloat = 168
+                let rect = CGRect(x: m, y: topPad,
+                                  width: geo.size.width - 2 * m,
+                                  height: max(90, geo.size.height - topPad - botPad))
+                FramingBrackets(rect: rect, color: state.cameraAimReady ? .green : .white)
+            }
+            .allowsHitTesting(false)
+
+            VStack {
+                HStack(alignment: .top, spacing: 12) {
+                    Button { state.cancelAiming() } label: {
+                        Image(systemName: "xmark").font(.headline.weight(.semibold)).foregroundStyle(.white)
+                            .frame(width: 38, height: 38).background(.ultraThinMaterial, in: Circle())
+                    }
+                    .accessibilityIdentifier("aiming-close")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(state.segmentationIsGrading ? "作业批改 · 取景" : "拍照答题 · 取景")
+                            .font(.subheadline.weight(.semibold)).foregroundStyle(.white)
+                        Label(state.cameraAimHint, systemImage: state.cameraAimReady ? "checkmark.circle.fill" : "viewfinder")
+                            .font(.caption).foregroundStyle(state.cameraAimReady ? .green : .white.opacity(0.85))
+                    }
+                    Spacer()
+                    Button { state.toggleTorch() } label: {
+                        Image(systemName: state.torchOn ? "bolt.fill" : "bolt.slash")
+                            .font(.headline).foregroundStyle(state.torchOn ? .yellow : .white)
+                            .frame(width: 38, height: 38).background(.ultraThinMaterial, in: Circle())
+                    }
+                    .accessibilityIdentifier("aiming-torch")
+                }
+                .padding(.horizontal, 16).padding(.top, 16)
+
+                Spacer()
+
+                VStack(spacing: 14) {
+                    Text(state.autoShutterArmed ? "对准清晰会自动拍，也可手动按快门" : "手动按快门拍照")
+                        .font(.caption).foregroundStyle(.white.opacity(0.85))
+                    HStack(spacing: 30) {
+                        Button { state.autoShutterArmed.toggle() } label: {
+                            VStack(spacing: 3) {
+                                Image(systemName: state.autoShutterArmed ? "a.circle.fill" : "a.circle").font(.title3)
+                                Text("自动").font(.caption2)
+                            }
+                            .foregroundStyle(state.autoShutterArmed ? .green : .white)
+                            .frame(width: 48)
+                        }
+                        .accessibilityIdentifier("aiming-auto-toggle")
+                        Button { state.captureSegmentationPhoto() } label: {
+                            ZStack {
+                                Circle().strokeBorder(.white, lineWidth: 4).frame(width: 74, height: 74)
+                                Circle().fill(.white).frame(width: 60, height: 60)
+                            }
+                        }
+                        .accessibilityIdentifier("aiming-shutter")
+                        Color.clear.frame(width: 48, height: 48)
+                    }
+                }
+                .padding(.bottom, 28)
+            }
+        }
+    }
+}
+
+struct FramingBrackets: View {
+    let rect: CGRect
+    let color: Color
+    var body: some View {
+        Path { p in
+            let L: CGFloat = 26
+            p.move(to: CGPoint(x: rect.minX, y: rect.minY + L)); p.addLine(to: CGPoint(x: rect.minX, y: rect.minY)); p.addLine(to: CGPoint(x: rect.minX + L, y: rect.minY))
+            p.move(to: CGPoint(x: rect.maxX - L, y: rect.minY)); p.addLine(to: CGPoint(x: rect.maxX, y: rect.minY)); p.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + L))
+            p.move(to: CGPoint(x: rect.minX, y: rect.maxY - L)); p.addLine(to: CGPoint(x: rect.minX, y: rect.maxY)); p.addLine(to: CGPoint(x: rect.minX + L, y: rect.maxY))
+            p.move(to: CGPoint(x: rect.maxX - L, y: rect.maxY)); p.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY)); p.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - L))
+        }
+        .stroke(color, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
     }
 }
 
@@ -6803,6 +6908,21 @@ final class AppState: ObservableObject {
     var segmentationRawImage: UIImage?                      // 原图（orientation 归一），非 @Published
     var segmentationCorrectedImage: UIImage?               // 校正图，非 @Published
     fileprivate var pendingRegionQAFrame: QAFrameCandidate?  // 选中题裁剪帧，喂给下一次提交（类型 private，故 fileprivate）
+    // P0：分题/批改「取景—自动快门」阶段（先对准拍清楚，再分割）
+    @Published var captureAimingVisible = false             // 取景拍照层是否在展示
+    @Published var cameraAimBrightness = 0.5                // 实时平均亮度 0..1
+    @Published var cameraAimSharpness = 0.0                 // 实时锐度（清晰度代理）0..1
+    @Published var torchOn = false                          // 补光手电状态
+    @Published var autoShutterArmed = true                  // 自动快门开关（达标自动拍）
+    private var aimReadyStreak = 0                          // 连续达标帧计数（自动快门去抖）
+    private var aimCapturing = false                        // 抓拍在途，防重复
+    /// 取景是否达标（够亮 + 够清晰）。
+    var cameraAimReady: Bool { cameraAimBrightness >= 0.18 && cameraAimSharpness >= 0.34 }
+    var cameraAimHint: String {
+        if cameraAimBrightness < 0.18 { return "光线偏暗，点亮手电或挪到亮处" }
+        if cameraAimSharpness < 0.34 { return "对焦中，把作业放平、点击对焦" }
+        return "清晰，可以拍了"
+    }
     // 设置开关：自动梯形校正 / 多题自动分割（默认开；关=回到老整图链路）
     @Published var autoKeystoneCorrection: Bool = {
         if UserDefaults.standard.object(forKey: autoKeystoneCorrectionDefaultsKey) == nil { return true }
@@ -6865,6 +6985,8 @@ final class AppState: ObservableObject {
     var captureSingle: (() -> Void)?
     var captureBurstFrame: (() -> Bool)?
     var captureQAFrame: (() -> Bool)?
+    var captureSegment: (() -> Bool)?          // P0：分题/批改取景后全分辨率抓拍
+    var setTorch: ((Bool) -> Void)?            // P0：补光手电
 
     private var burstBuffer: [BurstFrame] = []
     private var burstTimer: Timer?
@@ -9016,33 +9138,87 @@ final class AppState: ObservableObject {
 
     // MARK: - 题目分割 + 浮层选题（拍照答题 / 作业批改）
 
-    /// 入口：抓当前画面 → 梯形校正 → 题目分割 → 展示「冻结图 + 透明浮层」。grading=true 为作业批改，false 为拍照答题。
+    /// 入口：先进「取景—自动快门」阶段对准拍清楚 → 抓全分辨率真照片 → 梯形校正 → 题目分割 → 浮层选题。
     func beginQuestionSegmentation(grading: Bool) {
-        guard !segmentationBusy, !isSubmittingQuestion else { return }
+        guard !segmentationBusy, !isSubmittingQuestion, !captureAimingVisible else { return }
         recordUserOperation(grading ? "segment_grading" : "segment_qa")
         segmentationIsGrading = grading
-        segmentationBusy = true
-        segmentationVisible = true
-        segmentationNotice = ""
         selectedRegionID = nil
         questionRegions = []
         segmentationDisplayImage = nil
         pendingRegionQAFrame = nil
-        qaStateText = "抓取并分题"
-        qaSystemImage = "rectangle.dashed"
-        log(grading ? "作业批改：抓拍并分割题目" : "拍照答题：抓拍并分割题目")
-        Task { @MainActor in
-            guard let candidate = await captureCurrentQAFrame() else {
-                segmentationBusy = false
-                segmentationVisible = false
-                segmentationNotice = ""
-                qaStateText = "未能抓到画面"
-                qaSystemImage = "exclamationmark.triangle"
-                log("题目分割：未能抓到当前画面（模拟器无相机或超时）", level: "warning")
-                return
+        // 进取景阶段：打开相机预览 + 取景框 + 自动快门
+        aimReadyStreak = 0
+        aimCapturing = false
+        cameraAimSharpness = 0
+        cameraAimBrightness = 0.5
+        cameraTaskKind = .qaFrame
+        cameraPreviewVisible = true
+        cameraSheetVisible = false
+        captureAimingVisible = true
+        qaStateText = "对准取景"
+        qaSystemImage = "viewfinder"
+        log(grading ? "作业批改：进入取景拍照" : "拍照答题：进入取景拍照")
+    }
+
+    /// 取景阶段实时质量回调（控制器每帧调用）。达标连续若干帧 → 自动快门。
+    func updateCameraAim(brightness: Double, sharpness: Double) {
+        guard captureAimingVisible else { return }
+        cameraAimBrightness = brightness
+        cameraAimSharpness = sharpness
+        guard autoShutterArmed, !aimCapturing else { return }
+        if cameraAimReady {
+            aimReadyStreak += 1
+            if aimReadyStreak >= 3 {   // ~连续 3 帧达标(约 1 秒)才自动拍，去抖
+                captureSegmentationPhoto()
             }
-            processSegmentation(raw: candidate.image)
+        } else {
+            aimReadyStreak = 0
         }
+    }
+
+    /// 手动/自动快门：抓一张全分辨率真照片用于分题。
+    func captureSegmentationPhoto() {
+        guard captureAimingVisible, !aimCapturing else { return }
+        aimCapturing = true
+        aimReadyStreak = 0
+        qaStateText = "拍照中"
+        qaSystemImage = "camera"
+        if captureSegment?() != true {
+            aimCapturing = false
+            log("分题取景：抓拍入口不可用（模拟器无相机？）", level: "warning")
+        }
+    }
+
+    /// 取景阶段抓到全分辨率照片 → 关取景层 → 校正 + 分割 → 展示浮层选题层。
+    func didCaptureSegmentationPhoto(_ image: UIImage) {
+        guard captureAimingVisible else { return }
+        if torchOn { setTorch?(false); torchOn = false }
+        captureAimingVisible = false
+        aimCapturing = false
+        segmentationVisible = true
+        segmentationBusy = true
+        segmentationNotice = ""
+        qaStateText = "校正并分题"
+        qaSystemImage = "rectangle.dashed"
+        // 重活放到下一个 runloop，先让取景层切到选题层的 loading
+        DispatchQueue.main.async { [weak self] in
+            self?.processSegmentation(raw: image)
+        }
+    }
+
+    func toggleTorch() {
+        torchOn.toggle()
+        setTorch?(torchOn)
+    }
+
+    func cancelAiming() {
+        if torchOn { setTorch?(false); torchOn = false }
+        captureAimingVisible = false
+        aimCapturing = false
+        aimReadyStreak = 0
+        if cameraTaskKind == .qaFrame { cameraTaskKind = .none }
+        cameraPreviewVisible = false
     }
 
     /// 校正 + 分割（一次性，发生在显式点击「分题」之后，短暂主线程计算可接受）。
@@ -12844,6 +13020,8 @@ struct CameraView: UIViewControllerRepresentable {
         state.captureSingle = { [weak controller] in controller?.capture(kind: .single) }
         state.captureBurstFrame = { [weak controller] in controller?.capture(kind: .burst) ?? false }
         state.captureQAFrame = { [weak controller] in controller?.capture(kind: .qa) ?? false }
+        state.captureSegment = { [weak controller] in controller?.capture(kind: .segment) ?? false }
+        state.setTorch = { [weak controller] on in controller?.setTorch(on) }
         return controller
     }
 
@@ -12886,6 +13064,8 @@ struct CameraView: UIViewControllerRepresentable {
                     state.didCaptureBurstFrame(image)
                 case .qa:
                     state.didCaptureQAFrame(image)
+                case .segment:
+                    state.didCaptureSegmentationPhoto(image)
                 }
             }
         }
@@ -12896,6 +13076,13 @@ struct CameraView: UIViewControllerRepresentable {
                 state.cameraDidRecognizeGesture(gesture, stableFrames: stableFrames, point: point)
             }
         }
+
+        func didUpdateAimQuality(brightness: Double, sharpness: Double) {
+            Task { @MainActor in
+                guard state.isCurrentCameraHost(id: id) else { return }
+                state.updateCameraAim(brightness: brightness, sharpness: sharpness)
+            }
+        }
     }
 }
 
@@ -12903,6 +13090,7 @@ enum CaptureKind {
     case single
     case burst
     case qa
+    case segment   // P0：分题/批改取景后抓拍（全分辨率真照片）
 }
 
 protocol CameraViewControllerDelegate: AnyObject {
@@ -12910,6 +13098,7 @@ protocol CameraViewControllerDelegate: AnyObject {
     func cameraFailed(_ message: String)
     func didCapture(image: UIImage, kind: CaptureKind)
     func didRecognizeGesture(_ gesture: CameraGesture, stableFrames: Int, point: CGPoint?)
+    func didUpdateAimQuality(brightness: Double, sharpness: Double)  // P0：取景实时质量（自动快门/补光提示）
 }
 
 final class CameraViewController: UIViewController, AVCapturePhotoCaptureDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
@@ -13171,7 +13360,49 @@ final class CameraViewController: UIViewController, AVCapturePhotoCaptureDelegat
             self?.latestVideoImage = image
             self?.latestVideoImageAt = now
         }
+        let aim = aimQuality(cgImage: cgImage)
+        DispatchQueue.main.async { [weak self] in
+            self?.delegate?.didUpdateAimQuality(brightness: aim.brightness, sharpness: aim.sharpness)
+        }
         detectGesture(cgImage: cgImage)
+    }
+
+    /// P0：取景实时质量——平均亮度 + 边缘锐度（清晰度代理）。轻量，跑在视频队列。
+    private func aimQuality(cgImage: CGImage) -> (brightness: Double, sharpness: Double) {
+        let w = 40, h = 40
+        var pixels = [UInt8](repeating: 0, count: w * h)
+        let cs = CGColorSpaceCreateDeviceGray()
+        pixels.withUnsafeMutableBytes { ptr in
+            if let ctx = CGContext(data: ptr.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w, space: cs, bitmapInfo: 0) {
+                ctx.interpolationQuality = .medium
+                ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+            }
+        }
+        var lum = 0.0
+        var edge = 0.0
+        var checks = 0
+        for y in 2..<(h - 2) {
+            for x in 2..<(w - 2) {
+                let v = Int(pixels[y * w + x])
+                lum += Double(v)
+                edge += Double(abs(v - Int(pixels[y * w + x + 1]))) + Double(abs(v - Int(pixels[(y + 1) * w + x])))
+                checks += 1
+            }
+        }
+        let brightness = lum / Double(max(1, checks)) / 255.0
+        let sharpness = min(1.0, edge / Double(max(1, checks)) / 30.0)
+        return (brightness, sharpness)
+    }
+
+    func setTorch(_ on: Bool) {
+        guard let device = captureDevice, device.hasTorch else { return }
+        do {
+            try device.lockForConfiguration()
+            device.torchMode = on ? .on : .off
+            device.unlockForConfiguration()
+        } catch {
+            // 手电失败不致命
+        }
     }
 
     private func detectGesture(cgImage: CGImage) {

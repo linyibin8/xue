@@ -72,6 +72,11 @@ struct iPadRootView: View {
         )) {
             QuestionSegmentationSheet(state: state)
         }
+        .overlay {
+            if state.captureAimingVisible {
+                QuestionCaptureOverlay(state: state)
+            }
+        }
     }
 
     private var sidebar: some View {
