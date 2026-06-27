@@ -10606,10 +10606,13 @@ def _extract_segmentation_object(content: str) -> dict:
 
 def _build_segmentation_response(raw: str) -> dict:
     """把视觉模型的原始文本解析成稳定的题目分割契约；任何缺失/越界都被清洗成默认值，
-    解析失败时退回 {is_study_material: False, material_type: "none", questions: []}。"""
+    解析失败时退回 {is_study_material: False, material_type: "none", questions: []}。
+    新增 low_quality（像题目但太糊/读不清，建议整图问答或重拍）与 bbox_approx（bbox 为近似定位，
+    非精确，仅供排序/粗定位）两个布尔字段；两者均向后兼容。"""
     data = _extract_segmentation_object(raw)
     questions: list[dict] = []
     questions_raw = data.get("questions")
+    dropped_empty = 0
     if isinstance(questions_raw, list):
         for position, entry in enumerate(questions_raw, start=1):
             if not isinstance(entry, dict):
@@ -10618,11 +10621,16 @@ def _build_segmentation_response(raw: str) -> dict:
                 index = int(entry.get("index"))
             except (TypeError, ValueError):
                 index = position
+            question_text = truncate_text(entry.get("question_text") or "", 600)
+            # 模糊兜底吐空框：question_text 去空白后为空的题没有任何辨题价值，过滤掉。
+            if not question_text.strip():
+                dropped_empty += 1
+                continue
             questions.append(
                 {
                     "index": index,
                     "bbox": _segment_question_bbox(entry.get("bbox")),
-                    "question_text": truncate_text(entry.get("question_text") or "", 600),
+                    "question_text": question_text,
                     "has_student_answer": bool(entry.get("has_student_answer")),
                 }
             )
@@ -10635,10 +10643,22 @@ def _build_segmentation_response(raw: str) -> dict:
     if not is_material:
         questions = []
         material_type = "none"
+    # low_quality：像题目但读不清/退化，建议整图问答或重拍。两种触发：
+    #   1) 模型判为题目材料、但过滤后一道可读题都没有（全是空框 / 太糊）；
+    #   2) 切出了题，但平均文本极短（斜拍/远拍 OCR 退化的简单兜底）。
+    low_quality = False
+    if is_material and not questions:
+        low_quality = True
+    elif questions:
+        avg_text_len = sum(len(item["question_text"].strip()) for item in questions) / len(questions)
+        if avg_text_len < 6 or dropped_empty >= len(questions):
+            low_quality = True
     return {
         "is_study_material": is_material,
         "material_type": material_type,
         "questions": questions,
+        "low_quality": low_quality,
+        "bbox_approx": True,
     }
 
 
