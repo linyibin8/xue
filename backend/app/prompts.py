@@ -271,7 +271,9 @@ PROMPT_DEFINITIONS: tuple[PromptDefinition, ...] = (
             "严格按下面的结构和字段名输出（index 从 1 起，逐题递增）：\n"
             "{{\"is_study_material\": true, \"material_type\": \"book\", \"questions\": [{{\"index\": 1, "
             "\"bbox\": {{\"x\": 0, \"y\": 0, \"w\": 0, \"h\": 0}}, \"question_text\": \"\", \"has_student_answer\": false}}]}}\n"
-            "如果画面里没有题目，就只输出：{{\"is_study_material\": false, \"material_type\": \"none\", \"questions\": []}}"
+            "如果画面里没有题目，就只输出：{{\"is_study_material\": false, \"material_type\": \"none\", \"questions\": []}}\n"
+            "只输出严格合法 JSON：数字后面不要多余引号、不要尾逗号、所有键值用英文双引号；"
+            "question_text 尽量精简（只保留辨题所需的关键文字），把所有题一次性完整输出、不要中途截断。"
         ),
     ),
 )

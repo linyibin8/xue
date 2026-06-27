@@ -10452,16 +10452,8 @@ def _segment_question_bbox(raw: object) -> dict:
     return {"x": x, "y": y, "w": w, "h": h}
 
 
-def _extract_segmentation_object(content: str) -> dict:
-    """从模型输出里抽出题目分割 JSON 对象，容忍代码围栏/前后散文；解析失败返回 {}。
-    先整体走 parse_json_object，失败再退化到字符串感知的大括号匹配，扫描第一个能解析成 dict
-    且含目标键的 {...}（与 _iter_json_arrays 的括号匹配思路一致，只是匹配花括号）。"""
-    text = (content or "").strip()
-    if not text:
-        return {}
-    parsed = parse_json_object(text)
-    if isinstance(parsed, dict) and ("questions" in parsed or "is_study_material" in parsed):
-        return parsed
+def _iter_brace_blocks(text: str):
+    """字符串感知地扫描出所有最外层 {...} 子串（花括号匹配，忽略字符串内的括号）。"""
     depth = 0
     start = -1
     in_str = False
@@ -10484,15 +10476,132 @@ def _extract_segmentation_object(content: str) -> dict:
         elif ch == "}" and depth > 0:
             depth -= 1
             if depth == 0 and start >= 0:
-                candidate = text[start : index + 1]
+                yield text[start : index + 1]
                 start = -1
-                try:
-                    data = json.loads(candidate)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(data, dict) and ("questions" in data or "is_study_material" in data):
-                    return data
-    return {}
+
+
+def _balance_segmentation_json(text: str) -> str:
+    """补齐被 max_tokens 截断而未闭合的字符串/中括号/大括号；已闭合则原样返回。"""
+    stack: list[str] = []
+    in_str = False
+    esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch == "}":
+            if stack and stack[-1] == "{":
+                stack.pop()
+        elif ch == "]":
+            if stack and stack[-1] == "[":
+                stack.pop()
+    if not in_str and not stack:
+        return text
+    repaired = text
+    if in_str:
+        repaired += '"'
+    repaired = re.sub(r",\s*$", "", repaired.rstrip())
+    for opener in reversed(stack):
+        repaired += "}" if opener == "{" else "]"
+    return repaired
+
+
+def _repair_segmentation_json(text: str) -> str:
+    """对视觉模型偶尔吐出的轻微非法 JSON 做容错修复（只在严格解析失败后使用）：
+    1) 数值后多一个引号（如 "h": 0.5"）——只在「值位置」（紧跟 : [ , 后的纯数字）去掉这个引号，
+       绝不碰 question_text 这种以数字+引号结尾的合法字符串；
+    2) 去掉对象/数组里的尾逗号；
+    3) 截断未闭合时补齐引号/中括号/大括号。"""
+    repaired = re.sub(r'([:\[,]\s*-?\d+(?:\.\d+)?)"', r"\1", text)
+    repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
+    repaired = _balance_segmentation_json(repaired)
+    return repaired
+
+
+def _load_segmentation_dict(candidate: str) -> dict | None:
+    """把候选字符串严格解析成含目标键的分割对象；不是就返回 None。"""
+    try:
+        data = json.loads(candidate)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(data, dict) and ("questions" in data or "is_study_material" in data):
+        return data
+    return None
+
+
+def _regex_segmentation_fallback(text: str) -> dict:
+    """所有 JSON 修复都失败时的正则兜底：直接从文本里捞 is_study_material / material_type，
+    并逐个 question 对象抽 index / bbox(x,y,w,h) / question_text / has_student_answer。"""
+    result: dict = {}
+    match = re.search(r'"is_study_material"\s*:\s*(true|false)', text, re.IGNORECASE)
+    if match:
+        result["is_study_material"] = match.group(1).lower() == "true"
+    match = re.search(r'"material_type"\s*:\s*"([^"]*)"', text)
+    if match:
+        result["material_type"] = match.group(1)
+    positions = [m.start() for m in re.finditer(r'"index"\s*:', text)]
+    questions: list[dict] = []
+    for order, pos in enumerate(positions):
+        end = positions[order + 1] if order + 1 < len(positions) else len(text)
+        chunk = text[pos:end]
+        entry: dict = {}
+        index_match = re.search(r'"index"\s*:\s*(\d+)', chunk)
+        if index_match:
+            entry["index"] = int(index_match.group(1))
+        bbox: dict = {}
+        for key in ("x", "y", "w", "h"):
+            field = re.search(r'"' + key + r'"\s*:\s*(-?\d+(?:\.\d+)?)', chunk)
+            if field:
+                bbox[key] = float(field.group(1))
+        if bbox:
+            entry["bbox"] = bbox
+        text_match = re.search(r'"question_text"\s*:\s*"((?:[^"\\]|\\.)*)"', chunk)
+        if text_match:
+            entry["question_text"] = text_match.group(1)
+        answer_match = re.search(r'"has_student_answer"\s*:\s*(true|false)', chunk, re.IGNORECASE)
+        if answer_match:
+            entry["has_student_answer"] = answer_match.group(1).lower() == "true"
+        questions.append(entry)
+    if questions:
+        result["questions"] = questions
+    return result if ("questions" in result or "is_study_material" in result) else {}
+
+
+def _extract_segmentation_object(content: str) -> dict:
+    """从模型输出里抽出题目分割 JSON 对象，容忍代码围栏/前后散文，并对视觉模型偶尔吐出的
+    轻微非法 JSON（数值后多引号、尾逗号、截断未闭合）做容错修复后再解析；都失败时退到正则兜底。
+    解析顺序：严格整体 → 容错修复整体 → 修复后逐个 {...} 块 → 原文逐个 {...} 块 → 正则兜底。"""
+    text = (content or "").strip()
+    if not text:
+        return {}
+    parsed = _load_segmentation_dict(text)
+    if parsed is not None:
+        return parsed
+    repaired = _repair_segmentation_json(text)
+    parsed = _load_segmentation_dict(repaired)
+    if parsed is not None:
+        return parsed
+    for candidate in _iter_brace_blocks(repaired):
+        parsed = _load_segmentation_dict(candidate)
+        if parsed is not None:
+            return parsed
+        parsed = _load_segmentation_dict(_repair_segmentation_json(candidate))
+        if parsed is not None:
+            return parsed
+    for candidate in _iter_brace_blocks(text):
+        parsed = _load_segmentation_dict(candidate)
+        if parsed is not None:
+            return parsed
+    return _regex_segmentation_fallback(text)
 
 
 def _build_segmentation_response(raw: str) -> dict:
