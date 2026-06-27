@@ -1267,20 +1267,24 @@ struct QuestionSegmentationSheet: View {
             set: { if !$0 { state.selectedGradeIndex = nil } }
         )) {
             if let idx = state.selectedGradeIndex, let q = state.gradeQuestionsByIndex[idx] {
-                GradeDetailSheet(question: q,
+                GradeDetailSheet(state: state, question: q,
                                  onExplain: { state.explainGradedRegion(idx) },
                                  onClose: { state.selectedGradeIndex = nil })
                     .presentationDetents([.medium, .large])
+                    .onDisappear { state.clearRelayout() }
             }
         }
     }
 }
 
-/// 单题批改详情卡：判分 + 学生作答 + 订正/思路 + 「讲解这道题」。
+/// 单题批改详情卡：判分 + 学生作答 + 订正/思路 + 数字版题干(对照原图) + 「讲解这道题」。
 struct GradeDetailSheet: View {
+    @ObservedObject var state: AppState
     let question: GradedQuestion
     var onExplain: () -> Void
     var onClose: () -> Void
+    @State private var showRelayout = false
+    @State private var compareOriginal = false
 
     var body: some View {
         let mark = question.mark
@@ -1302,6 +1306,9 @@ struct GradeDetailSheet: View {
                     Text("这类题需要看图/几何推理，AI 不硬判对错，点下面让它给你讲。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+
+                relayoutSection
+
                 Button { onExplain() } label: {
                     Label("讲解这道题", systemImage: "sparkles")
                         .font(.subheadline.weight(.semibold))
@@ -1312,6 +1319,43 @@ struct GradeDetailSheet: View {
                 .padding(.top, 4)
             }
             .padding(18)
+        }
+    }
+
+    // B：数字版题干（仅印刷题干，强制可对照原图）。
+    @ViewBuilder private var relayoutSection: some View {
+        Divider()
+        if !showRelayout {
+            Button {
+                showRelayout = true
+                Task { await state.fetchRelayout(for: question.index) }
+            } label: {
+                Label("看数字版题干（对照原图）", systemImage: "doc.plaintext")
+                    .font(.subheadline.weight(.semibold)).foregroundStyle(Color.accentColor)
+            }
+        } else {
+            HStack {
+                Text("数字版题干").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                if state.relayoutCropImage != nil {
+                    Toggle("对照原图", isOn: $compareOriginal).font(.caption).labelsHidden()
+                    Text(compareOriginal ? "原图" : "数字版").font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            if state.relayoutInFlight {
+                ProgressView().padding(.vertical, 6)
+            } else if compareOriginal, let img = state.relayoutCropImage {
+                Image(uiImage: img).resizable().scaledToFit()
+                    .frame(maxHeight: 200).clipShape(RoundedRectangle(cornerRadius: 8))
+            } else {
+                Text(state.relayoutText.isEmpty ? "（无）" : state.relayoutText)
+                    .font(.subheadline).textSelection(.enabled)
+                if !state.relayoutFigureNote.isEmpty {
+                    Text(state.relayoutFigureNote).font(.caption).foregroundStyle(.orange)
+                }
+                Text("数字版仅整理印刷题干、不含手写/不重画图，务必对照原图。")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -7010,6 +7054,12 @@ final class AppState: ObservableObject {
     @Published var gradingNotice = ""                       // 批改兜底文案（未识别/太糊）
     @Published var selectedGradeIndex: Int?                 // 点开的题（详情卡）
     @Published var autoRouteRevertText: String?             // P4：自动进模块时记下原话，供「其实只想问」一键纠偏
+    // B：印刷题干数字化重排版（仅印刷题干，强制对照原图；学生作答/几何不重生成）。
+    @Published var relayoutText = ""                        // 数字版题干纯文本
+    @Published var relayoutFigureNote = ""                  // 「此题含图，见原图」
+    @Published var relayoutInFlight = false
+    @Published var relayoutForIndex: Int?                   // 已取数字版的题序
+    var relayoutCropImage: UIImage?                        // 对照原图用的该题裁剪图（非 @Published）
     var segmentationRawImage: UIImage?                      // 原图（orientation 归一），非 @Published
     var segmentationCorrectedImage: UIImage?               // 校正图，非 @Published
     fileprivate var pendingRegionQAFrame: QAFrameCandidate?  // 选中题裁剪帧，喂给下一次提交（类型 private，故 fileprivate）
@@ -9419,6 +9469,44 @@ final class AppState: ObservableObject {
             gradingNotice = "批改失败，可整图问答或重拍"
             log("整页批改失败：\(error.localizedDescription)", level: "error")
         }
+    }
+
+    /// B：取该题的「数字版印刷题干」（裁剪该题区域发后端 relayout，强制对照原图）。
+    func fetchRelayout(for index: Int) async {
+        guard let region = questionRegions.first(where: { $0.index == index }),
+              let base = segmentationDisplayImage else { return }
+        relayoutInFlight = true
+        relayoutText = ""
+        relayoutFigureNote = ""
+        defer { relayoutInFlight = false }
+        let padded = paddedSegmentationRect(region.normalizedRect)
+        let cropped = QuestionSegmenter.crop(base, to: padded)
+        relayoutCropImage = cropped
+        guard await ensureQASession(), let sessionId else { relayoutText = "暂时取不到数字版，可看原图"; return }
+        do {
+            let files = [MultipartFile(field: "image", name: "relayout.jpg", mime: "image/jpeg", data: try jpegData(cropped))]
+            let data = try await postForm(
+                path: "/api/sessions/\(sessionId)/relayout-question",
+                fields: ["source": UIDevice.current.identifierForVendor?.uuidString ?? "ios"],
+                files: files
+            )
+            let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let isPrinted = (json?["is_printed_question"] as? Bool) ?? false
+            let plain = (json?["plain_text"] as? String) ?? ""
+            relayoutFigureNote = (json?["figure_note"] as? String) ?? ""
+            relayoutText = (isPrinted && !plain.isEmpty) ? plain : "这道题没读到清晰的印刷题干，请看原图"
+            relayoutForIndex = index
+        } catch {
+            relayoutText = "数字版获取失败，请看原图"
+            log("relayout 失败：\(error.localizedDescription)", level: "error")
+        }
+    }
+
+    func clearRelayout() {
+        relayoutText = ""
+        relayoutFigureNote = ""
+        relayoutForIndex = nil
+        relayoutCropImage = nil
     }
 
     /// 在批改详情里「讲解这道题」：裁剪该题 → 走拍照答题链路讲解（不再判分）。
