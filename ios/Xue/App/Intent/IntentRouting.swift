@@ -30,7 +30,8 @@ extension AppState {
         guard !text.isEmpty else { return false }
 
         // 本地预筛：纯提问直接放行不走 route（省一次 LLM 往返的延迟税）。
-        guard localPrefilterLooksLikeConfig(text) else { return false }
+        // P4：配置类 或 批改/分题类 任一命中才付往返。
+        guard localPrefilterLooksLikeConfig(text) || localPrefilterLooksLikeModule(text) else { return false }
 
         // 仅疑似配置才付往返；短 timeout，失败/超时降级为 QA。
         intentRouteInFlight = true
@@ -48,6 +49,14 @@ extension AppState {
         do {
             let data = try await intentPostJSON(path: "/api/intent/route", payload: payload, timeout: 12)
             let resp = try JSONDecoder().decode(IntentRouteResponse.self, from: data)
+            // P4：自动进功能模块（作业批改 / 拍照分题答题），并记下原话供「其实只想问」一键纠偏。
+            if resp.isModule, let module = resp.module {
+                autoRouteRevertText = text
+                appendUserChatMessage(text)
+                log(module == "grade" ? "识别为作业批改，进入取景批改" : "识别为拍照分题，进入取景答题")
+                beginQuestionSegmentation(grading: module == "grade")
+                return true
+            }
             guard resp.isConfig, let proposal = resp.proposal else {
                 // intent_kind == "qa" 或 needs_clarification（无卡片）→ 照常走 QA。
                 if resp.needsClarification == true, let msg = resp.clarification, !msg.isEmpty {
@@ -81,6 +90,27 @@ extension AppState {
         let hasNoun = toggleNouns.contains { t.contains($0) }
         if hasVerb && hasNoun { return true }
         return false
+    }
+
+    /// P4 预筛：疑似「作业批改 / 拍照分题答题」。命中才付 route 往返（最终由后端 LLM 裁决）。
+    func localPrefilterLooksLikeModule(_ text: String) -> Bool {
+        let gradeCues = ["批改", "检查", "对不对", "对吗", "对了吗", "错没错", "改完", "判一下", "判对错", "看看对错", "有没有错", "做错没"]
+        let segmentCues = ["分一下", "分题", "这几道题", "这些题", "好几道题", "几道题", "整页", "这一页", "这页题", "拍照解"]
+        if gradeCues.contains(where: { text.contains($0) }) { return true }
+        if segmentCues.contains(where: { text.contains($0) }) { return true }
+        return false
+    }
+
+    /// P4 一键纠偏：从「自动进模块」退回——取消取景，把原话当普通提问发出（跳过再次拦截，防环）。
+    @MainActor
+    func revertAutoRouteToQA() {
+        let original = autoRouteRevertText ?? ""
+        autoRouteRevertText = nil
+        cancelAiming()
+        dismissSegmentation()
+        let text = original.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        proceedTypedQuestion(text)   // 逃生口：跳过意图拦截，直接当普通提问
     }
 
     // MARK: - 确认 / 撤销 / 收尾

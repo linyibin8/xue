@@ -64,18 +64,20 @@ struct IntentProposal: Identifiable, Decodable, Equatable {
 // MARK: - route 响应
 
 struct IntentRouteResponse: Decodable {
-    let intentKind: String              // "qa" | "config"
+    let intentKind: String              // "qa" | "config" | "module"
     let proposal: IntentProposal?
     let needsClarification: Bool?
     let clarification: String?
+    let module: String?                 // P4：intentKind=="module" 时 "grade" | "answer"
 
     enum CodingKeys: String, CodingKey {
-        case proposal, clarification
+        case proposal, clarification, module
         case intentKind = "intent_kind"
         case needsClarification = "needs_clarification"
     }
 
     var isConfig: Bool { intentKind == "config" }
+    var isModule: Bool { intentKind == "module" }
 }
 
 // MARK: - confirm / undo 回吐的真源目标值（echo_state）

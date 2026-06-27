@@ -1376,6 +1376,19 @@ struct QuestionCaptureOverlay: View {
                 }
                 .padding(.horizontal, 16).padding(.top, 16)
 
+                // P4：自动进模块时给「其实只想问」一键纠偏（退回普通问答）。
+                if state.autoRouteRevertText != nil {
+                    Button { state.revertAutoRouteToQA() } label: {
+                        Label("其实只想问问题 →", systemImage: "arrow.uturn.left")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 12).padding(.vertical, 7)
+                            .background(.ultraThinMaterial, in: Capsule())
+                    }
+                    .padding(.top, 8)
+                    .accessibilityIdentifier("aiming-revert-qa")
+                }
+
                 Spacer()
 
                 VStack(spacing: 14) {
@@ -6996,6 +7009,7 @@ final class AppState: ObservableObject {
     @Published var gradingInFlight = false                  // 批改请求在途（题上转圈）
     @Published var gradingNotice = ""                       // 批改兜底文案（未识别/太糊）
     @Published var selectedGradeIndex: Int?                 // 点开的题（详情卡）
+    @Published var autoRouteRevertText: String?             // P4：自动进模块时记下原话，供「其实只想问」一键纠偏
     var segmentationRawImage: UIImage?                      // 原图（orientation 归一），非 @Published
     var segmentationCorrectedImage: UIImage?               // 校正图，非 @Published
     fileprivate var pendingRegionQAFrame: QAFrameCandidate?  // 选中题裁剪帧，喂给下一次提交（类型 private，故 fileprivate）
@@ -9289,6 +9303,7 @@ final class AppState: ObservableObject {
     /// 取景阶段抓到全分辨率照片 → 关取景层 → 校正 + 分割 → 展示浮层选题层。
     func didCaptureSegmentationPhoto(_ image: UIImage) {
         guard captureAimingVisible else { return }
+        autoRouteRevertText = nil   // 已拍照committed，纠偏入口收起
         if torchOn { setTorch?(false); torchOn = false }
         captureAimingVisible = false
         aimCapturing = false
@@ -9313,6 +9328,7 @@ final class AppState: ObservableObject {
         captureAimingVisible = false
         aimCapturing = false
         aimReadyStreak = 0
+        autoRouteRevertText = nil
         if cameraTaskKind == .qaFrame { cameraTaskKind = .none }
         cameraPreviewVisible = false
     }
@@ -10461,7 +10477,7 @@ final class AppState: ObservableObject {
         UserDefaults.standard.set(userInputMemory, forKey: userInputMemoryDefaultsKey)
     }
 
-    private func appendUserChatMessage(_ text: String) {
+    func appendUserChatMessage(_ text: String) {   // internal：供 Intent/IntentRouting.swift P4 自动分流复用
         let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanText.isEmpty else { return }
         recordUserInputMemory(cleanText)
