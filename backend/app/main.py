@@ -10527,13 +10527,17 @@ def _repair_segmentation_json(text: str) -> str:
     return repaired
 
 
-def _load_segmentation_dict(candidate: str) -> dict | None:
-    """把候选字符串严格解析成含目标键的分割对象；不是就返回 None。"""
+_SEGMENTATION_TARGET_KEYS = ("questions", "is_study_material")
+
+
+def _load_segmentation_dict(candidate: str, target_keys: tuple[str, ...] = _SEGMENTATION_TARGET_KEYS) -> dict | None:
+    """把候选字符串严格解析成含目标键之一的对象；不是就返回 None。target_keys 可换成别的端点的键
+    （如重排版 is_printed_question/plain_text），让同一套鲁棒解析复用到非分割响应上。"""
     try:
         data = json.loads(candidate)
     except (json.JSONDecodeError, ValueError):
         return None
-    if isinstance(data, dict) and ("questions" in data or "is_study_material" in data):
+    if isinstance(data, dict) and any(k in data for k in target_keys):
         return data
     return None
 
@@ -10576,32 +10580,36 @@ def _regex_segmentation_fallback(text: str) -> dict:
     return result if ("questions" in result or "is_study_material" in result) else {}
 
 
-def _extract_segmentation_object(content: str) -> dict:
-    """从模型输出里抽出题目分割 JSON 对象，容忍代码围栏/前后散文，并对视觉模型偶尔吐出的
+def _extract_segmentation_object(content: str, target_keys: tuple[str, ...] = _SEGMENTATION_TARGET_KEYS) -> dict:
+    """从模型输出里抽出 JSON 对象，容忍代码围栏/前后散文，并对视觉模型偶尔吐出的
     轻微非法 JSON（数值后多引号、尾逗号、截断未闭合）做容错修复后再解析；都失败时退到正则兜底。
-    解析顺序：严格整体 → 容错修复整体 → 修复后逐个 {...} 块 → 原文逐个 {...} 块 → 正则兜底。"""
+    解析顺序：严格整体 → 容错修复整体 → 修复后逐个 {...} 块 → 原文逐个 {...} 块 → 正则兜底。
+    target_keys 决定「合法对象」的判据；非分割端点（如重排版）传自己的键，并跳过分割专用的正则兜底。"""
     text = (content or "").strip()
     if not text:
         return {}
-    parsed = _load_segmentation_dict(text)
+    parsed = _load_segmentation_dict(text, target_keys)
     if parsed is not None:
         return parsed
     repaired = _repair_segmentation_json(text)
-    parsed = _load_segmentation_dict(repaired)
+    parsed = _load_segmentation_dict(repaired, target_keys)
     if parsed is not None:
         return parsed
     for candidate in _iter_brace_blocks(repaired):
-        parsed = _load_segmentation_dict(candidate)
+        parsed = _load_segmentation_dict(candidate, target_keys)
         if parsed is not None:
             return parsed
-        parsed = _load_segmentation_dict(_repair_segmentation_json(candidate))
+        parsed = _load_segmentation_dict(_repair_segmentation_json(candidate), target_keys)
         if parsed is not None:
             return parsed
     for candidate in _iter_brace_blocks(text):
-        parsed = _load_segmentation_dict(candidate)
+        parsed = _load_segmentation_dict(candidate, target_keys)
         if parsed is not None:
             return parsed
-    return _regex_segmentation_fallback(text)
+    # 正则兜底仅对分割响应有意义（抽 is_study_material/questions）；其它端点解析失败就返回 {}。
+    if target_keys == _SEGMENTATION_TARGET_KEYS:
+        return _regex_segmentation_fallback(text)
+    return {}
 
 
 def _build_segmentation_response(raw: str) -> dict:
@@ -10908,7 +10916,7 @@ def _build_relayout_response(raw: str) -> dict:
     顶层强制 must_compare_original=True，前端据此强制显示原图（批改证据/题干须对照原图核验）。
     本函数只搬运模型给的印刷题干文本，不在服务端拼接学生作答、不重建几何图。
     整体解析失败时退回 {is_printed_question: False, plain_text: "", must_compare_original: True}。"""
-    data = _extract_segmentation_object(raw)
+    data = _extract_segmentation_object(raw, target_keys=("is_printed_question", "plain_text", "title"))
     if not data:
         return {
             "is_printed_question": False,
