@@ -89,8 +89,9 @@
   - **转写准、口算/纯算术判分可靠**；但 **VLM 几何/读图题编造标准答案(同题三照片三值、与自己 correction 矛盾)→学生写对也误判错**，是模型硬伤，提示词治不住。
   - **修法=服务端可靠性闸门**：question_text 含读图/几何线索(如图/阴影/三角形+面积…)→强制 verdict「不确定」+清 correct_answer+`gradable=false`；纯算术保持判分。响应加 `reliable_subset_only/gradable`。实测 real5 全几何题已正确变「不确定」。**产品定调(对标小猿口算)：只判可靠子集(口算/算术)，几何题给「讲解」不硬判对错。**
 - [x] **P2 iOS 作业批改逐题 ✓/✗ UI**(commit 163c234)：作业批改→取景拍清→端上 Vision segment(准 bbox)→调 grade-page 整页判分→按 index 对齐叠 ✓(对)/✗(错)/◐(部分)/?(不确定·几何待讲解)；`gradable=false` 只显「?·待讲解」绝不红叉；点题→GradeDetailSheet(判分+学生作答+订正/思路+错因+知识点+「讲解这道题」)。整图问答兜底保留。两端编译过。新文件 QuestionGradingOverlay.swift。
-- [ ] P4 NL 自动分流(扩 intent_router：实时对话说「这题怎么做/帮我批改」自动进答题/批改+一键纠偏)。
-- [ ] B 印刷题干重排版(仅印刷题干、强制对照原图)。
+- [x] **P4 NL 自动分流**(commit 014dcc6)：后端 intent_router 加 grade_homework/photo_answer→intent_kind:module(已部署+实测:批改→grade、分这几道题→answer、单题→qa、config 不变)。iOS 文本路径 maybeInterceptAsIntent 命中 module→记原话→自动 beginQuestionSegmentation；取景层「其实只想问问题→」一键纠偏(proceedTypedQuestion 逃生口)。两端编译过。**语音路径暂不拦截(待续，避免给语音流加往返延迟)。**
+- [ ] B 印刷题干重排版(仅印刷题干、强制对照原图；学生作答/几何绝不重生成)——用户想试的实验。
+- 待发版：P4(+B) 合并出一个里程碑包。WTT 文案注意：**ASC 拒绝 ✓/✗ 等特殊 unicode(INVALID_TEXT)，用纯文字**。
 
 ## 约束
 - 两端共享核心（AppState/AuthSession/模型/API），UI 各接一次（见 docs/MULTI_CLIENT_GUIDE.md）。
