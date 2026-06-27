@@ -83,7 +83,13 @@
 - [x] P1 服务端分题端点 `POST /api/sessions/{id}/segment-questions`(复用27B VLM)：已部署 prod + **用10张真实作业照片深度测试(test→fix→retest 子代理循环)**。
   - **关键发现(定架构)**：VLM 判 `is_study_material` + `question_text` + `has_student_answer` **可靠(真题8/8)**；但 **bbox 是按题序编造的等距网格、非真实定位(漂移10-20%)** → **像素级✓/✗叠标不能只靠 VLM**，要么用端上 Vision(QuestionSegmenter 文字行位置准、但糊图/非题失效)，要么专用版面模型(P1-proper,GPU 现满)。响应已加 `bbox_approx:true`。
   - 修过的 bug：①JSON 解析脆弱致~50%假阴性(数字后多引号/截断)→分层容错解析(已修，10张里8张正确检出)；②一题号一条/练习标题并入(real2 由误并3→正确5)；③模糊吐空文本框→过滤+`low_quality`标志；temperature 已=0。
-  - **架构结论**：服务端 VLM = 「有没有题/题干文本/是否作答/逐题判分」理解层(已就位)；端上 Vision = 「题在图上哪(准 bbox)」定位层；P2 批改 = 端上 bbox 定位 + VLM/批改JSON 判分，二者融合。**待 Mac 恢复做 iOS 融合 + P2 叠标 UI。**
+  - **架构结论**：服务端 VLM = 「有没有题/题干文本/是否作答/逐题判分」理解层(已就位)；端上 Vision = 「题在图上哪(准 bbox)」定位层；P2 批改 = 端上 bbox 定位 + VLM/批改JSON 判分，二者融合。
+- [x] **里程碑包 build 202606272314** 已发 TestFlight(VALID,4 testers)：P0 全分辨率捕获+取景+study-material gating。相机/取景真机待用户测。
+- [x] **P2 后端整页批改端点 `POST /api/sessions/{id}/grade-page`**(复用 VLM+鲁棒解析)：逐题 verdict+学生作答转写+订正。**10 张真测+视觉评测**发现并修：
+  - **转写准、口算/纯算术判分可靠**；但 **VLM 几何/读图题编造标准答案(同题三照片三值、与自己 correction 矛盾)→学生写对也误判错**，是模型硬伤，提示词治不住。
+  - **修法=服务端可靠性闸门**：question_text 含读图/几何线索(如图/阴影/三角形+面积…)→强制 verdict「不确定」+清 correct_answer+`gradable=false`；纯算术保持判分。响应加 `reliable_subset_only/gradable`。实测 real5 全几何题已正确变「不确定」。**产品定调(对标小猿口算)：只判可靠子集(口算/算术)，几何题给「讲解」不硬判对错。**
+- [ ] P2 iOS UI：作业批改流程→端上 segment(准 bbox)+调 grade-page→照片叠 ✓/✗(仅 gradable 题)；不确定/几何题显「?·讲解这道题」不显红叉；点题看订正。**Mac 已恢复，下轮做。**
+- [ ] P4 NL 自动分流(扩 intent_router)。 B 印刷题干重排版。
 
 ## 约束
 - 两端共享核心（AppState/AuthSession/模型/API），UI 各接一次（见 docs/MULTI_CLIENT_GUIDE.md）。
