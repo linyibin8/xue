@@ -10719,6 +10719,127 @@ async def segment_session_questions(
     return result
 
 
+_GRADING_VERDICTS = {"对", "错", "部分对", "未作答", "未识别"}
+
+
+def _build_grading_response(raw: str) -> dict:
+    """把整页批改视觉模型的原始文本解析成稳定的逐题批改契约。复用题目分割的鲁棒 JSON 抽取
+    （_extract_segmentation_object）与 bbox 清洗（_segment_question_bbox）。每题取
+    index/bbox/question_text/student_answer/verdict(白名单校验，非法→"未识别")/correct_answer/
+    correction/error_reason/knowledge；question_text 与 student_answer 都为空的题过滤掉。
+    bbox 仅供粗排序（bbox_approx=True），前端用端上 Vision 的精确 bbox 定位。
+    整体解析失败时退回 {is_study_material: False, questions: [], low_quality: True}。"""
+    data = _extract_segmentation_object(raw)
+    if not data:
+        return {
+            "is_study_material": False,
+            "questions": [],
+            "low_quality": True,
+            "bbox_approx": True,
+        }
+    questions: list[dict] = []
+    questions_raw = data.get("questions")
+    if isinstance(questions_raw, list):
+        for position, entry in enumerate(questions_raw, start=1):
+            if not isinstance(entry, dict):
+                continue
+            try:
+                index = int(entry.get("index"))
+            except (TypeError, ValueError):
+                index = position
+            question_text = truncate_text(entry.get("question_text") or "", 600)
+            student_answer = truncate_text(entry.get("student_answer") or "", 600)
+            # 题干与学生作答都为空的题没有任何批改价值，过滤掉。
+            if not question_text.strip() and not student_answer.strip():
+                continue
+            verdict = str(entry.get("verdict") or "").strip()
+            if verdict not in _GRADING_VERDICTS:
+                verdict = "未识别"
+            questions.append(
+                {
+                    "index": index,
+                    "bbox": _segment_question_bbox(entry.get("bbox")),
+                    "question_text": question_text,
+                    "student_answer": student_answer,
+                    "verdict": verdict,
+                    "correct_answer": truncate_text(entry.get("correct_answer") or "", 600),
+                    "correction": truncate_text(entry.get("correction") or "", 600),
+                    "error_reason": truncate_text(entry.get("error_reason") or "", 600),
+                    "knowledge": truncate_text(entry.get("knowledge") or "", 300),
+                }
+            )
+    is_material = bool(data.get("is_study_material"))
+    if questions:
+        is_material = True
+    if not is_material:
+        questions = []
+    # like 题目材料 but no gradable question survived → 建议整图问答或重拍。
+    low_quality = bool(is_material and not questions)
+    return {
+        "is_study_material": is_material,
+        "questions": questions,
+        "low_quality": low_quality,
+        "bbox_approx": True,
+    }
+
+
+@app.post("/api/sessions/{session_id}/grade-page")
+async def grade_session_questions(
+    session_id: str,
+    request: Request,
+    image: UploadFile = File(...),
+    source: str = Form("ios"),
+) -> dict:
+    """对整页作业逐题批改（供 iOS 端调用）。复用现有 27B 视觉大模型逐题给出对/错+订正；
+    鉴权/存图/限流口径与 /segment-questions 完全一致。bbox 仅供粗排序，前端用端上 Vision 精确定位。"""
+    init_db()
+    principal = principal_from_request(request)
+    if not image.filename:
+        raise HTTPException(422, "image is required")
+    with connect() as conn:
+        require_account_session(conn, session_id, principal)
+    source_text = clean_user_text(source, 80) or "ios"
+    _, filename, _ = await save_upload(
+        image,
+        session_id,
+        "grade",
+        batch_id="grade",
+        captured_at=utc_now(),
+        capture_meta={"source": source_text, "purpose": "page_grading"},
+    )
+    settings = effective_llm_settings_for_session(session_id)
+    prompt = prompts.render_prompt("page_grading")
+    image_paths = [image_path_for_request(filename)]
+    try:
+        raw = await run_with_llm_gate(
+            f"grade:{session_id[:8]}",
+            session_id,
+            lambda: llm.analyze_images(settings, prompt, image_paths),
+            priority=LLM_PRIORITY_REALTIME,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        emit_log(
+            f"整页批改调用视觉模型失败：{truncate_text(str(exc), 180)}",
+            session_id=session_id,
+            device_id=source_text,
+            source="grade",
+            level="warning",
+        )
+        raise HTTPException(502, "page grading failed")
+    result = _build_grading_response(raw)
+    emit_log(
+        f"整页批改完成：is_study_material={result['is_study_material']}，"
+        f"题数={len(result['questions'])}，low_quality={result['low_quality']}",
+        session_id=session_id,
+        device_id=source_text,
+        source="grade",
+    )
+    result["raw"] = truncate_text(raw, 4000)
+    return result
+
+
 @app.post("/api/solve-single")
 async def solve_single(
     request: Request,
