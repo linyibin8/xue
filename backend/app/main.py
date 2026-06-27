@@ -10884,6 +10884,111 @@ async def grade_session_questions(
     return result
 
 
+def _relayout_str_list(raw: object, item_limit: int = 600, max_items: int = 30) -> list[str]:
+    """把模型给的 given/formulas 字段安全清洗成 list[str]：非列表→空列表；逐项转字符串、截断、
+    丢掉空白项；最多保留 max_items 条，避免异常输出撑爆响应。"""
+    if not isinstance(raw, list):
+        return []
+    items: list[str] = []
+    for entry in raw:
+        if isinstance(entry, (dict, list)):
+            continue
+        text = truncate_text(str(entry) if entry is not None else "", item_limit).strip()
+        if text:
+            items.append(text)
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def _build_relayout_response(raw: str) -> dict:
+    """把“印刷题干数字化重排版”视觉模型的原始文本解析成稳定契约。复用题目分割的鲁棒 JSON 抽取
+    （_extract_segmentation_object）。只取印刷题干字段：is_printed_question(bool)/title/plain_text/
+    given(list[str])/ask/formulas(list[str])/figure_note/uncertain，缺字段安全降级为空值。
+    顶层强制 must_compare_original=True，前端据此强制显示原图（批改证据/题干须对照原图核验）。
+    本函数只搬运模型给的印刷题干文本，不在服务端拼接学生作答、不重建几何图。
+    整体解析失败时退回 {is_printed_question: False, plain_text: "", must_compare_original: True}。"""
+    data = _extract_segmentation_object(raw)
+    if not data:
+        return {
+            "is_printed_question": False,
+            "plain_text": "",
+            "must_compare_original": True,
+        }
+    return {
+        "is_printed_question": bool(data.get("is_printed_question")),
+        "title": truncate_text(data.get("title") or "", 200),
+        "plain_text": truncate_text(data.get("plain_text") or "", 4000),
+        "given": _relayout_str_list(data.get("given")),
+        "ask": truncate_text(data.get("ask") or "", 600),
+        "formulas": _relayout_str_list(data.get("formulas")),
+        "figure_note": truncate_text(data.get("figure_note") or "", 300),
+        "uncertain": bool(data.get("uncertain")),
+        # 铁律：题干须对照原图核验；前端强制显示原图，不得仅凭重排文本作答/批改。
+        "must_compare_original": True,
+    }
+
+
+@app.post("/api/sessions/{session_id}/relayout-question")
+async def relayout_question(
+    session_id: str,
+    request: Request,
+    image: UploadFile = File(...),
+    source: str = Form("ios"),
+) -> dict:
+    """把图中【印刷体题干】整理成干净数字版（B 实验，供 iOS 端调用）。严格只重排印刷题干：
+    不转写学生手写作答、不重画几何图（含图只在 figure_note 注明见原图）、看不清写“未识别”。
+    复用现有 27B 视觉大模型；鉴权/存图/限流口径与 /segment-questions 完全一致；不解题、不批改。
+    响应顶层强制 must_compare_original=true，前端据此强制显示原图。"""
+    init_db()
+    principal = principal_from_request(request)
+    if not image.filename:
+        raise HTTPException(422, "image is required")
+    with connect() as conn:
+        require_account_session(conn, session_id, principal)
+    source_text = clean_user_text(source, 80) or "ios"
+    _, filename, _ = await save_upload(
+        image,
+        session_id,
+        "relayout",
+        batch_id="relayout",
+        captured_at=utc_now(),
+        capture_meta={"source": source_text, "purpose": "question_relayout"},
+    )
+    settings = effective_llm_settings_for_session(session_id)
+    prompt = prompts.render_prompt("question_relayout")
+    image_paths = [image_path_for_request(filename)]
+    try:
+        raw = await run_with_llm_gate(
+            f"relayout:{session_id[:8]}",
+            session_id,
+            lambda: llm.analyze_images(settings, prompt, image_paths),
+            priority=LLM_PRIORITY_REALTIME,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        emit_log(
+            f"题干重排版调用视觉模型失败：{truncate_text(str(exc), 180)}",
+            session_id=session_id,
+            device_id=source_text,
+            source="relayout",
+            level="warning",
+        )
+        raise HTTPException(502, "question relayout failed")
+    result = _build_relayout_response(raw)
+    emit_log(
+        f"印刷题干重排版完成：is_printed_question={result['is_printed_question']}，"
+        f"uncertain={result.get('uncertain')}，文本长度={len(result.get('plain_text') or '')}，"
+        f"must_compare_original={result['must_compare_original']}",
+        session_id=session_id,
+        device_id=source_text,
+        source="relayout",
+    )
+    result["raw"] = truncate_text(raw, 4000)
+    return result
+
+
 @app.post("/api/solve-single")
 async def solve_single(
     request: Request,
