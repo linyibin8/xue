@@ -80,6 +80,10 @@
 **验收(逐条可测)**：① 没对准题目时不自动拍、提示「请对准书本/试卷/屏幕上的题目」；对准清晰题目才自动/手动拍。② 拍到的是全分辨率清晰图(非预览帧)，分题能框出≥70%的题。③ 选一题只分析那道；整页批改逐题✓/✗叠在原图上、点错题看讲解。④ 实时对话说「这题怎么做」「帮我批改」自动进对应模块，误判可一键切换。⑤ B 实验：仅印刷题干可重排版且强制对照原图，学生作答/几何绝不重生成。⑥ 两端一致、不破坏现有问答/观察/记忆。
 **loop 纪律**：① Mac(100.64.0.6) 离线时先做 Mac 无关的(后端/设计/GOAL)，并定期重试 Mac 做 iOS 编译+发布。② dell 2×4090 显存被 27B 占满(~2GB 空闲/卡)时，P1 先用**现有 27B VLM** 做服务端「是否题目+分题 bbox」JSON 端点(GPU 轻)，专用 OCR(DocRes/PP-OCRv5/PP-FormulaNet)等显存腾出或上 CPU 再补。③ 累积到阶段里程碑再出一个 TestFlight 包(尊重用户「统一测」)。
 - [x] P0+ 先判断有没有题目印刷体(study-material gating)：取景实时 materialScore(VNRecognizeText 数文本行+矩形)，<0.5 不自动快门、提示对准题目；分割为空按 textCount/blur/light 给精准重拍引导。**(已码，待 Mac 恢复编译验证)**
+- [x] P1 服务端分题端点 `POST /api/sessions/{id}/segment-questions`(复用27B VLM)：已部署 prod + **用10张真实作业照片深度测试(test→fix→retest 子代理循环)**。
+  - **关键发现(定架构)**：VLM 判 `is_study_material` + `question_text` + `has_student_answer` **可靠(真题8/8)**；但 **bbox 是按题序编造的等距网格、非真实定位(漂移10-20%)** → **像素级✓/✗叠标不能只靠 VLM**，要么用端上 Vision(QuestionSegmenter 文字行位置准、但糊图/非题失效)，要么专用版面模型(P1-proper,GPU 现满)。响应已加 `bbox_approx:true`。
+  - 修过的 bug：①JSON 解析脆弱致~50%假阴性(数字后多引号/截断)→分层容错解析(已修，10张里8张正确检出)；②一题号一条/练习标题并入(real2 由误并3→正确5)；③模糊吐空文本框→过滤+`low_quality`标志；temperature 已=0。
+  - **架构结论**：服务端 VLM = 「有没有题/题干文本/是否作答/逐题判分」理解层(已就位)；端上 Vision = 「题在图上哪(准 bbox)」定位层；P2 批改 = 端上 bbox 定位 + VLM/批改JSON 判分，二者融合。**待 Mac 恢复做 iOS 融合 + P2 叠标 UI。**
 
 ## 约束
 - 两端共享核心（AppState/AuthSession/模型/API），UI 各接一次（见 docs/MULTI_CLIENT_GUIDE.md）。
