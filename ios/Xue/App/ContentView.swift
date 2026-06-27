@@ -1150,13 +1150,18 @@ struct QuestionSegmentationSheet: View {
                 .accessibilityIdentifier("segmentation-close")
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(state.segmentationIsGrading ? "作业批改 · 选题" : "拍照答题 · 选题")
+                    Text(state.segmentationIsGrading ? "作业批改" : "拍照答题 · 选题")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.white)
                     if !state.segmentationNotice.isEmpty {
                         Text(state.segmentationNotice)
                             .font(.caption)
                             .foregroundStyle(.white.opacity(0.78))
+                    }
+                    if state.segmentationIsGrading && !state.gradingNotice.isEmpty {
+                        Text(state.gradingNotice)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
                     }
                 }
                 Spacer()
@@ -1185,16 +1190,30 @@ struct QuestionSegmentationSheet: View {
                         .tint(.white)
                         .foregroundStyle(.white)
                 } else if let image = state.segmentationDisplayImage {
-                    QuestionRegionOverlay(
-                        image: image,
-                        regions: state.questionRegions,
-                        selectedID: Binding(
-                            get: { state.selectedRegionID },
-                            set: { state.selectedRegionID = $0 }
-                        ),
-                        onSelect: { state.selectQuestionRegion($0) }
-                    )
-                    .padding(.horizontal, 12)
+                    if state.segmentationIsGrading {
+                        QuestionGradingOverlay(
+                            image: image,
+                            regions: state.questionRegions,
+                            verdicts: state.gradeQuestionsByIndex,
+                            selectedIndex: Binding(
+                                get: { state.selectedGradeIndex },
+                                set: { state.selectedGradeIndex = $0 }
+                            ),
+                            onSelect: { state.selectedGradeIndex = $0.index }
+                        )
+                        .padding(.horizontal, 12)
+                    } else {
+                        QuestionRegionOverlay(
+                            image: image,
+                            regions: state.questionRegions,
+                            selectedID: Binding(
+                                get: { state.selectedRegionID },
+                                set: { state.selectedRegionID = $0 }
+                            ),
+                            onSelect: { state.selectQuestionRegion($0) }
+                        )
+                        .padding(.horizontal, 12)
+                    }
                 } else {
                     ProgressView().tint(.white)
                 }
@@ -1214,19 +1233,28 @@ struct QuestionSegmentationSheet: View {
                 }
                 .accessibilityIdentifier("segmentation-whole-image")
 
-                Button {
-                    state.confirmSelectedRegion()
-                } label: {
-                    Text(state.segmentationIsGrading ? "批改选中题" : "分析选中题")
+                if state.segmentationIsGrading {
+                    Text(state.gradingInFlight ? "逐题批改中…" : "点题目看批改详情")
                         .font(.subheadline.weight(.semibold))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 13)
-                        .background(hasSelection ? Color.accentColor : Color.gray.opacity(0.5),
-                                    in: RoundedRectangle(cornerRadius: 12))
-                        .foregroundStyle(.white)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                        .foregroundStyle(.white.opacity(0.85))
+                } else {
+                    Button {
+                        state.confirmSelectedRegion()
+                    } label: {
+                        Text("分析选中题")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 13)
+                            .background(hasSelection ? Color.accentColor : Color.gray.opacity(0.5),
+                                        in: RoundedRectangle(cornerRadius: 12))
+                            .foregroundStyle(.white)
+                    }
+                    .disabled(!hasSelection || state.segmentationBusy)
+                    .accessibilityIdentifier("segmentation-confirm")
                 }
-                .disabled(!hasSelection || state.segmentationBusy)
-                .accessibilityIdentifier("segmentation-confirm")
             }
             .padding(.horizontal, 16)
             .padding(.top, 10)
@@ -1234,6 +1262,64 @@ struct QuestionSegmentationSheet: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black.ignoresSafeArea())
+        .sheet(isPresented: Binding(
+            get: { state.selectedGradeIndex != nil },
+            set: { if !$0 { state.selectedGradeIndex = nil } }
+        )) {
+            if let idx = state.selectedGradeIndex, let q = state.gradeQuestionsByIndex[idx] {
+                GradeDetailSheet(question: q,
+                                 onExplain: { state.explainGradedRegion(idx) },
+                                 onClose: { state.selectedGradeIndex = nil })
+                    .presentationDetents([.medium, .large])
+            }
+        }
+    }
+}
+
+/// 单题批改详情卡：判分 + 学生作答 + 订正/思路 + 「讲解这道题」。
+struct GradeDetailSheet: View {
+    let question: GradedQuestion
+    var onExplain: () -> Void
+    var onClose: () -> Void
+
+    var body: some View {
+        let mark = question.mark
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 10) {
+                    Image(systemName: mark.symbol).font(.title2).foregroundStyle(mark.color)
+                    Text("第\(question.index)题 · \(mark.label)").font(.headline)
+                    Spacer()
+                    Button { onClose() } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
+                }
+                if !question.questionText.isEmpty { field("题目", question.questionText) }
+                if !question.studentAnswer.isEmpty { field("学生作答", question.studentAnswer) }
+                if question.gradable && !question.correctAnswer.isEmpty { field("参考答案", question.correctAnswer) }
+                if !question.correction.isEmpty { field(question.gradable ? "订正" : "思路", question.correction) }
+                if question.gradable && !question.errorReason.isEmpty { field("错因", question.errorReason) }
+                if !question.knowledge.isEmpty { field("知识点", question.knowledge) }
+                if !question.gradable {
+                    Text("这类题需要看图/几何推理，AI 不硬判对错，点下面让它给你讲。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Button { onExplain() } label: {
+                    Label("讲解这道题", systemImage: "sparkles")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity).padding(.vertical, 12)
+                        .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 12))
+                        .foregroundStyle(.white)
+                }
+                .padding(.top, 4)
+            }
+            .padding(18)
+        }
+    }
+
+    @ViewBuilder private func field(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            Text(value).font(.subheadline).textSelection(.enabled)
+        }
     }
 }
 
@@ -6903,8 +6989,13 @@ final class AppState: ObservableObject {
     @Published var selectedRegionID: UUID?                  // 当前选中的浮层
     @Published var segmentationDidCorrect = false           // 本次是否做了梯形校正
     @Published var segmentationUseCorrected = true          // 「用矫正图 ⇄ 用原图」切换
-    @Published var segmentationIsGrading = false            // true=作业批改单题, false=拍照答题
+    @Published var segmentationIsGrading = false            // true=作业批改, false=拍照答题
     @Published var segmentationNotice = ""                  // 顶部提示（未框到题等兜底文案）
+    // P2 整页批改：端上准 bbox(questionRegions) + 后端 grade-page 逐题判分，按 index 对齐叠 ✓/✗/?。
+    @Published var gradeQuestionsByIndex: [Int: GradedQuestion] = [:]  // region.index → 判分
+    @Published var gradingInFlight = false                  // 批改请求在途（题上转圈）
+    @Published var gradingNotice = ""                       // 批改兜底文案（未识别/太糊）
+    @Published var selectedGradeIndex: Int?                 // 点开的题（详情卡）
     var segmentationRawImage: UIImage?                      // 原图（orientation 归一），非 @Published
     var segmentationCorrectedImage: UIImage?               // 校正图，非 @Published
     fileprivate var pendingRegionQAFrame: QAFrameCandidate?  // 选中题裁剪帧，喂给下一次提交（类型 private，故 fileprivate）
@@ -9254,9 +9345,81 @@ final class AppState: ObservableObject {
                 segmentationNotice = "没自动框出整题，可直接按整张图问答"
             }
         } else {
-            segmentationNotice = segmentationIsGrading ? "点一道题，我来批改" : "点一道题，我来讲"
+            segmentationNotice = segmentationIsGrading ? "正在逐题批改…" : "点一道题，我来讲"
         }
         log("题目分割完成：\(regions.count) 道题，校正=\(rect.didCorrect)")
+        // P2 作业批改：分割出题后，对整页发起后端逐题判分，按 index 把 ✓/✗/? 叠到端上准 bbox。
+        if segmentationIsGrading && !regions.isEmpty {
+            Task { await gradePageForSegmentation() }
+        }
+    }
+
+    /// 整页批改：把（校正后）展示图发后端 grade-page，按 region.index 对齐逐题判分。
+    func gradePageForSegmentation() async {
+        guard let image = segmentationDisplayImage else { return }
+        gradingInFlight = true
+        gradeQuestionsByIndex = [:]
+        gradingNotice = ""
+        defer { gradingInFlight = false }
+        guard await ensureQASession(), let sessionId else {
+            gradingNotice = "未能创建批改会话，可整图问答"
+            return
+        }
+        do {
+            let files = [MultipartFile(field: "image", name: "grade.jpg", mime: "image/jpeg", data: try jpegData(image))]
+            let data = try await postForm(
+                path: "/api/sessions/\(sessionId)/grade-page",
+                fields: ["source": UIDevice.current.identifierForVendor?.uuidString ?? "ios"],
+                files: files
+            )
+            let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let isMaterial = (json?["is_study_material"] as? Bool) ?? false
+            let lowQuality = (json?["low_quality"] as? Bool) ?? false
+            let rawQuestions = (json?["questions"] as? [[String: Any]]) ?? []
+            var map: [Int: GradedQuestion] = [:]
+            for q in rawQuestions {
+                let g = GradedQuestion.from(q)
+                if g.index > 0 { map[g.index] = g }
+            }
+            // 端上分出的题但后端没判到的，补一个「待讲解」占位，避免题上一直转圈。
+            for region in questionRegions where map[region.index] == nil {
+                map[region.index] = GradedQuestion(
+                    index: region.index, questionText: region.ocrText ?? "", studentAnswer: "",
+                    verdict: "未识别", gradable: false, correctAnswer: "", correction: "",
+                    errorReason: "", knowledge: ""
+                )
+            }
+            gradeQuestionsByIndex = map
+            if !isMaterial || rawQuestions.isEmpty {
+                gradingNotice = lowQuality ? "图像不够清晰，建议重拍；也可整图问答" : "未识别到可批改的题目，可整图问答"
+            } else {
+                let correct = map.values.filter { $0.mark == .correct }.count
+                let wrong = map.values.filter { $0.mark == .wrong || $0.mark == .partial }.count
+                let pending = map.values.filter { $0.mark == .uncertain }.count
+                segmentationNotice = "批改完成：对 \(correct)・错 \(wrong)・待讲解 \(pending)（点题看详情）"
+                log("整页批改完成：对\(correct) 错\(wrong) 待讲解\(pending)")
+            }
+        } catch {
+            gradingNotice = "批改失败，可整图问答或重拍"
+            log("整页批改失败：\(error.localizedDescription)", level: "error")
+        }
+    }
+
+    /// 在批改详情里「讲解这道题」：裁剪该题 → 走拍照答题链路讲解（不再判分）。
+    func explainGradedRegion(_ index: Int) {
+        guard let region = questionRegions.first(where: { $0.index == index }),
+              let base = segmentationDisplayImage else { return }
+        selectedGradeIndex = nil
+        let padded = paddedSegmentationRect(region.normalizedRect)
+        let cropped = QuestionSegmenter.crop(base, to: padded)
+        let focus = QAFocus(
+            x: Double(region.normalizedRect.midX), y: Double(region.normalizedRect.midY),
+            label: "explain_question_\(region.index)", trigger: "region_select",
+            stableFrames: 0, region: region.normalizedRect, questionIndex: region.index,
+            questionText: region.ocrText, crop: true
+        )
+        segmentationIsGrading = false   // 讲解走答题链路
+        dispatchSegmentationQuestion(image: cropped, focus: focus, questionLabel: "第\(region.index)题")
     }
 
     /// 「用原图 ⇄ 用矫正图」切换：重画并按新图重算分割（保证浮层坐标与展示图一致）。
@@ -9366,6 +9529,10 @@ final class AppState: ObservableObject {
         segmentationCorrectedImage = nil
         segmentationDidCorrect = false
         segmentationNotice = ""
+        gradeQuestionsByIndex = [:]
+        gradingInFlight = false
+        gradingNotice = ""
+        selectedGradeIndex = nil
         if !keepPendingFrame {
             pendingRegionQAFrame = nil
             if cameraTaskKind == .qaFrame { cameraTaskKind = .none }
