@@ -9060,9 +9060,19 @@ final class AppState: ObservableObject {
         questionRegions = regions
         selectedRegionID = regions.count == 1 ? regions.first?.id : nil
         segmentationBusy = false
-        segmentationNotice = regions.isEmpty
-            ? "没自动框出题目，可直接按整张图问答"
-            : (segmentationIsGrading ? "点一道题，我来批改" : "点一道题，我来讲")
+        if regions.isEmpty {
+            // P0：分不出题多半是拍糊/太暗——给出可执行的重拍引导，而不是笼统“没框出题目”。
+            let signals = BurstFrameAnalyzer.analyze(display).signals
+            if signals.blurScore < 0.35 {
+                segmentationNotice = "图像偏糊，建议把作业放平、点击对焦后重拍；也可直接按整张图问答"
+            } else if signals.lightCoverage < 0.12 {
+                segmentationNotice = "光线偏暗，建议开灯/补光后重拍；也可直接按整张图问答"
+            } else {
+                segmentationNotice = "没自动框出题目，可直接按整张图问答"
+            }
+        } else {
+            segmentationNotice = segmentationIsGrading ? "点一道题，我来批改" : "点一道题，我来讲"
+        }
         log("题目分割完成：\(regions.count) 道题，校正=\(rect.didCorrect)")
     }
 
@@ -12910,6 +12920,7 @@ final class CameraViewController: UIViewController, AVCapturePhotoCaptureDelegat
     private let videoOutput = AVCaptureVideoDataOutput()
     private let videoOutputQueue = DispatchQueue(label: "com.xue.camera-video-output", qos: .userInitiated)
     private let ciContext = CIContext()
+    private var captureDevice: AVCaptureDevice?      // P0：留引用以配置对焦/曝光/点按对焦
     private var previewLayer: AVCaptureVideoPreviewLayer?
     private var pendingKinds: [Int64: CaptureKind] = [:]
     private var latestVideoImage: UIImage?
@@ -12960,18 +12971,77 @@ final class CameraViewController: UIViewController, AVCapturePhotoCaptureDelegat
             delegate?.didCapture(image: latestVideoImage, kind: kind)
             return true
         }
-        if kind == .qa,
-           let latestVideoImage,
-           let latestVideoImageAt,
-           Date().timeIntervalSince(latestVideoImageAt) < 2 {
-            delegate?.didCapture(image: latestVideoImage, kind: kind)
-            return true
-        }
-
-        let settings = AVCapturePhotoSettings()
+        // P0：拍照答题/分题/批改（.qa）与单拍（.single）都走全分辨率 photoOutput 真照片，
+        // 不再用低清预览帧——那正是题目分割/梯形校正失败的根因。仅 .burst 智能观察继续用预览帧（求速度）。
+        let settings = photoSettings()
         pendingKinds[settings.uniqueID] = kind
         photoOutput.capturePhoto(with: settings, delegate: self)
         return true
+    }
+
+    /// P0：高质量照片设置（优先画质、开启高分辨率/最大尺寸）。
+    private func photoSettings() -> AVCapturePhotoSettings {
+        let settings: AVCapturePhotoSettings
+        if photoOutput.availablePhotoCodecTypes.contains(.jpeg) {
+            settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])
+        } else {
+            settings = AVCapturePhotoSettings()
+        }
+        settings.photoQualityPrioritization = .quality
+        if #available(iOS 16.0, *) {
+            settings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
+        } else {
+            settings.isHighResolutionPhotoEnabled = photoOutput.isHighResolutionCaptureEnabled
+        }
+        return settings
+    }
+
+    /// P0：点按对焦/测光——把对焦点设到用户点的位置。
+    func focus(atDevicePoint devicePoint: CGPoint) {
+        guard let device = captureDevice else { return }
+        do {
+            try device.lockForConfiguration()
+            if device.isFocusPointOfInterestSupported {
+                device.focusPointOfInterest = devicePoint
+                device.focusMode = device.isFocusModeSupported(.autoFocus) ? .autoFocus : device.focusMode
+            }
+            if device.isExposurePointOfInterestSupported {
+                device.exposurePointOfInterest = devicePoint
+                device.exposureMode = device.isExposureModeSupported(.continuousAutoExposure) ? .continuousAutoExposure : device.exposureMode
+            }
+            device.unlockForConfiguration()
+        } catch {
+            // 对焦失败不致命，忽略
+        }
+    }
+
+    /// P0：开机即配置连续自动对焦/曝光，文档近距离更稳。
+    private func configureDeviceFocus(_ device: AVCaptureDevice) {
+        do {
+            try device.lockForConfiguration()
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            }
+            if device.isSmoothAutoFocusSupported {
+                device.isSmoothAutoFocusEnabled = true
+            }
+            if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+            }
+            if device.isAutoFocusRangeRestrictionSupported {
+                device.autoFocusRangeRestriction = .none
+            }
+            device.unlockForConfiguration()
+        } catch {
+            // 配置失败不致命
+        }
+    }
+
+    @objc private func handleFocusTap(_ recognizer: UITapGestureRecognizer) {
+        guard let previewLayer else { return }
+        let point = recognizer.location(in: view)
+        let devicePoint = previewLayer.captureDevicePointConverted(fromLayerPoint: point)
+        focus(atDevicePoint: devicePoint)
     }
 
     private func configure() {
@@ -12991,7 +13061,10 @@ final class CameraViewController: UIViewController, AVCapturePhotoCaptureDelegat
 
     private func setupSession() {
         session.beginConfiguration()
-        if session.canSetSessionPreset(.high) {
+        // P0：全分辨率照片预设（拍清楚的地基），而非 .high(~720p)。
+        if session.canSetSessionPreset(.photo) {
+            session.sessionPreset = .photo
+        } else if session.canSetSessionPreset(.high) {
             session.sessionPreset = .high
         }
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
@@ -13002,8 +13075,16 @@ final class CameraViewController: UIViewController, AVCapturePhotoCaptureDelegat
             delegate?.cameraFailed("无法初始化后置摄像头")
             return
         }
+        captureDevice = device
         session.addInput(input)
         session.addOutput(photoOutput)
+        if #available(iOS 16.0, *) {
+            photoOutput.maxPhotoDimensions = device.activeFormat.supportedMaxPhotoDimensions.last ?? photoOutput.maxPhotoDimensions
+        } else {
+            photoOutput.isHighResolutionCaptureEnabled = true
+        }
+        photoOutput.maxPhotoQualityPrioritization = .quality
+        configureDeviceFocus(device)
 
         videoOutput.alwaysDiscardsLateVideoFrames = true
         videoOutput.videoSettings = [
@@ -13020,6 +13101,9 @@ final class CameraViewController: UIViewController, AVCapturePhotoCaptureDelegat
         view.layer.insertSublayer(layer, at: 0)
         previewLayer = layer
         updatePreviewGeometry()
+        // P0：点按对焦/测光
+        let focusTap = UITapGestureRecognizer(target: self, action: #selector(handleFocusTap(_:)))
+        view.addGestureRecognizer(focusTap)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.session.startRunning()
