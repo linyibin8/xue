@@ -10719,14 +10719,17 @@ async def segment_session_questions(
     return result
 
 
-_GRADING_VERDICTS = {"对", "错", "部分对", "未作答", "未识别"}
+_GRADING_VERDICTS = {"对", "错", "部分对", "不确定", "未作答", "未识别"}
+# 这三档是“声称判定了对错”的结论，必须有正确答案做依据，否则降级为“不确定”。
+_GRADING_DECISIVE_VERDICTS = {"对", "错", "部分对"}
 
 
 def _build_grading_response(raw: str) -> dict:
     """把整页批改视觉模型的原始文本解析成稳定的逐题批改契约。复用题目分割的鲁棒 JSON 抽取
     （_extract_segmentation_object）与 bbox 清洗（_segment_question_bbox）。每题取
-    index/bbox/question_text/student_answer/verdict(白名单校验，非法→"未识别")/correct_answer/
+    index/bbox/question_text/student_answer/verdict(白名单校验，非法→"不确定")/correct_answer/
     correction/error_reason/knowledge；question_text 与 student_answer 都为空的题过滤掉。
+    一致性兜底：verdict∈{对,错,部分对} 但 correct_answer 为空（缺判分依据）→降级为"不确定"。
     bbox 仅供粗排序（bbox_approx=True），前端用端上 Vision 的精确 bbox 定位。
     整体解析失败时退回 {is_study_material: False, questions: [], low_quality: True}。"""
     data = _extract_segmentation_object(raw)
@@ -10753,8 +10756,13 @@ def _build_grading_response(raw: str) -> dict:
             if not question_text.strip() and not student_answer.strip():
                 continue
             verdict = str(entry.get("verdict") or "").strip()
+            # 非法判定不要默认成判分档“未识别”，统一退到“不确定”，避免无依据地给出对错。
             if verdict not in _GRADING_VERDICTS:
-                verdict = "未识别"
+                verdict = "不确定"
+            correct_answer = truncate_text(entry.get("correct_answer") or "", 600)
+            # 一致性兜底：声称判了对/错/部分对，却没给出正确答案，说明判定缺乏依据，降级为“不确定”。
+            if verdict in _GRADING_DECISIVE_VERDICTS and not correct_answer.strip():
+                verdict = "不确定"
             questions.append(
                 {
                     "index": index,
@@ -10762,7 +10770,7 @@ def _build_grading_response(raw: str) -> dict:
                     "question_text": question_text,
                     "student_answer": student_answer,
                     "verdict": verdict,
-                    "correct_answer": truncate_text(entry.get("correct_answer") or "", 600),
+                    "correct_answer": correct_answer,
                     "correction": truncate_text(entry.get("correction") or "", 600),
                     "error_reason": truncate_text(entry.get("error_reason") or "", 600),
                     "knowledge": truncate_text(entry.get("knowledge") or "", 300),
