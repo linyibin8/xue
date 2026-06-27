@@ -50,6 +50,16 @@
 - [x] 三期 · 滚动记忆更新
 - [x] 三期 · 可纠正数字人档案
 
+## 增量 · 拍照分题浮层 + 梯形校正 + 逐题批改（2026-06-27，commit 64b2dea）
+三期外新需求（用户）：拍照答题/作业批改时把当前画面的每道题分割，盖多个透明浮层，点选一题只分析那道；并对拍歪的原图做梯形校正。多角色子代理设计交叉验证后落地。
+- [x] 端上梯形校正（VNDetectDocumentSegmentation/Rectangles 取四角 + CIPerspectiveCorrection，三段式兜底→原图）
+- [x] 端上题目分割（VNRecognizeText 文字行聚类，按题号/垂直间隙成块，大题为一块）
+- [x] 透明浮层选题层（两端共享 QuestionRegionOverlay，编号/单选高亮/≥44pt 命中；用原图⇄用矫正图切换；未识别兜底；整图问答回退）
+- [x] 选中题→裁剪子图→复用 submitQuestion/focus（扩展 region/crop/question_index/question_text，后端 build_qa_prompt 选中题聚焦规则，向后兼容）
+- [x] 作业批改逐题（后端 批改JSON 全题判定块 + parse_batch_grading 落库；展示用 strip_structured_json_for_display 防机读块回放）
+- [x] 两端入口 + 设置开关（多题自动分割 / 自动梯形校正）；4/4 编译矩阵过；后端部署+冒烟过
+- 备注：相机/校正真机流只能 TestFlight 真机验收（模拟器无相机，沿用既有 QA 边界）。批改JSON 为前瞻后端能力，暂无 iOS 消费方。本次连带把 commit 0012d86 的「错题JSON 抽取重构」从未部署 WIP 一并上线 prod（用户批准）。
+
 ## 约束
 - 两端共享核心（AppState/AuthSession/模型/API），UI 各接一次（见 docs/MULTI_CLIENT_GUIDE.md）。
 - 后端 surgical 部署，data/ 勿覆盖。
