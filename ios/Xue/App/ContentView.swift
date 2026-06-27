@@ -6912,16 +6912,19 @@ final class AppState: ObservableObject {
     @Published var captureAimingVisible = false             // 取景拍照层是否在展示
     @Published var cameraAimBrightness = 0.5                // 实时平均亮度 0..1
     @Published var cameraAimSharpness = 0.0                 // 实时锐度（清晰度代理）0..1
+    @Published var cameraAimMaterial = 0.0                  // 是否有题目印刷体（书本/试卷/屏幕）0..1
     @Published var torchOn = false                          // 补光手电状态
     @Published var autoShutterArmed = true                  // 自动快门开关（达标自动拍）
     private var aimReadyStreak = 0                          // 连续达标帧计数（自动快门去抖）
     private var aimCapturing = false                        // 抓拍在途，防重复
-    /// 取景是否达标（够亮 + 够清晰）。
-    var cameraAimReady: Bool { cameraAimBrightness >= 0.18 && cameraAimSharpness >= 0.34 }
+    /// 取景是否达标（有题目印刷体 + 够亮 + 够清晰）。先判断「有没有题目」是关键——
+    /// 没对准书本/试卷/屏幕上的题目就不自动拍、也不去识别。
+    var cameraAimReady: Bool { cameraAimMaterial >= 0.5 && cameraAimBrightness >= 0.18 && cameraAimSharpness >= 0.34 }
     var cameraAimHint: String {
+        if cameraAimMaterial < 0.5 { return "请把镜头对准书本/试卷/屏幕上的题目" }
         if cameraAimBrightness < 0.18 { return "光线偏暗，点亮手电或挪到亮处" }
-        if cameraAimSharpness < 0.34 { return "对焦中，把作业放平、点击对焦" }
-        return "清晰，可以拍了"
+        if cameraAimSharpness < 0.34 { return "对焦中，把题目放平、点击对焦" }
+        return "已识别到题目，清晰，可以拍了"
     }
     // 设置开关：自动梯形校正 / 多题自动分割（默认开；关=回到老整图链路）
     @Published var autoKeystoneCorrection: Bool = {
@@ -9152,6 +9155,7 @@ final class AppState: ObservableObject {
         aimCapturing = false
         cameraAimSharpness = 0
         cameraAimBrightness = 0.5
+        cameraAimMaterial = 0
         cameraTaskKind = .qaFrame
         cameraPreviewVisible = true
         cameraSheetVisible = false
@@ -9162,10 +9166,11 @@ final class AppState: ObservableObject {
     }
 
     /// 取景阶段实时质量回调（控制器每帧调用）。达标连续若干帧 → 自动快门。
-    func updateCameraAim(brightness: Double, sharpness: Double) {
+    func updateCameraAim(brightness: Double, sharpness: Double, material: Double) {
         guard captureAimingVisible else { return }
         cameraAimBrightness = brightness
         cameraAimSharpness = sharpness
+        cameraAimMaterial = material
         guard autoShutterArmed, !aimCapturing else { return }
         if cameraAimReady {
             aimReadyStreak += 1
@@ -9239,12 +9244,14 @@ final class AppState: ObservableObject {
         if regions.isEmpty {
             // P0：分不出题多半是拍糊/太暗——给出可执行的重拍引导，而不是笼统“没框出题目”。
             let signals = BurstFrameAnalyzer.analyze(display).signals
-            if signals.blurScore < 0.35 {
-                segmentationNotice = "图像偏糊，建议把作业放平、点击对焦后重拍；也可直接按整张图问答"
+            if signals.textCount < 1 {
+                segmentationNotice = "没识别到题目，请对准书本/试卷/屏幕上的题目重拍；也可直接按整张图问答"
+            } else if signals.blurScore < 0.35 {
+                segmentationNotice = "图像偏糊，建议把题目放平、点击对焦后重拍；也可直接按整张图问答"
             } else if signals.lightCoverage < 0.12 {
                 segmentationNotice = "光线偏暗，建议开灯/补光后重拍；也可直接按整张图问答"
             } else {
-                segmentationNotice = "没自动框出题目，可直接按整张图问答"
+                segmentationNotice = "没自动框出整题，可直接按整张图问答"
             }
         } else {
             segmentationNotice = segmentationIsGrading ? "点一道题，我来批改" : "点一道题，我来讲"
@@ -13077,10 +13084,10 @@ struct CameraView: UIViewControllerRepresentable {
             }
         }
 
-        func didUpdateAimQuality(brightness: Double, sharpness: Double) {
+        func didUpdateAimQuality(brightness: Double, sharpness: Double, material: Double) {
             Task { @MainActor in
                 guard state.isCurrentCameraHost(id: id) else { return }
-                state.updateCameraAim(brightness: brightness, sharpness: sharpness)
+                state.updateCameraAim(brightness: brightness, sharpness: sharpness, material: material)
             }
         }
     }
@@ -13098,7 +13105,7 @@ protocol CameraViewControllerDelegate: AnyObject {
     func cameraFailed(_ message: String)
     func didCapture(image: UIImage, kind: CaptureKind)
     func didRecognizeGesture(_ gesture: CameraGesture, stableFrames: Int, point: CGPoint?)
-    func didUpdateAimQuality(brightness: Double, sharpness: Double)  // P0：取景实时质量（自动快门/补光提示）
+    func didUpdateAimQuality(brightness: Double, sharpness: Double, material: Double)  // P0：取景实时质量（亮度/清晰度/是否有题目印刷体）
 }
 
 final class CameraViewController: UIViewController, AVCapturePhotoCaptureDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
@@ -13118,6 +13125,8 @@ final class CameraViewController: UIViewController, AVCapturePhotoCaptureDelegat
     private var stableGesture: CameraGesture?
     private var stableGestureCount = 0
     private var lastGestureFireAt = Date.distantPast
+    private var lastMaterialCheckAt = Date.distantPast   // P0：印刷体检测节流
+    private var cachedMaterialScore = 0.0
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -13361,10 +13370,40 @@ final class CameraViewController: UIViewController, AVCapturePhotoCaptureDelegat
             self?.latestVideoImageAt = now
         }
         let aim = aimQuality(cgImage: cgImage)
+        // P0：印刷体题目检测（书本/试卷/屏幕）——较重，单独节流到 ~0.7s，缓存复用。
+        if now.timeIntervalSince(lastMaterialCheckAt) >= 0.7 {
+            lastMaterialCheckAt = now
+            cachedMaterialScore = materialScore(cgImage: cgImage)
+        }
+        let material = cachedMaterialScore
         DispatchQueue.main.async { [weak self] in
-            self?.delegate?.didUpdateAimQuality(brightness: aim.brightness, sharpness: aim.sharpness)
+            self?.delegate?.didUpdateAimQuality(brightness: aim.brightness, sharpness: aim.sharpness, material: material)
         }
         detectGesture(cgImage: cgImage)
+    }
+
+    /// P0：画面里是否有「题目印刷体」（书本/试卷/平板屏幕）。用快速文字识别数文本行 + 矩形，
+    /// 给出 0..1 置信度——没对准题目就不自动快门、也不去分割。
+    private func materialScore(cgImage: CGImage) -> Double {
+        let textRequest = VNRecognizeTextRequest()
+        textRequest.recognitionLevel = .fast
+        textRequest.usesLanguageCorrection = false
+        textRequest.recognitionLanguages = ["zh-Hans", "en-US"]
+        textRequest.minimumTextHeight = 0.02
+        let rectRequest = VNDetectRectanglesRequest()
+        rectRequest.maximumObservations = 4
+        rectRequest.minimumConfidence = 0.4
+        rectRequest.minimumSize = 0.2
+        let handler = VNImageRequestHandler(cgImage: cgImage, orientation: .up, options: [:])
+        guard (try? handler.perform([textRequest, rectRequest])) != nil else { return 0 }
+        let lines = (textRequest.results ?? []).filter { obs in
+            (obs.topCandidates(1).first?.string.trimmingCharacters(in: .whitespacesAndNewlines).count ?? 0) >= 2
+        }.count
+        let rects = (rectRequest.results ?? []).filter { $0.confidence >= 0.4 }.count
+        // 题目通常有多行文字；3+ 行视为强证据；矩形（纸张/屏幕边框）加成。
+        let textScore = min(1.0, Double(lines) / 4.0)
+        let rectBonus = rects > 0 ? 0.15 : 0.0
+        return min(1.0, textScore + rectBonus)
     }
 
     /// P0：取景实时质量——平均亮度 + 边缘锐度（清晰度代理）。轻量，跑在视频队列。
