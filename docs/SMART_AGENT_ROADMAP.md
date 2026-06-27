@@ -90,8 +90,14 @@
   - **修法=服务端可靠性闸门**：question_text 含读图/几何线索(如图/阴影/三角形+面积…)→强制 verdict「不确定」+清 correct_answer+`gradable=false`；纯算术保持判分。响应加 `reliable_subset_only/gradable`。实测 real5 全几何题已正确变「不确定」。**产品定调(对标小猿口算)：只判可靠子集(口算/算术)，几何题给「讲解」不硬判对错。**
 - [x] **P2 iOS 作业批改逐题 ✓/✗ UI**(commit 163c234)：作业批改→取景拍清→端上 Vision segment(准 bbox)→调 grade-page 整页判分→按 index 对齐叠 ✓(对)/✗(错)/◐(部分)/?(不确定·几何待讲解)；`gradable=false` 只显「?·待讲解」绝不红叉；点题→GradeDetailSheet(判分+学生作答+订正/思路+错因+知识点+「讲解这道题」)。整图问答兜底保留。两端编译过。新文件 QuestionGradingOverlay.swift。
 - [x] **P4 NL 自动分流**(commit 014dcc6)：后端 intent_router 加 grade_homework/photo_answer→intent_kind:module(已部署+实测:批改→grade、分这几道题→answer、单题→qa、config 不变)。iOS 文本路径 maybeInterceptAsIntent 命中 module→记原话→自动 beginQuestionSegmentation；取景层「其实只想问问题→」一键纠偏(proceedTypedQuestion 逃生口)。两端编译过。**语音路径暂不拦截(待续，避免给语音流加往返延迟)。**
-- [ ] B 印刷题干重排版(仅印刷题干、强制对照原图；学生作答/几何绝不重生成)——用户想试的实验。
-- 待发版：P4(+B) 合并出一个里程碑包。WTT 文案注意：**ASC 拒绝 ✓/✗ 等特殊 unicode(INVALID_TEXT)，用纯文字**。
+- [x] **B 印刷题干数字化重排版**(commit 38b0887)：后端 `POST /relayout-question`(复用 VLM+泛化鲁棒解析 target_keys)——只整理印刷题干、**无手写泄漏(真测验证)**、figure_note 注「见原图」不重画、强制 `must_compare_original`。iOS GradeDetailSheet「看数字版题干(对照原图)」段+对照原图 toggle。两端编译过。
+- 待发版：P4+B 合并里程碑包。WTT 文案注意：**ASC 拒绝 ✓/✗ 等特殊 unicode(INVALID_TEXT)，用纯文字**。
+
+### ✅ 增量2 完成（2026-06-27）—— 6 条验收全过
+①没对准题目不自动拍+提示(P0+) ②全分辨率清晰图+端上分题(P0) ③选一题只分析那道+整页批改逐题✓/✗+点错看讲解(P2) ④实时对话自然语言自动进答题/批改+一键纠偏(P4) ⑤数字版仅印刷题干+强制对照原图、学生作答/几何不重生成(B) ⑥两端一致、向后兼容不破坏现有问答/观察/记忆。
+- **TestFlight build**：202606271124(分题浮层雏形)→202606271323(全分辨率捕获+取景+study-material gating)→202606280007(逐题✓/✗批改UI)→202606280113(P4自动分流+B数字版，本期合集)。均内部组4 testers。
+- **关键架构发现(指导后续)**：VLM 判「是否题目/题干文本/是否作答/口算判分」可靠，但**bbox 是按题序编的等距网格不精准、几何题编造标准答案**→ 像素级叠标用端上 Vision 准 bbox，几何判分用服务端可靠性闸门强制「不确定」给讲解。
+- **未做(GPU 受限的可选增强，非验收项)**：P3 专用 OCR(PP-OCRv5/PP-FormulaNet)、P1-proper(DocRes 去畸变/PP-DocLayout 版面)——dell 2×4090 被 27B 占满显存，待腾出或上 CPU；上了可让分题/批改 bbox 精准、手写公式更准。P4 语音路径自动分流(避免给语音流加往返延迟，待续)。
 
 ## 约束
 - 两端共享核心（AppState/AuthSession/模型/API），UI 各接一次（见 docs/MULTI_CLIENT_GUIDE.md）。
