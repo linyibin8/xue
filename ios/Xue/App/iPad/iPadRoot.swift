@@ -66,6 +66,12 @@ struct iPadRootView: View {
         .sheet(isPresented: $showBackgroundTasks) {
             iPadBackgroundTasksSheet(state: state, auth: auth) { showBackgroundTasks = false }
         }
+        .fullScreenCover(isPresented: Binding(
+            get: { state.segmentationVisible },
+            set: { if !$0 { state.dismissSegmentation() } }
+        )) {
+            QuestionSegmentationSheet(state: state)
+        }
     }
 
     private var sidebar: some View {

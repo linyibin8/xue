@@ -63,10 +63,16 @@ struct iPadSettingsView: View {
             Toggle(isOn: Binding(get: { state.textOnlyQuestion }, set: { state.textOnlyQuestionDidChange($0) })) {
                 Label("纯文字提问（不开相机）", systemImage: "keyboard")
             }
+            Toggle(isOn: Binding(get: { state.questionSegmentationEnabled }, set: { state.questionSegmentationEnabledDidChange($0) })) {
+                Label("多题自动分割", systemImage: "rectangle.split.3x1")
+            }
+            Toggle(isOn: Binding(get: { state.autoKeystoneCorrection }, set: { state.autoKeystoneCorrectionDidChange($0) })) {
+                Label("自动梯形校正", systemImage: "perspective")
+            }
         } header: {
             Text("提问")
         } footer: {
-            Text("开启后打字/快捷追问不会打开相机或抓取画面，按纯文字理解。拍题、语音、智能观察不受影响。")
+            Text("多题自动分割：拍照后把每道题盖一个浮层，点一道只问那道。自动梯形校正：把拍歪的纸张扶正。纯文字提问：打字/快捷追问不开相机。")
         }
     }
 

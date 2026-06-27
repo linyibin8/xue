@@ -62,6 +62,17 @@ struct iPadLearnView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup(placement: .navigationBarTrailing) {
+            // 分题问答 / 批改作业：拍照→盖透明浮层→点一道题→只分析那道（共享核心，对齐 iPhone）
+            Button {
+                state.beginQuestionSegmentation(grading: false)
+            } label: {
+                Label("分题问答", systemImage: "rectangle.split.3x1")
+            }
+            Button {
+                state.beginQuestionSegmentation(grading: true)
+            } label: {
+                Label("批改作业", systemImage: "checkmark.rectangle.stack")
+            }
             // 动态（活动日志），对齐 iPhone 的「动态」(#2)。偏好已移到 设置·一句话辅导偏好(#3 移除旧菜单)
             Button {
                 showActivity = true

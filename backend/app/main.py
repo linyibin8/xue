@@ -3917,7 +3917,61 @@ _MISTAKE_JSON_FIELD_ALIASES = {
     "evidence": ("证据", "判错证据", "evidence"),
     "correction": ("订正", "改正", "修正", "correction"),
     "knowledge": ("知识点", "考点", "knowledge", "knowledge_points"),
+    "region": ("区域", "region", "bbox"),
+    "verdict": ("判定", "判定结果", "error_verdict", "verdict"),
+    "question_index": ("题序", "题号序", "question_index"),
 }
+
+# 逐题批改（全题对错权威）用独立标记，和“错题JSON/错题候选JSON”区分开。
+_BATCH_GRADING_JSON_MARKER = re.compile(r"批改\s*JSON", re.IGNORECASE)
+
+# 展示用：分析正文末尾会追加机读结构化块（错题候选JSON/错题JSON/批改JSON：[...]）。这些块只供后端解析，
+# 不该回放给用户看（历史观察回放会直接显示 analyses[].content）。模板约定结构化块在人读正文之后追加，
+# 故从最早出现的标记处截断即可。仅用于 API 返回时清洗，DB 原文保留供最终报告蒸馏。
+_STRUCTURED_JSON_DISPLAY_MARKER = re.compile(r"(错题候选\s*JSON|错题\s*JSON|批改\s*JSON)", re.IGNORECASE)
+
+
+def strip_structured_json_for_display(content: object) -> str:
+    text = content if isinstance(content, str) else ("" if content is None else str(content))
+    if not text:
+        return text
+    match = _STRUCTURED_JSON_DISPLAY_MARKER.search(text)
+    if not match:
+        return text
+    return text[: match.start()].rstrip()
+
+
+def sanitize_analyses_for_display(analyses: list[dict]) -> list[dict]:
+    """把分析列表里每条 content 的结构化机读块去掉（只影响返回客户端的副本，不改 DB）。"""
+    cleaned: list[dict] = []
+    for row in analyses:
+        item = dict(row)
+        if "content" in item:
+            item["content"] = strip_structured_json_for_display(item.get("content"))
+        cleaned.append(item)
+    return cleaned
+
+
+def _region_bbox(raw: object) -> dict:
+    """把归一化区域框 {x,y,w,h}（取值[0,1]，原点左上、x 右 y 下、相对已校正竖直图）规整成
+    干净的 dict；无法识别（缺字段/非数字/非 dict）时返回 {}，调用方据此维持现状。"""
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return {}
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+    box: dict = {}
+    for key in ("x", "y", "w", "h"):
+        try:
+            box[key] = float(raw.get(key))
+        except (TypeError, ValueError):
+            return {}
+    return box
 
 
 def _iter_json_arrays(text: str):
@@ -4010,6 +4064,9 @@ def parse_structured_mistakes(
         evidence = clean_asset_field(_mistake_json_field(entry, "evidence"), ASSET_SOURCE_SUMMARY_LIMIT)
         correction = clean_asset_field(_mistake_json_field(entry, "correction"), ASSET_SOURCE_SUMMARY_LIMIT)
         entry_knowledge = _mistake_json_knowledge(_mistake_json_field(entry, "knowledge"))
+        region_box = _region_bbox(_mistake_json_field(entry, "region"))
+        region_ref = json_dumps(region_box) if region_box else ""
+        question_index = clean_asset_field(_mistake_json_field(entry, "question_index"))
         combined = " ".join((error_type, reason, evidence))
         is_incomplete = any(token in combined for token in ("未完成", "空白", "未作答", "不会"))
         has_student = not is_blank_mistake_value(student)
@@ -4045,6 +4102,10 @@ def parse_structured_mistakes(
                 "expected_answer": expected,
                 "error_reason": truncate_text(reason or evidence or title_source, MISTAKE_REASON_LIMIT),
                 "knowledge_points": (entry_knowledge or fallback_knowledge)[:8],
+                # 区域 bbox -> location_ref(JSON 字符串)、题序 -> question_ref；缺失时留空，
+                # 交给 enrich_asset_fields_from_text 回退到既有页码/题号启发式。
+                "location_ref": region_ref,
+                "question_ref": question_index,
                 "status": status,
                 "evidence": truncate_text(evidence or student or question, ASSET_SOURCE_SUMMARY_LIMIT),
                 "error_type": error_type or extract_error_type(combined),
@@ -4059,6 +4120,44 @@ def parse_structured_mistakes(
         if len(items) >= 40:
             break
     return items
+
+
+def parse_batch_grading(content: str) -> list[dict]:
+    """解析模型输出的“批改JSON：[...]”逐题判定数组（全题对错权威，覆盖检测到的所有题，
+    含做对/空白/未识别）。坐标系：归一化[0,1]、原点左上、x 右 y 下、相对已校正竖直图。
+    解析失败或没有该标记一律返回 []，绝不影响错题抽取链路。"""
+    if not _BATCH_GRADING_JSON_MARKER.search(content or ""):
+        return []
+    try:
+        entries = extract_mistake_json(content, _BATCH_GRADING_JSON_MARKER)
+    except Exception:
+        return []
+    results: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        verdict = str(_mistake_json_field(entry, "verdict") or "").strip()
+        question = clean_asset_field(_mistake_json_field(entry, "question"))
+        student = clean_asset_field(_mistake_json_field(entry, "student"))
+        question_index = clean_asset_field(_mistake_json_field(entry, "question_index"))
+        if not (question or student or question_index or verdict):
+            continue
+        results.append(
+            {
+                "question_index": question_index,
+                "region": _region_bbox(_mistake_json_field(entry, "region")),
+                "question": question,
+                "student_answer": student,
+                "verdict": verdict,
+                "expected_answer": clean_asset_field(_mistake_json_field(entry, "expected")),
+                "correction": clean_asset_field(_mistake_json_field(entry, "correction"), ASSET_SOURCE_SUMMARY_LIMIT),
+                "error_reason": clean_asset_field(_mistake_json_field(entry, "reason"), MISTAKE_REASON_LIMIT),
+                "knowledge_points": _mistake_json_knowledge(_mistake_json_field(entry, "knowledge")),
+            }
+        )
+        if len(results) >= 60:
+            break
+    return results
 
 
 def json_list(raw: str | None) -> list[str]:
@@ -6651,6 +6750,11 @@ Answer quality rules:
 - When using decomposition or carrying, do not add the original whole number again after adding its decomposed parts.
 - Only ask the student to move or retake the material when there is no prior context to answer from. During follow-up, prefer continuing the explanation from prior context.
 - If you mention a student's answer is wrong, state the correct answer and one short correction step.
+- 选中题聚焦规则（仅当 focus 含 region/crop/question_text/regions 时生效，老客户端不带这些字段时忽略本段）：
+  · 若 focus.crop 为真：当前帧已被裁剪为单独一道题，把整帧当作唯一目标题作答，不要提“画面里还有别的题”或让学生圈选。
+  · 若 focus.region 存在且 focus.crop 不为真：画面里可能有多道题，只回答 region 归一化框（x,y,w,h，取值[0,1]，原点左上、x 右 y 下、相对已梯形校正后的竖直上传图）框住的那一道，其它题忽略、不要顺带讲解。
+  · 若 focus.question_text 存在：以它作为选中题的题干锚点；当它与画面内容冲突时以画面为准，并简短指出冲突。
+  · focus.regions 只用于帮助你理解整页布局，不要据此逐题作答。
 - Keep each label compact. Prefer one idea per line. Avoid long Markdown paragraphs and avoid Markdown tables.
 - Especially in 学生答案、步骤、结论, use plain text math only; no Markdown math, no LaTeX, no dollar signs.
 
@@ -8082,6 +8186,25 @@ async def run_analysis(
             session_id, batch_id, analysis_id, content, filenames,
             detection_method="observation" if summarize else "photo_grading",
         )
+        # 逐题批改（全题对错权威）：模型已把“批改JSON：[...]”写进 analyses.content（已落库），
+        # 端上可直接从分析内容解析读取；这里再解析一次仅用于校验与可观测日志，最小面、不加列、
+        # 不触发迁移，且与上面的错题抽取链路互不影响（解析失败返回 []）。
+        try:
+            grading = parse_batch_grading(content)
+        except Exception:
+            grading = []
+        if grading:
+            emit_log(
+                f"逐题批改已解析：{len(grading)} 题（全题对错，含做对/空白；已随 analyses.content 落库供端上读取）",
+                session_id=session_id,
+            )
+            record_report_event(
+                session_id,
+                "batch_grading",
+                "逐题批改结果",
+                f"batch={batch_id or 'single'}；题数={len(grading)}",
+                analysis_id,
+            )
         inferred = infer_needs_from_analysis(content)
         if counts["mistake_item_count"]:
             inferred = merge_tags(inferred, ["mistake_book"])
@@ -9522,6 +9645,7 @@ def get_session_overview(
             )
         ]
         analyses = attach_visualization_metadata(analyses, "analysis", text_keys=("content",))
+        analyses = sanitize_analyses_for_display(analyses)
         final_analysis = conn.execute(
             f"""
             SELECT {analysis_public_columns()}
@@ -9622,6 +9746,7 @@ def session_payload(session_id: str, principal: dict | None = None) -> dict:
         ]
         analyses = [dict(row) for row in conn.execute("SELECT * FROM analyses WHERE session_id=? ORDER BY created_at", (session_id,))]
         analyses = attach_visualization_metadata(analyses, "analysis", text_keys=("content",))
+        analyses = sanitize_analyses_for_display(analyses)
     return {
         "session": dict(session),
         "images": images,

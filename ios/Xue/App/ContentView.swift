@@ -38,6 +38,8 @@ private let voicePlaybackRateDefaultsKey = "xue.voicePlaybackRate"
 private let learningModeDefaultsKey = "xue.learningMode"
 private let coachDepthDefaultsKey = "xue.coachDepth"
 private let textOnlyQuestionDefaultsKey = "xue.textOnlyQuestion"
+private let autoKeystoneCorrectionDefaultsKey = "xue.autoKeystoneCorrection"
+private let questionSegmentationEnabledDefaultsKey = "xue.questionSegmentationEnabled"
 private let coachPreferenceTextDefaultsKey = "xue.coachPreferenceText"
 private let longTermInstructionDefaultsKey = "xue.longTermInstruction"
 private let longTermMemoriesDefaultsKey = "xue.longTermMemories"
@@ -461,6 +463,12 @@ private struct LandscapeLearningWorkbench: View {
             AttachmentPreviewScreen(attachment: attachment) {
                 selectedAttachment = nil
             }
+        }
+        .fullScreenCover(isPresented: Binding(
+            get: { state.segmentationVisible },
+            set: { if !$0 { state.dismissSegmentation() } }
+        )) {
+            QuestionSegmentationSheet(state: state)
         }
         .onDisappear {
             voiceDockRevealTask?.cancel()
@@ -997,6 +1005,38 @@ private struct FloatingToolDock: View {
             }
 
             FloatingToolButton(
+                title: "分题问答",
+                systemImage: "rectangle.split.3x1",
+                accessibilityLabel: "分题问答",
+                identifier: "segment-qa-action"
+            ) {
+                dismissKeyboard()
+                withAnimation(.spring(response: 0.24, dampingFraction: 0.84)) {
+                    showActivity = false
+                    showContext = false
+                    showHistory = false
+                    toolsExpanded = false
+                }
+                state.beginQuestionSegmentation(grading: false)
+            }
+
+            FloatingToolButton(
+                title: "批改作业",
+                systemImage: "checkmark.rectangle.stack",
+                accessibilityLabel: "批改作业",
+                identifier: "segment-grade-action"
+            ) {
+                dismissKeyboard()
+                withAnimation(.spring(response: 0.24, dampingFraction: 0.84)) {
+                    showActivity = false
+                    showContext = false
+                    showHistory = false
+                    toolsExpanded = false
+                }
+                state.beginQuestionSegmentation(grading: true)
+            }
+
+            FloatingToolButton(
                 title: "上下文",
                 systemImage: showContext ? "tray.full.fill" : "tray.full",
                 accessibilityLabel: "上下文",
@@ -1080,6 +1120,114 @@ private struct FloatingToolButton: View {
         .opacity(disabled ? 0.42 : 1)
         .accessibilityLabel(accessibilityLabel)
         .accessibilityIdentifier(identifier)
+    }
+}
+
+// 题目分割选题层（两端复用）：冻结图 + 透明浮层；点一道题分析，或整图问答。含梯形校正切换。
+struct QuestionSegmentationSheet: View {
+    @ObservedObject var state: AppState
+
+    private var hasSelection: Bool { state.selectedRegionID != nil }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Button {
+                    state.dismissSegmentation()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.headline.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 34, height: 34)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                .accessibilityIdentifier("segmentation-close")
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(state.segmentationIsGrading ? "作业批改 · 选题" : "拍照答题 · 选题")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                    if !state.segmentationNotice.isEmpty {
+                        Text(state.segmentationNotice)
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.78))
+                    }
+                }
+                Spacer()
+                if state.segmentationDidCorrect {
+                    Button {
+                        state.toggleSegmentationCorrection()
+                    } label: {
+                        Label(state.segmentationUseCorrected ? "用原图" : "用矫正图",
+                              systemImage: "perspective")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 7)
+                            .background(.ultraThinMaterial, in: Capsule())
+                    }
+                    .accessibilityIdentifier("segmentation-correction-toggle")
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 10)
+
+            ZStack {
+                if state.segmentationBusy {
+                    ProgressView("正在校正并分割题目…")
+                        .tint(.white)
+                        .foregroundStyle(.white)
+                } else if let image = state.segmentationDisplayImage {
+                    QuestionRegionOverlay(
+                        image: image,
+                        regions: state.questionRegions,
+                        selectedID: Binding(
+                            get: { state.selectedRegionID },
+                            set: { state.selectedRegionID = $0 }
+                        ),
+                        onSelect: { state.selectQuestionRegion($0) }
+                    )
+                    .padding(.horizontal, 12)
+                } else {
+                    ProgressView().tint(.white)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            HStack(spacing: 12) {
+                Button {
+                    state.submitWholeImageFromSegmentation()
+                } label: {
+                    Text("整图问答")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 13)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                        .foregroundStyle(.white)
+                }
+                .accessibilityIdentifier("segmentation-whole-image")
+
+                Button {
+                    state.confirmSelectedRegion()
+                } label: {
+                    Text(state.segmentationIsGrading ? "批改选中题" : "分析选中题")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 13)
+                        .background(hasSelection ? Color.accentColor : Color.gray.opacity(0.5),
+                                    in: RoundedRectangle(cornerRadius: 12))
+                        .foregroundStyle(.white)
+                }
+                .disabled(!hasSelection || state.segmentationBusy)
+                .accessibilityIdentifier("segmentation-confirm")
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 10)
+            .padding(.bottom, 18)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black.ignoresSafeArea())
     }
 }
 
@@ -3835,6 +3983,16 @@ private struct ChatSettingsPanel: View {
                 }
                 .font(.caption.weight(.semibold))
 
+                Toggle(isOn: Binding(get: { state.questionSegmentationEnabled }, set: { state.questionSegmentationEnabledDidChange($0) })) {
+                    Label("多题自动分割", systemImage: "rectangle.split.3x1")
+                }
+                .font(.caption.weight(.semibold))
+
+                Toggle(isOn: Binding(get: { state.autoKeystoneCorrection }, set: { state.autoKeystoneCorrectionDidChange($0) })) {
+                    Label("自动梯形校正", systemImage: "perspective")
+                }
+                .font(.caption.weight(.semibold))
+
                 Toggle(isOn: $state.voicePlaybackEnabled) {
                     Label("朗读回答", systemImage: state.voicePlaybackEnabled ? "speaker.wave.2.fill" : "speaker.slash")
                 }
@@ -6218,6 +6376,11 @@ struct QAFocus {
     var label: String
     var trigger: String
     var stableFrames: Int
+    // 题目分割·选中题（可选；不设置=旧行为，后端不带这些键即旧逻辑）。
+    var region: CGRect? = nil       // 归一化 bbox（左上原点），相对已校正上传图
+    var questionIndex: Int? = nil   // 选中题在端上分割结果里的序号（1 基）
+    var questionText: String? = nil // 端上 OCR 题干（可空）
+    var crop: Bool = false          // 上传图是否已裁成该题
 }
 
 struct ReviewQueueResponse: Decodable {
@@ -6627,6 +6790,28 @@ final class AppState: ObservableObject {
     @Published var serverTasks: [ServerBackgroundTask] = []   // #8 后端在跑的后台生成任务（账号隔离，可取消）
     @Published var cameraTaskKind = CameraTaskKind.none
     @Published var backgroundCameraEnabled = true
+    // 题目分割 + 浮层选题（拍照答题/作业批改）。空状态=旧拍题问答链路完全不受影响。
+    @Published var segmentationVisible = false             // 是否在展示「冻结图 + 透明浮层」选题层
+    @Published var segmentationBusy = false                // 校正/分割进行中
+    @Published var segmentationDisplayImage: UIImage?       // 当前展示用图（原图或校正图）
+    @Published var questionRegions: [QuestionRegion] = []   // 端上分割出的题目区域
+    @Published var selectedRegionID: UUID?                  // 当前选中的浮层
+    @Published var segmentationDidCorrect = false           // 本次是否做了梯形校正
+    @Published var segmentationUseCorrected = true          // 「用矫正图 ⇄ 用原图」切换
+    @Published var segmentationIsGrading = false            // true=作业批改单题, false=拍照答题
+    @Published var segmentationNotice = ""                  // 顶部提示（未框到题等兜底文案）
+    var segmentationRawImage: UIImage?                      // 原图（orientation 归一），非 @Published
+    var segmentationCorrectedImage: UIImage?               // 校正图，非 @Published
+    fileprivate var pendingRegionQAFrame: QAFrameCandidate?  // 选中题裁剪帧，喂给下一次提交（类型 private，故 fileprivate）
+    // 设置开关：自动梯形校正 / 多题自动分割（默认开；关=回到老整图链路）
+    @Published var autoKeystoneCorrection: Bool = {
+        if UserDefaults.standard.object(forKey: autoKeystoneCorrectionDefaultsKey) == nil { return true }
+        return UserDefaults.standard.bool(forKey: autoKeystoneCorrectionDefaultsKey)
+    }()
+    @Published var questionSegmentationEnabled: Bool = {
+        if UserDefaults.standard.object(forKey: questionSegmentationEnabledDefaultsKey) == nil { return true }
+        return UserDefaults.standard.bool(forKey: questionSegmentationEnabledDefaultsKey)
+    }()
     @Published var lastSubmittedContextItems: [ContextBadgeItem] = []
     /// Memories the server semantically retrieved into the most recent answer (with score breakdown).
     @Published var lastTurnMemories: [RetrievedMemory] = []
@@ -8451,6 +8636,20 @@ final class AppState: ObservableObject {
         voicePlaybackEnabledDidChange(!voicePlaybackEnabled)
     }
 
+    // 自动梯形校正：拍照分题前先把拍歪的纸张扶正（检测不到/形变很小则用原图）
+    func autoKeystoneCorrectionDidChange(_ on: Bool) {
+        autoKeystoneCorrection = on
+        UserDefaults.standard.set(on, forKey: autoKeystoneCorrectionDefaultsKey)
+        log(on ? "自动梯形校正已开启" : "自动梯形校正已关闭：用相机原图")
+    }
+
+    // 多题自动分割：拍照后把多道题各盖一个浮层供点选（关=直接整图问答）
+    func questionSegmentationEnabledDidChange(_ on: Bool) {
+        questionSegmentationEnabled = on
+        UserDefaults.standard.set(on, forKey: questionSegmentationEnabledDefaultsKey)
+        log(on ? "多题自动分割已开启" : "多题自动分割已关闭：拍照按整张图分析")
+    }
+
     // 纯文字提问（不开相机）：开启后打字提问不再打开相机/抓取画面，按纯文字理解
     func textOnlyQuestionDidChange(_ on: Bool) {
         textOnlyQuestion = on
@@ -8815,6 +9014,173 @@ final class AppState: ObservableObject {
         completePendingQAFrame(QAFrameCandidate(image: image, analysis: analysis, assessment: assessment))
     }
 
+    // MARK: - 题目分割 + 浮层选题（拍照答题 / 作业批改）
+
+    /// 入口：抓当前画面 → 梯形校正 → 题目分割 → 展示「冻结图 + 透明浮层」。grading=true 为作业批改，false 为拍照答题。
+    func beginQuestionSegmentation(grading: Bool) {
+        guard !segmentationBusy, !isSubmittingQuestion else { return }
+        recordUserOperation(grading ? "segment_grading" : "segment_qa")
+        segmentationIsGrading = grading
+        segmentationBusy = true
+        segmentationVisible = true
+        segmentationNotice = ""
+        selectedRegionID = nil
+        questionRegions = []
+        segmentationDisplayImage = nil
+        pendingRegionQAFrame = nil
+        qaStateText = "抓取并分题"
+        qaSystemImage = "rectangle.dashed"
+        log(grading ? "作业批改：抓拍并分割题目" : "拍照答题：抓拍并分割题目")
+        Task { @MainActor in
+            guard let candidate = await captureCurrentQAFrame() else {
+                segmentationBusy = false
+                segmentationVisible = false
+                segmentationNotice = ""
+                qaStateText = "未能抓到画面"
+                qaSystemImage = "exclamationmark.triangle"
+                log("题目分割：未能抓到当前画面（模拟器无相机或超时）", level: "warning")
+                return
+            }
+            processSegmentation(raw: candidate.image)
+        }
+    }
+
+    /// 校正 + 分割（一次性，发生在显式点击「分题」之后，短暂主线程计算可接受）。
+    private func processSegmentation(raw: UIImage) {
+        let rect: (image: UIImage, didCorrect: Bool) = autoKeystoneCorrection
+            ? QuestionSegmenter.rectify(raw)
+            : (image: raw, didCorrect: false)
+        segmentationRawImage = raw
+        segmentationCorrectedImage = rect.image
+        segmentationDidCorrect = rect.didCorrect
+        segmentationUseCorrected = true
+        let display = rect.didCorrect ? rect.image : raw
+        segmentationDisplayImage = display
+        let regions = questionSegmentationEnabled ? QuestionSegmenter.segment(display) : []
+        questionRegions = regions
+        selectedRegionID = regions.count == 1 ? regions.first?.id : nil
+        segmentationBusy = false
+        segmentationNotice = regions.isEmpty
+            ? "没自动框出题目，可直接按整张图问答"
+            : (segmentationIsGrading ? "点一道题，我来批改" : "点一道题，我来讲")
+        log("题目分割完成：\(regions.count) 道题，校正=\(rect.didCorrect)")
+    }
+
+    /// 「用原图 ⇄ 用矫正图」切换：重画并按新图重算分割（保证浮层坐标与展示图一致）。
+    func toggleSegmentationCorrection() {
+        guard let raw = segmentationRawImage, let corrected = segmentationCorrectedImage else { return }
+        segmentationUseCorrected.toggle()
+        let display = segmentationUseCorrected ? corrected : raw
+        segmentationDisplayImage = display
+        let regions = questionSegmentationEnabled ? QuestionSegmenter.segment(display) : []
+        questionRegions = regions
+        selectedRegionID = regions.count == 1 ? regions.first?.id : nil
+    }
+
+    func selectQuestionRegion(_ region: QuestionRegion) {
+        selectedRegionID = region.id
+    }
+
+    /// 确认选中的一题：裁剪子图 → 设为下一次提交的题图 → 拍照答题进语音 / 作业批改直接发。
+    func confirmSelectedRegion() {
+        guard let id = selectedRegionID,
+              let region = questionRegions.first(where: { $0.id == id }),
+              let base = segmentationDisplayImage else {
+            submitWholeImageFromSegmentation()
+            return
+        }
+        let padded = paddedSegmentationRect(region.normalizedRect)
+        let cropped = QuestionSegmenter.crop(base, to: padded)
+        let focus = QAFocus(
+            x: Double(region.normalizedRect.midX),
+            y: Double(region.normalizedRect.midY),
+            label: "selected_question_\(region.index)",
+            trigger: segmentationIsGrading ? "correction_check" : "region_select",
+            stableFrames: 0,
+            region: region.normalizedRect,
+            questionIndex: region.index,
+            questionText: region.ocrText,
+            crop: true
+        )
+        dispatchSegmentationQuestion(image: cropped, focus: focus, questionLabel: "第\(region.index)题")
+    }
+
+    /// 回退：不选题，直接用（校正后的）整图走一次拍照问答 / 整页批改。
+    func submitWholeImageFromSegmentation() {
+        guard let base = segmentationDisplayImage else { dismissSegmentation(); return }
+        let focus = QAFocus(
+            x: 0.5, y: 0.5,
+            label: "whole_image",
+            trigger: segmentationIsGrading ? "correction_check" : "region_select",
+            stableFrames: 0
+        )
+        dispatchSegmentationQuestion(image: base, focus: focus, questionLabel: nil)
+    }
+
+    private func dispatchSegmentationQuestion(image: UIImage, focus: QAFocus, questionLabel: String?) {
+        let analysis = BurstFrameAnalyzer.analyze(image)
+        let assessment = CaptureQualityAssessment.evaluate(
+            signals: analysis.signals,
+            visualDistance: nil,
+            textDistance: nil,
+            isFirstUsefulFrame: true
+        )
+        pendingRegionQAFrame = QAFrameCandidate(image: image, analysis: analysis, assessment: assessment)
+        let grading = segmentationIsGrading
+        dismissSegmentation(keepPendingFrame: true)
+        if grading {
+            stopSpeaking()
+            stopListening(submit: false)
+            pendingQATrigger = "correction_check"
+            pendingQAFocus = focus
+            let prompt = questionLabel.map { "请批改\($0)，指出对错并给订正建议。" }
+                ?? "请批改这页作业，逐题指出对错与订正。"
+            pendingQAQuestion = prompt
+            recognizedText = prompt
+            qaAnswer = ""
+            qaOverlayVisible = true
+            lastSubmittedContextItems = pendingContextItems(draft: prompt)
+            appendUserChatMessage(prompt)
+            isThinking = true
+            qaStateText = "批改中"
+            qaSystemImage = "checkmark.rectangle.stack"
+            let generation = beginQuestionSubmissionGeneration()
+            Task { await submitRecognizedQuestion(generation: generation) }
+        } else {
+            // 拍照答题：题图已锁定为该题，进入语音让用户说想问什么
+            startVoiceQuestion(trigger: "region_select", focus: focus)
+        }
+    }
+
+    /// 选中题裁剪留白：上下各 +10% 题高、左右各 +2% 题宽，clamp 到图内。
+    private func paddedSegmentationRect(_ r: CGRect) -> CGRect {
+        let padX = r.width * 0.02
+        let padY = r.height * 0.10
+        let minX = max(0, r.minX - padX)
+        let minY = max(0, r.minY - padY)
+        let maxX = min(1, r.maxX + padX)
+        let maxY = min(1, r.maxY + padY)
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    func dismissSegmentation(keepPendingFrame: Bool = false) {
+        segmentationVisible = false
+        segmentationBusy = false
+        questionRegions = []
+        selectedRegionID = nil
+        segmentationDisplayImage = nil
+        segmentationRawImage = nil
+        segmentationCorrectedImage = nil
+        segmentationDidCorrect = false
+        segmentationNotice = ""
+        if !keepPendingFrame {
+            pendingRegionQAFrame = nil
+            if cameraTaskKind == .qaFrame { cameraTaskKind = .none }
+            cameraPreviewVisible = false
+            cameraSheetVisible = false
+        }
+    }
+
     func cameraDidRecognizeGesture(_ gesture: CameraGesture, stableFrames: Int, point: CGPoint?) {
         suppressObservationDanmakuBriefly()
         switch gesture {
@@ -9151,7 +9517,15 @@ final class AppState: ObservableObject {
         let intentHint = qaIntentHint(for: qaQuestionTextForSubmission())
         let shouldCaptureFrame = shouldCaptureVisualContext(intentHint: intentHint)
         let frame: QAFrameCandidate?
-        if shouldCaptureFrame {
+        // 题目分割·选中题：已有裁剪好的单题图，直接使用、跳过重新抓帧（强制采用）。
+        let forceSubmitRegionFrame = pendingRegionQAFrame != nil
+        if let regionFrame = pendingRegionQAFrame {
+            frame = regionFrame
+            pendingRegionQAFrame = nil
+            qaStateText = "已锁定选中题，思考中"
+            qaSystemImage = "viewfinder.rectangular"
+            log("题目分割：使用选中题裁剪图作为上下文")
+        } else if shouldCaptureFrame {
             qaStateText = "截取当前画面"
             qaSystemImage = "camera.viewfinder"
             log("AI 问答准备截取当前画面作为上下文")
@@ -9167,7 +9541,7 @@ final class AppState: ObservableObject {
                 log("本轮使用文字和已有回合上下文，不额外抓取当前画面")
             }
         }
-        let shouldSubmitCurrentFrame = frame.map { shouldSubmitQAFrame($0, intentHint: intentHint, turn: currentTurn) } ?? false
+        let shouldSubmitCurrentFrame = forceSubmitRegionFrame || (frame.map { shouldSubmitQAFrame($0, intentHint: intentHint, turn: currentTurn) } ?? false)
         if currentTurn == 1, let frame, shouldSubmitCurrentFrame {
             anchoredQAFrame = frame
         } else if let frame, shouldSubmitCurrentFrame {
@@ -10289,13 +10663,26 @@ final class AppState: ObservableObject {
 
     private func focusJSON(_ focus: QAFocus?) -> String {
         guard let focus else { return "{}" }
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "x": focus.x,
             "y": focus.y,
             "label": focus.label,
             "trigger": focus.trigger,
             "stable_frames": focus.stableFrames
         ]
+        if let region = focus.region {
+            payload["region"] = [
+                "x": Double(region.minX),
+                "y": Double(region.minY),
+                "w": Double(region.width),
+                "h": Double(region.height)
+            ]
+        }
+        if let questionIndex = focus.questionIndex { payload["question_index"] = questionIndex }
+        if let questionText = focus.questionText, !questionText.isEmpty {
+            payload["question_text"] = String(questionText.prefix(200))
+        }
+        if focus.crop { payload["crop"] = true }
         return jsonString(payload)
     }
 
@@ -12392,7 +12779,9 @@ private extension Data {
     }
 }
 
-private extension UIImage {
+// 注：访问级别由 private 放宽为 internal，供 QuestionSegmenter.swift / QuestionRegionOverlay.swift 复用
+// `resizedForVision(maxSide:)` 与 `cgImagePropertyOrientation`（行为不变）。
+extension UIImage {
     var cgImagePropertyOrientation: CGImagePropertyOrientation {
         switch imageOrientation {
         case .up:
