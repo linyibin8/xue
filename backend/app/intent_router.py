@@ -42,7 +42,7 @@ _CONTEXT_KEYS = {
     "debug": "调试",
 }
 
-_INTENT_TYPES = {"update_coach_preference", "toggle_context", "qa"}
+_INTENT_TYPES = {"update_coach_preference", "toggle_context", "qa", "grade_homework", "photo_answer"}
 _CONFIDENCE_FLOOR = 0.6
 
 
@@ -111,6 +111,13 @@ _CLASSIFY_PROMPT = """你是「知进伴学」App 的指令分类器。用户在
    例如“把长期记忆关掉”→ {{"key":"memory","value":false}}；“打开错题上下文”→ {{"key":"mistakes","value":true}}。
    若用户说的开关不在上表（比如“关掉声音”“关闭通知”），不要硬套，请判为 qa 或低置信度。
 
+另外两类是「进入功能模块」的意图（不是配置、也不是直接问答，而是要打开拍照流程）：
+
+3) grade_homework —— 用户想【批改作业/检查对错】，例如“帮我批改这页作业”“检查一下我做得对不对”“我改完了看看错没错”“判一下这张卷子”。slots 可为空。
+
+4) photo_answer —— 用户想【拍照把整页/好几道题分出来解答】，例如“帮我把这几道题分一下”“这一页题拍照解答”“这些题怎么做（一次好几道）”。slots 可为空。
+   注意：如果只是问【单独一道题】“这题怎么做/讲讲这道题”，那是普通 qa（现有问答已会自动看画面），不要判为 photo_answer。
+
 如果这句话其实是在【提问】（哪怕含“删/关/记住”等字，但语义是问知识），intent_type 必须是 "qa"。
 不确定时给低 confidence。绝不要编造 key，绝不要把不在白名单里的开关塞进 key。
 
@@ -118,10 +125,10 @@ _CLASSIFY_PROMPT = """你是「知进伴学」App 的指令分类器。用户在
 {state_summary}
 
 只输出一个 JSON 对象，不要任何多余文字、不要 markdown 代码块：
-{{"intent_type": "update_coach_preference"|"toggle_context"|"qa",
+{{"intent_type": "update_coach_preference"|"toggle_context"|"grade_homework"|"photo_answer"|"qa",
   "confidence": 0.0~1.0 的小数,
   "slots": {{}},
-  "summary": "一句中文，概括你打算做的配置变更（qa 时可为空串）",
+  "summary": "一句中文，概括你打算做的事（qa 时可为空串）",
   "clarification": null 或 "需要向用户澄清的一句话"}}
 
 用户这句话：
@@ -293,6 +300,16 @@ async def intent_route(request: Request) -> dict:
     slots = result.get("slots") if isinstance(result.get("slots"), dict) else {}
     summary = str(result.get("summary") or "").strip()
     clarification = result.get("clarification")
+
+    # P4：进入功能模块（拍照答题/作业批改）。不确定就当普通提问，绝不误打断问答。
+    if intent_type in ("grade_homework", "photo_answer"):
+        if confidence < _CONFIDENCE_FLOOR:
+            return {"intent_kind": "qa"}
+        return {
+            "intent_kind": "module",
+            "module": "grade" if intent_type == "grade_homework" else "answer",
+            "summary": summary,
+        }
 
     # 低置信度 → 不出卡片，请前端澄清（或当 QA）。
     if confidence < _CONFIDENCE_FLOOR:
