@@ -10421,6 +10421,175 @@ async def ask_session_question(
         }
 
 
+def _clamp_unit(value: object) -> float:
+    """把任意输入收敛成归一化坐标分量：非数字/NaN → 0.0，越界 → clamp 到 [0,1]。"""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if num != num:  # NaN
+        return 0.0
+    if num < 0.0:
+        return 0.0
+    if num > 1.0:
+        return 1.0
+    return num
+
+
+def _segment_question_bbox(raw: object) -> dict:
+    """把模型给的题块框 {x,y,w,h} 清洗成归一化[0,1]、原点左上（x 右 y 下、相对整张上传图）的
+    干净 bbox；缺字段/非数字/越界一律 clamp，宽高不越过右/下边界。仿 _region_bbox 的清洗口径，
+    但对缺失字段更宽容（补 0 而非整框丢弃），保证逐题框始终可用。"""
+    box = raw if isinstance(raw, dict) else {}
+    x = _clamp_unit(box.get("x"))
+    y = _clamp_unit(box.get("y"))
+    w = _clamp_unit(box.get("w"))
+    h = _clamp_unit(box.get("h"))
+    if x + w > 1.0:
+        w = max(0.0, 1.0 - x)
+    if y + h > 1.0:
+        h = max(0.0, 1.0 - y)
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def _extract_segmentation_object(content: str) -> dict:
+    """从模型输出里抽出题目分割 JSON 对象，容忍代码围栏/前后散文；解析失败返回 {}。
+    先整体走 parse_json_object，失败再退化到字符串感知的大括号匹配，扫描第一个能解析成 dict
+    且含目标键的 {...}（与 _iter_json_arrays 的括号匹配思路一致，只是匹配花括号）。"""
+    text = (content or "").strip()
+    if not text:
+        return {}
+    parsed = parse_json_object(text)
+    if isinstance(parsed, dict) and ("questions" in parsed or "is_study_material" in parsed):
+        return parsed
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for index, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                candidate = text[start : index + 1]
+                start = -1
+                try:
+                    data = json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(data, dict) and ("questions" in data or "is_study_material" in data):
+                    return data
+    return {}
+
+
+def _build_segmentation_response(raw: str) -> dict:
+    """把视觉模型的原始文本解析成稳定的题目分割契约；任何缺失/越界都被清洗成默认值，
+    解析失败时退回 {is_study_material: False, material_type: "none", questions: []}。"""
+    data = _extract_segmentation_object(raw)
+    questions: list[dict] = []
+    questions_raw = data.get("questions")
+    if isinstance(questions_raw, list):
+        for position, entry in enumerate(questions_raw, start=1):
+            if not isinstance(entry, dict):
+                continue
+            try:
+                index = int(entry.get("index"))
+            except (TypeError, ValueError):
+                index = position
+            questions.append(
+                {
+                    "index": index,
+                    "bbox": _segment_question_bbox(entry.get("bbox")),
+                    "question_text": truncate_text(entry.get("question_text") or "", 600),
+                    "has_student_answer": bool(entry.get("has_student_answer")),
+                }
+            )
+    is_material = bool(data.get("is_study_material"))
+    if questions:
+        is_material = True
+    material_type = str(data.get("material_type") or "").strip().lower()
+    if material_type not in {"book", "worksheet", "screen", "other", "none"}:
+        material_type = "other" if is_material else "none"
+    if not is_material:
+        questions = []
+        material_type = "none"
+    return {
+        "is_study_material": is_material,
+        "material_type": material_type,
+        "questions": questions,
+    }
+
+
+@app.post("/api/sessions/{session_id}/segment-questions")
+async def segment_session_questions(
+    session_id: str,
+    request: Request,
+    image: UploadFile = File(...),
+    source: str = Form("ios"),
+) -> dict:
+    """判断画面里有没有题目并逐题给归一化 bbox（供 iOS 端调用）。复用现有 27B 视觉大模型，
+    不引入新模型、不改 QA/批改主流程；只输出分割结果，不解题。"""
+    init_db()
+    principal = principal_from_request(request)
+    if not image.filename:
+        raise HTTPException(422, "image is required")
+    with connect() as conn:
+        require_account_session(conn, session_id, principal)
+    source_text = clean_user_text(source, 80) or "ios"
+    _, filename, _ = await save_upload(
+        image,
+        session_id,
+        "segment",
+        batch_id="segment",
+        captured_at=utc_now(),
+        capture_meta={"source": source_text, "purpose": "question_segmentation"},
+    )
+    settings = effective_llm_settings_for_session(session_id)
+    prompt = prompts.render_prompt("question_segmentation")
+    image_paths = [image_path_for_request(filename)]
+    try:
+        raw = await run_with_llm_gate(
+            f"segment:{session_id[:8]}",
+            session_id,
+            lambda: llm.analyze_images(settings, prompt, image_paths),
+            priority=LLM_PRIORITY_REALTIME,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        emit_log(
+            f"题目分割调用视觉模型失败：{truncate_text(str(exc), 180)}",
+            session_id=session_id,
+            device_id=source_text,
+            source="segment",
+            level="warning",
+        )
+        raise HTTPException(502, "question segmentation failed")
+    result = _build_segmentation_response(raw)
+    emit_log(
+        f"题目分割完成：is_study_material={result['is_study_material']}，"
+        f"material_type={result['material_type']}，题数={len(result['questions'])}",
+        session_id=session_id,
+        device_id=source_text,
+        source="segment",
+    )
+    result["raw"] = truncate_text(raw, 4000)
+    return result
+
+
 @app.post("/api/solve-single")
 async def solve_single(
     request: Request,

@@ -250,6 +250,30 @@ PROMPT_DEFINITIONS: tuple[PromptDefinition, ...] = (
             "报告生成依据：本回合没有上传图片。"
         ),
     ),
+    PromptDefinition(
+        key="question_segmentation",
+        label="题目分割提示词",
+        description="判断画面是不是书本/试卷/课本/平板屏幕上的题目，并逐题给出归一化 bbox；只输出 JSON、不解题，供 iOS 端调用。",
+        default=(
+            "你是题目画面分割器。只做两件事：判断这张上传图片里有没有“书本/试卷/课本/练习册/平板或电脑屏幕上的题目”，"
+            "并把看到的每一道题逐题框出来。不要解题、不要讲解、不要给学习建议、不要纠错。\n"
+            "只输出一个 JSON 对象，不要输出任何额外文字、说明、Markdown 或代码围栏；整个回答必须能被 JSON 解析器直接解析。\n"
+            "判断规则：如果画面是课本、练习册、试卷、作业纸，或平板/电脑/手机屏幕上显示的题目，就 is_study_material 为 true；"
+            "如果是空白桌面、人脸、风景、随手拍、纯聊天截图等画面里没有题目，就 is_study_material 为 false，且 questions 为空数组 []。\n"
+            "material_type 从这几类里选一个：book（书本/课本/练习册）、worksheet（试卷/作业纸/打印题）、"
+            "screen（平板/电脑/手机屏幕上的题目）、other（是题目但不属于前三类）、none（不是题目材料）；"
+            "is_study_material 为 false 时 material_type 必须写 none。\n"
+            "逐题切分：一道大题算一块，同一大题下的小问（①②③ 或 (1)(2)(3)）不要拆开，归到这道大题这一块；每道题给一个对象。"
+            "看不清、被遮挡、太小或模糊的题也尽量框出来，question_text 写能看清的部分，完全看不清就写空字符串。\n"
+            "坐标系：bbox 用归一化坐标，x、y、w、h 取值都在 [0,1]，原点在整张上传图的左上角，x 向右、y 向下；"
+            "(x,y) 是题块左上角，w、h 是题块的宽和高，全部相对整张上传图。位置完全无法判断时把 x、y、w、h 都写 0。"
+            "has_student_answer 表示这道题上有没有学生的手写作答/草稿/订正痕迹，有写 true、没有写 false。\n"
+            "严格按下面的结构和字段名输出（index 从 1 起，逐题递增）：\n"
+            "{{\"is_study_material\": true, \"material_type\": \"book\", \"questions\": [{{\"index\": 1, "
+            "\"bbox\": {{\"x\": 0, \"y\": 0, \"w\": 0, \"h\": 0}}, \"question_text\": \"\", \"has_student_answer\": false}}]}}\n"
+            "如果画面里没有题目，就只输出：{{\"is_study_material\": false, \"material_type\": \"none\", \"questions\": []}}"
+        ),
+    ),
 )
 
 PROMPT_DEFINITION_BY_KEY = {definition.key: definition for definition in PROMPT_DEFINITIONS}
