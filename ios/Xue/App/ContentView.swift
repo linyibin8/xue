@@ -9820,8 +9820,24 @@ final class AppState: ObservableObject {
             let generation = beginQuestionSubmissionGeneration()
             Task { await submitRecognizedQuestion(generation: generation) }
         } else {
-            // 拍照答题：题图已锁定为该题，进入语音让用户说想问什么
-            startVoiceQuestion(trigger: "region_select", focus: focus)
+            // 拍照答题（“点一题，我来讲”）：选中题直接讲解，不再等用户开口说话（修复“点了没反应”）。
+            stopSpeaking()
+            stopListening(submit: false)
+            pendingQATrigger = "region_select"
+            pendingQAFocus = focus
+            let prompt = questionLabel.map { "请讲解\($0)：给出解题思路和最终答案。" }
+                ?? "请讲解这道题：给出解题思路和最终答案。"
+            pendingQAQuestion = prompt
+            recognizedText = prompt
+            qaAnswer = ""
+            qaOverlayVisible = true
+            lastSubmittedContextItems = pendingContextItems(draft: prompt)
+            appendUserChatMessage(prompt)
+            isThinking = true
+            qaStateText = "讲解中"
+            qaSystemImage = "text.bubble"
+            let generation = beginQuestionSubmissionGeneration()
+            Task { await submitRecognizedQuestion(generation: generation) }
         }
     }
 
