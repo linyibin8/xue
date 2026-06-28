@@ -233,6 +233,45 @@ async def analyze_images(settings: Settings, prompt: str, image_paths: list[Path
     return message.get("content") or message.get("reasoning_content") or json.dumps(data, ensure_ascii=False)
 
 
+async def analyze_images_responses(
+    settings: Settings,
+    instructions: str,
+    prompt: str,
+    image_paths: list[Path],
+    effort: str = "low",
+) -> str:
+    """高质量视觉任务（精批/精准分题）走前沿大模型 GPT-5.5 的 Responses API 网关。
+    与本地 27B 的 /chat/completions 不同：用 instructions(系统) + input(input_text/input_image) + reasoning.effort。
+    返回聚合的 output_text。外部 API，调用方负责并发上限与超时。"""
+    content: list[dict] = [{"type": "input_text", "text": prompt}]
+    for path in image_paths:
+        encoded = base64.b64encode(path.read_bytes()).decode()
+        mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+        content.append({"type": "input_image", "image_url": f"data:{mime};base64,{encoded}"})
+    payload = {
+        "model": settings.grading_llm_model,
+        "instructions": instructions,
+        "input": [{"role": "user", "content": content}],
+        "reasoning": {"effort": effort},
+    }
+    timeout = httpx.Timeout(settings.grading_llm_timeout_seconds, connect=CONNECT_TIMEOUT)
+    async with httpx.AsyncClient(base_url=settings.grading_llm_url, timeout=timeout, trust_env=False) as client:
+        response = await client.post(
+            "/v1/responses",
+            json=payload,
+            headers={"Authorization": f"Bearer {settings.grading_llm_key}", "Content-Type": "application/json"},
+        )
+        response.raise_for_status()
+        data = response.json()
+    out = ""
+    for item in data.get("output", []):
+        if item.get("type") == "message":
+            for part in item.get("content", []):
+                if part.get("type") == "output_text":
+                    out += part.get("text", "")
+    return out or json.dumps(data, ensure_ascii=False)[:2000]
+
+
 async def analyze_text(settings: Settings, prompt: str, max_tokens: int = 2600) -> str:
     payload = _text_payload(settings, prompt, max_tokens)
     async with _client(settings) as client:

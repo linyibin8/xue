@@ -10698,11 +10698,10 @@ async def segment_session_questions(
     prompt = prompts.render_prompt("question_segmentation")
     image_paths = [image_path_for_request(filename)]
     try:
-        raw = await run_with_llm_gate(
-            f"segment:{session_id[:8]}",
-            session_id,
-            lambda: llm.analyze_images(settings, prompt, image_paths),
-            priority=LLM_PRIORITY_REALTIME,
+        raw, _used_frontier = await _quality_vision_analyze(
+            session_id, f"segment:{session_id[:8]}", settings,
+            _SEGMENT_INSTRUCTIONS, prompt, image_paths,
+            get_settings().grading_llm_seg_effort, LLM_PRIORITY_REALTIME,
         )
     except HTTPException:
         raise
@@ -10758,7 +10757,7 @@ def _grading_needs_figure(question_text: str) -> bool:
     return False
 
 
-def _build_grading_response(raw: str) -> dict:
+def _build_grading_response(raw: str, enforce_figure_gate: bool = True) -> dict:
     """把整页批改视觉模型的原始文本解析成稳定的逐题批改契约。复用题目分割的鲁棒 JSON 抽取
     （_extract_segmentation_object）与 bbox 清洗（_segment_question_bbox）。每题取
     index/bbox/question_text/student_answer/verdict(白名单校验，非法→"不确定")/correct_answer/
@@ -10799,7 +10798,8 @@ def _build_grading_response(raw: str) -> dict:
                 verdict = "不确定"
             # 可靠性闸门：读图/几何推理题 VLM 判分不可靠，强制降级为“不确定”并清空正确答案，
             # 仅保留 student_answer/question_text/correction(只当思路)/error_reason/knowledge。
-            needs_figure = _grading_needs_figure(question_text)
+            # enforce_figure_gate=False 给前沿大模型(GPT-5.5)路径：它自己会算几何并诚实判不确定，不强制。
+            needs_figure = enforce_figure_gate and _grading_needs_figure(question_text)
             if needs_figure and verdict in _GRADING_DECISIVE_VERDICTS:
                 verdict = "不确定"
                 correct_answer = ""
@@ -10835,6 +10835,50 @@ def _build_grading_response(raw: str) -> dict:
     }
 
 
+_grading_llm_sem: asyncio.Semaphore | None = None
+
+
+def _grading_llm_enabled() -> bool:
+    s = get_settings()
+    return bool(s.grading_llm_url and s.grading_llm_key)
+
+
+def _grading_llm_semaphore() -> asyncio.Semaphore:
+    global _grading_llm_sem
+    if _grading_llm_sem is None:
+        _grading_llm_sem = asyncio.Semaphore(max(1, get_settings().grading_llm_max_concurrency))
+    return _grading_llm_sem
+
+
+async def _quality_vision_analyze(
+    session_id: str,
+    label: str,
+    settings,
+    instructions: str,
+    prompt: str,
+    image_paths: list,
+    effort: str,
+    fallback_priority,
+) -> tuple[str, bool]:
+    """精批/精准分题：有 GPT-5.5 网关就走它（外部，不占本地 27B GPU gate，自带并发上限）；
+    否则回退本地 27B（走 llm_gate）。返回 (raw_text, used_frontier)。"""
+    if _grading_llm_enabled():
+        s = get_settings()
+        async with _grading_llm_semaphore():
+            raw = await llm.analyze_images_responses(s, instructions, prompt, image_paths, effort)
+        return raw, True
+    raw = await run_with_llm_gate(
+        label, session_id,
+        lambda: llm.analyze_images(settings, prompt, image_paths),
+        priority=fallback_priority,
+    )
+    return raw, False
+
+
+_GRADE_INSTRUCTIONS = "你是严谨的中小学作业批改助手。只输出 JSON。只依据图片中清晰可见的内容，看不清就写未识别，绝不编造答案。"
+_SEGMENT_INSTRUCTIONS = "你是作业题目分割器。只输出 JSON。逐题按题目在图中的真实像素位置给归一化 bbox，不要按题序均匀平铺。"
+
+
 @app.post("/api/sessions/{session_id}/grade-page")
 async def grade_session_questions(
     session_id: str,
@@ -10863,11 +10907,10 @@ async def grade_session_questions(
     prompt = prompts.render_prompt("page_grading")
     image_paths = [image_path_for_request(filename)]
     try:
-        raw = await run_with_llm_gate(
-            f"grade:{session_id[:8]}",
-            session_id,
-            lambda: llm.analyze_images(settings, prompt, image_paths),
-            priority=LLM_PRIORITY_REALTIME,
+        raw, used_frontier = await _quality_vision_analyze(
+            session_id, f"grade:{session_id[:8]}", settings,
+            _GRADE_INSTRUCTIONS, prompt, image_paths,
+            get_settings().grading_llm_grade_effort, LLM_PRIORITY_REALTIME,
         )
     except HTTPException:
         raise
@@ -10880,7 +10923,8 @@ async def grade_session_questions(
             level="warning",
         )
         raise HTTPException(502, "page grading failed")
-    result = _build_grading_response(raw)
+    # GPT-5.5 会自己诚实判几何题/自报不确定 → 放开服务端「几何强制不确定」闸门；本地 27B 仍强制。
+    result = _build_grading_response(raw, enforce_figure_gate=not used_frontier)
     emit_log(
         f"整页批改完成：is_study_material={result['is_study_material']}，"
         f"题数={len(result['questions'])}，low_quality={result['low_quality']}",

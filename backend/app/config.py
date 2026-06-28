@@ -16,6 +16,15 @@ class Settings(BaseSettings):
     llm_provider: str = "evowit"
     llm_gateway_url: str = ""
     llm_gateway_key: str = ""
+    # 高质量「精批/精准分题」后台路径：前沿大模型(GPT-5.5) Responses API 网关。
+    # 有 url+key 才启用；批改/分题路由到它(外部，不占本地 27B GPU gate)，实时问答仍用 27B。
+    grading_llm_url: str = "http://100.64.0.13:8080"
+    grading_llm_key: str = ""
+    grading_llm_model: str = "gpt-5.5"
+    grading_llm_seg_effort: str = "low"     # 分题 bbox：low 已够准(~35s)
+    grading_llm_grade_effort: str = "medium"  # 批改判分：medium 平衡质量/延迟(~60-105s, <iOS 180s 超时)
+    grading_llm_max_concurrency: int = 3
+    grading_llm_timeout_seconds: float = 170.0
     embed_url: str = ""
     embed_dim: int = 512
     llm_max_concurrency: int = 1
