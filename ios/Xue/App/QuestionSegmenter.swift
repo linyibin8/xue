@@ -91,39 +91,53 @@ enum QuestionSegmenter {
         lines.sort { $0.rect.minY < $1.rect.minY }
         let avgHeight = lines.map { $0.rect.height }.reduce(0, +) / CGFloat(lines.count)
 
-        // 垂直间隙 > 行高*1.5 或命中题号 → 开新题块；否则并入当前块
-        var blocks: [[TextLine]] = []
-        var current: [TextLine] = []
-        for line in lines {
-            if current.isEmpty {
-                current = [line]
-                continue
-            }
-            let prevMaxY = current.map { $0.rect.maxY }.max() ?? line.rect.minY
-            let gap = line.rect.minY - prevMaxY
-            let startsNew = gap > avgHeight * 1.5 || matchesQuestionNumber(line.text)
-            if startsNew {
-                blocks.append(current)
-                current = [line]
-            } else {
-                current.append(line)
-            }
-        }
-        if !current.isEmpty { blocks.append(current) }
-
-        // 题块 → QuestionRegion（union + 2% padding + 面积过滤）
+        let pad: CGFloat = 0.012
         var regions: [QuestionRegion] = []
-        let pad: CGFloat = 0.02
-        for block in blocks {
-            var union = block[0].rect
+
+        /// 由一组文字行生成题块矩形；yBottomOverride 把竖直下界延伸到下一题题号，
+        /// 从而把「题号到下一题之间」的图形/留白也圈进来（密排题切得更全更准）。
+        func makeRegion(_ block: [TextLine], yBottomOverride: CGFloat?) -> QuestionRegion? {
+            guard let first = block.first else { return nil }
+            var union = first.rect
             for line in block.dropFirst() { union = union.union(line.rect) }
+            if let yb = yBottomOverride, yb > union.minY {
+                union = CGRect(x: union.minX, y: union.minY, width: union.width, height: yb - union.minY)
+            }
             let padded = clampRect(union.insetBy(dx: -pad, dy: -pad))
-            guard padded.width * padded.height >= 0.015 else { continue }
-            let text = block.map { $0.text }.joined(separator: "\n")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { continue }
+            guard padded.width * padded.height >= 0.012 else { return nil }
+            let text = block.map { $0.text }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return nil }
             let confidence = block.map { $0.confidence }.reduce(0, +) / Double(block.count)
-            regions.append(QuestionRegion(normalizedRect: padded, index: 0, ocrText: text, confidence: confidence))
+            return QuestionRegion(normalizedRect: padded, index: 0, ocrText: text, confidence: confidence)
+        }
+
+        // 题号锚行（行首命中「N、/N，/N./第N题」等）。密排题靠题号逐题切，最准。
+        let anchors = lines.indices.filter { matchesQuestionNumber(lines[$0].text) }
+        if anchors.count >= 2 {
+            // 每道题 = [本题号行, 下一题号行) 的文字行，竖直下界延伸到下一题题号顶部。
+            for (a, start) in anchors.enumerated() {
+                let end = (a + 1 < anchors.count) ? anchors[a + 1] : lines.count
+                let yBottom = (a + 1 < anchors.count) ? lines[anchors[a + 1]].rect.minY - pad : nil
+                if let region = makeRegion(Array(lines[start..<end]), yBottomOverride: yBottom) {
+                    regions.append(region)
+                }
+            }
+        } else {
+            // 回退：识别不到足够题号时，按垂直间隙 > 行高*1.6 或命中题号 聚类。
+            var blocks: [[TextLine]] = []
+            var current: [TextLine] = []
+            for line in lines {
+                if current.isEmpty { current = [line]; continue }
+                let prevMaxY = current.map { $0.rect.maxY }.max() ?? line.rect.minY
+                let gap = line.rect.minY - prevMaxY
+                if gap > avgHeight * 1.6 || matchesQuestionNumber(line.text) {
+                    blocks.append(current); current = [line]
+                } else { current.append(line) }
+            }
+            if !current.isEmpty { blocks.append(current) }
+            for block in blocks {
+                if let region = makeRegion(block, yBottomOverride: nil) { regions.append(region) }
+            }
         }
 
         // 阅读顺序：上→下、左→右
@@ -267,9 +281,10 @@ enum QuestionSegmenter {
         return CGRect(x: minX, y: minY, width: max(0, maxX - minX), height: max(0, maxY - minY))
     }
 
-    /// 题号正则：第?[数字/中文数字]+[、.)）题]；(1)(2) 这类小问因以括号起头不命中，确保“大题为一块”。
+    /// 题号正则：第?[数字/中文数字]+[、，,.)）题]；含全/半角逗号（试卷常写「1，2，3，」）。
+    /// (1)(2) 这类小问以括号起头不命中，确保“大题为一块”。
     private static let questionNumberRegex: NSRegularExpression? = {
-        try? NSRegularExpression(pattern: "^\\s*(第)?[0-9一二三四五六七八九十]+\\s*[、.\\)）题]")
+        try? NSRegularExpression(pattern: "^\\s*(第)?[0-9一二三四五六七八九十]+\\s*[、，,.\\)）题]")
     }()
 
     private static func matchesQuestionNumber(_ text: String) -> Bool {
