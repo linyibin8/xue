@@ -99,6 +99,16 @@
 - **关键架构发现(指导后续)**：VLM 判「是否题目/题干文本/是否作答/口算判分」可靠，但**bbox 是按题序编的等距网格不精准、几何题编造标准答案**→ 像素级叠标用端上 Vision 准 bbox，几何判分用服务端可靠性闸门强制「不确定」给讲解。
 - **未做(GPU 受限的可选增强，非验收项)**：P3 专用 OCR(PP-OCRv5/PP-FormulaNet)、P1-proper(DocRes 去畸变/PP-DocLayout 版面)——dell 2×4090 被 27B 占满显存，待腾出或上 CPU；上了可让分题/批改 bbox 精准、手写公式更准。P4 语音路径自动分流(避免给语音流加往返延迟，待续)。
 
+## 增量3 · 观察台 Web Demo（拍照观察式题目提取还原，2026-06-28）
+用户新需求：开相机观察(半小时几百张图)→提取题目→结构化存储→生成 HTML 还原页(接近原图)→可打印空白卷重做；在此之上完成 题目提取/作业批改/答题；并**算清算力与延迟**。要求先做【独立 Demo + 新入口】看效果，确认后再融入语音指令。多角色子代理(PM/交互/架构/算力/对抗整合)交叉验证后落地。
+- **形态裁决(对抗整合)**：Mac 离线时最快"看到效果"=后端直 serve 的 Web Demo，不接真相机/麦克风(留待后续融入语音)、不引入新模型、不接 TestFlight。砍掉异步 jobs 队列/建表/存图等过度设计。
+- **新入口** `GET /observe`(static/observe.html)：多选/选文件夹模拟连拍→前端 aHash 图级去重→串行逐张提取(进度+延迟实时面板)→还原页(印刷题干语义重排+强制并排原图)→空白卷(@media print A4,window.print())→可选批改(verdict 徽章)。
+- **新端点** `POST /api/observe-demo/extract`(无状态)：复用 27B VLM,**每图只 1 次** analyze_images(合并 segment+relayout,砍一半算力);`required=False` 免登录;`LLM_PRIORITY_BACKGROUND` 给课堂 realtime 让路;同 batch_token 串行;临时文件 finally unlink。**红线:不 save_upload、不写任何用户表(images/sessions/errors 实测 0 行)、原图只前端持有。**
+- **新提示词** `observe_extract`：单图逐题输出 学科/题号/题型/题干/选项/填空数/图形注记/是否作答/学生作答;服务端追加去重指纹 fingerprint(40hex)+simhash(16hex);`_build_observe_response` 复用鲁棒 JSON 抽取,几何/读图题(`_grading_needs_figure`)强制 verdict="不确定"。
+- **算力结论**(docs/OBSERVE_DEMO_COMPUTE.md)：**裸跑高、按本方案不高**。单图~6.4s,300 张不去重串行≈32 分(过高);但几百帧实际仅 10–40 道独立题,去重+后台批处理后真正过 VLM 15–30 张≈1.5–3 分,几乎不占课堂卡。瓶颈是共享 GPU 机会成本而非钱(自托管每场<$0.06,云 API 几美分~几美元)。优化序:端上预筛去重>>后台批处理>专用 OCR 分工>小模型 triage。
+- **验收(实测过)**：①/observe 200 ②清晰题页→5 题结构化(qtype/题号/选项/填空/指纹齐) 6.2s/页 ③非题目图→is_study_material=false ④中文几何题→强制"不确定"、gradable=false ⑤连测后 0 临时残留、0 用户表写入(不污染) ⑥已部署 prod xue.evowit.com,现有 / 等端点无回归。
+- **后续(确认效果后)**：融入语音指令(实时对话说"把这些题提取出来/打印空白卷"自动进观察台);iOS 端上 Vision 强去重+透视校正;真相机+麦克风转文字图文联合。
+
 ## 约束
 - 两端共享核心（AppState/AuthSession/模型/API），UI 各接一次（见 docs/MULTI_CLIENT_GUIDE.md）。
 - 后端 surgical 部署，data/ 勿覆盖。

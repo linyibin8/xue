@@ -10997,6 +10997,205 @@ async def relayout_question(
     return result
 
 
+# ---------------------------------------------------------------------------
+# 观察台 Demo（/observe）：无状态拍照观察式题目提取还原。独立入口、不污染真实数据。
+# 红线：不调用 save_upload、不写任何用户表（images/errors/knowledge/sessions），
+# 原图只在前端持有 blob，后端只用临时文件且 finally unlink。每图只触发【一次】VLM 调用。
+# ---------------------------------------------------------------------------
+_OBSERVE_QTYPES = {
+    "选择题", "填空题", "计算题", "口算题", "解答题", "应用题", "判断题", "作文题", "其它",
+}
+_OBSERVE_GRADE_CLAUSE = (
+    "\n额外要求（批改模式）：再给每道题一个 verdict 字段，只能从这六个里选一个："
+    "对、错、部分对、不确定、未作答、未识别。判分门槛（对标可靠口算批改，宁可不判也别瞎判）："
+    "只有纯口算/印刷算术、你能独立有把握确认正确答案时，才允许判“对/错/部分对”；"
+    "凡是需要读图/几何推理、应用题、或你拿不准的，verdict 一律写“不确定”，不要硬判对错；"
+    "学生没作答写“未作答”，题干或作答看不清写“未识别”。verdict 放进每道题对象里。"
+)
+
+
+def _observe_options(raw: object) -> list[dict]:
+    """把模型给的 options 安全清洗成 [{label,text}] 列表：非列表→[]；逐项取 label/text、截断、
+    丢掉 label 与 text 都空的项；最多 12 项，避免异常输出撑爆响应。"""
+    if not isinstance(raw, list):
+        return []
+    items: list[dict] = []
+    for entry in raw:
+        label = ""
+        text = ""
+        if isinstance(entry, dict):
+            label = truncate_text(entry.get("label") or "", 16).strip()
+            text = truncate_text(entry.get("text") or "", 300).strip()
+        elif entry is not None and not isinstance(entry, list):
+            text = truncate_text(str(entry), 300).strip()
+        if not label and not text:
+            continue
+        items.append({"label": label, "text": text})
+        if len(items) >= 12:
+            break
+    return items
+
+
+_OBSERVE_PUNCT_RE = re.compile(r"[\s　.,;:!?。，、；：！？_\-—–·…\"'“”‘’()（）\[\]【】]+")
+
+
+def _observe_normalize_stem(stem: str) -> str:
+    """题干归一化：去空白/标点、统一小写，用于跨图去重指纹。stem 已不含学生手写作答。"""
+    return _OBSERVE_PUNCT_RE.sub("", (stem or "").lower())
+
+
+def _observe_simhash(stem: str) -> str:
+    """对归一化题干的 3-gram 计算 64 位 SimHash，返回 16 位十六进制。前端用 Hamming 距离判近似同题。"""
+    text = _observe_normalize_stem(stem)
+    if not text:
+        return "0" * 16
+    grams = [text[i : i + 3] for i in range(max(1, len(text) - 2))]
+    v = [0] * 64
+    for gram in grams:
+        h = int(hashlib.sha1(gram.encode("utf-8")).hexdigest()[:16], 16)
+        for bit in range(64):
+            v[bit] += 1 if (h >> bit) & 1 else -1
+    out = 0
+    for bit in range(64):
+        if v[bit] > 0:
+            out |= 1 << bit
+    return f"{out:016x}"
+
+
+def _build_observe_response(raw: str, do_grade: bool) -> dict:
+    """把观察台单图提取的视觉模型原始文本解析成稳定契约。复用题目分割的鲁棒 JSON 抽取
+    （_extract_segmentation_object）。每题清洗 index/number/subject/qtype/stem/options/blanks/
+    figure_note/has_student_answer/student_answer，并由服务端追加去重用的 fingerprint(40hex)+simhash(16hex)。
+    do_grade=True 时校验 verdict 白名单（非法→“不确定”），并对命中 _grading_needs_figure（读图/几何）的题
+    强制降级为“不确定”，避免模型编造标准答案（沿用 grade-page 的可靠性闸门）。
+    stem 与 student_answer 都为空的题过滤掉；整体解析失败退回 {is_study_material: False, questions: [], low_quality: True}。"""
+    data = _extract_segmentation_object(raw, target_keys=("is_study_material", "questions"))
+    if not data:
+        return {"is_study_material": False, "questions": [], "low_quality": True}
+    questions: list[dict] = []
+    questions_raw = data.get("questions")
+    if isinstance(questions_raw, list):
+        for position, entry in enumerate(questions_raw, start=1):
+            if not isinstance(entry, dict):
+                continue
+            try:
+                index = int(entry.get("index"))
+            except (TypeError, ValueError):
+                index = position
+            stem = truncate_text(entry.get("stem") or "", 800)
+            student_answer = truncate_text(entry.get("student_answer") or "", 600)
+            # 题干与学生作答都为空的题没有提取价值，过滤掉。
+            if not stem.strip() and not student_answer.strip():
+                continue
+            qtype = str(entry.get("qtype") or "").strip()
+            if qtype not in _OBSERVE_QTYPES:
+                qtype = "其它"
+            try:
+                blanks = max(0, int(entry.get("blanks")))
+            except (TypeError, ValueError):
+                blanks = 0
+            stem_norm = _observe_normalize_stem(stem)
+            question = {
+                "index": index,
+                "number": truncate_text(entry.get("number") or "", 40),
+                "subject": truncate_text(entry.get("subject") or "", 40),
+                "qtype": qtype,
+                "stem": stem,
+                "options": _observe_options(entry.get("options")),
+                "blanks": blanks,
+                "figure_note": truncate_text(entry.get("figure_note") or "", 300),
+                "has_student_answer": bool(entry.get("has_student_answer")),
+                "student_answer": student_answer,
+                # 去重指纹：fingerprint 精确同题，simhash 近似同题（前端按 Hamming<=3 合并）。
+                "fingerprint": hashlib.sha1(stem_norm.encode("utf-8")).hexdigest() if stem_norm else "",
+                "simhash": _observe_simhash(stem),
+            }
+            if do_grade:
+                verdict = str(entry.get("verdict") or "").strip()
+                if verdict not in _GRADING_VERDICTS:
+                    verdict = "不确定"
+                # 可靠性闸门：读图/几何题 VLM 判分不可靠，强制降级为“不确定”。
+                if _grading_needs_figure(stem) and verdict in _GRADING_DECISIVE_VERDICTS:
+                    verdict = "不确定"
+                question["verdict"] = verdict
+                question["gradable"] = not _grading_needs_figure(stem)
+            questions.append(question)
+    is_material = bool(data.get("is_study_material")) or bool(questions)
+    if not is_material:
+        questions = []
+    return {
+        "is_study_material": is_material,
+        "questions": questions,
+        "low_quality": bool(is_material and not questions),
+    }
+
+
+# 观察台 Demo 的轻量防滥用：同一 batch_token 维度的活跃请求串行（防单入口独占共享 27B），
+# 配合前端单批 ≤40 张硬上限 + BACKGROUND 优先级（给课堂 realtime 让路）。
+_OBSERVE_BATCH_LOCKS: dict[str, asyncio.Lock] = {}
+_OBSERVE_MAX_IMAGE_BYTES = 16 * 1024 * 1024
+
+
+@app.post("/api/observe-demo/extract")
+async def observe_demo_extract(
+    request: Request,
+    image: UploadFile = File(...),
+    do_grade: bool = Form(False),
+    batch_token: str = Form(""),
+) -> dict:
+    """观察台 Demo 单图题目结构化提取（无状态、不污染真实数据）。复用现有 27B 视觉大模型，
+    每图只触发一次 analyze_images；BACKGROUND 优先级给课堂实时请求让路。原图写临时文件、用完即删，
+    不调用 save_upload、不写任何用户表。无 token 也可用（required=False），便于 Mac 离线时浏览器直接看效果。"""
+    init_db()
+    # 显式 required=False：即便生产 auth_required=true 也免登录可用（这是独立 Demo 的定位）。
+    principal_from_request(request, required=False)
+    if not image.filename:
+        raise HTTPException(422, "image is required")
+    payload = await image.read()
+    if not payload:
+        raise HTTPException(422, "image is empty")
+    if len(payload) > _OBSERVE_MAX_IMAGE_BYTES:
+        raise HTTPException(413, "image too large (Demo 单图上限 16MB)")
+    token = clean_user_text(batch_token, 64) or "default"
+    lock = _OBSERVE_BATCH_LOCKS.setdefault(token, asyncio.Lock())
+    tmp_dir = get_settings().data_dir / "observe_demo"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_dir / f"{uuid.uuid4().hex}.jpg"
+    tmp_path.write_bytes(payload)
+    settings = effective_llm_settings_for_session(None)
+    prompt = prompts.render_prompt("observe_extract")
+    if do_grade:
+        prompt = prompt + _OBSERVE_GRADE_CLAUSE
+    try:
+        async with lock:
+            raw = await run_with_llm_gate(
+                f"observe:{tmp_path.stem[:8]}",
+                None,
+                lambda: llm.analyze_images(settings, prompt, [tmp_path]),
+                priority=LLM_PRIORITY_BACKGROUND,
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        emit_log(
+            f"观察台提取调用视觉模型失败：{truncate_text(str(exc), 180)}",
+            source="observe",
+            level="warning",
+        )
+        raise HTTPException(502, "observe extract failed")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    result = _build_observe_response(raw, do_grade)
+    result["filename"] = truncate_text(image.filename, 200)
+    result["raw"] = truncate_text(raw, 4000)
+    return result
+
+
+@app.get("/observe", response_class=HTMLResponse)
+def observe_demo_page() -> str:
+    return (Path(__file__).parent / "static" / "observe.html").read_text(encoding="utf-8")
+
+
 @app.post("/api/solve-single")
 async def solve_single(
     request: Request,
