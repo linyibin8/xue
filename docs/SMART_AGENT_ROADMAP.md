@@ -123,3 +123,8 @@
 - 后端 surgical 部署，data/ 勿覆盖。
 - 真机相机流不可在模拟器 E2E（见 docs/QA_TEST_REPORT.md）。
 - **全自动**：设计/编码/测试/发布全程自动，三期连续做完，不在每期停（用户已授权）。
+
+## 增量4 后续真机迭代（2026-06-28）
+- 真机反馈①「逐题切割不准」(多题并一框)：根因=题号正则不认全角逗号「1，2，3，」→ 修(加 ，, + 按相邻题号切竖直条带含图形)，build 202606281310。
+- 真机反馈②「点分析选中题没反应」：根因=非批改分支 confirmSelectedRegion 走 startVoiceQuestion 等语音(与副标题「点一题我来讲」矛盾)→ 修为直接讲解(复用裁剪帧+submitRecognizedQuestion)，commit 6d5809d，build **202606281439**(VALID,4 testers)。
+- 分题问答功能备份：git tag `segment-qa-backup-20260628` + GitHub Release(linyibin8/xue)。
