@@ -10875,7 +10875,12 @@ async def _quality_vision_analyze(
     return raw, False
 
 
-_GRADE_INSTRUCTIONS = "你是严谨的中小学作业批改助手。只输出 JSON。只依据图片中清晰可见的内容，看不清就写未识别，绝不编造答案。"
+_GRADE_INSTRUCTIONS = (
+    "你是严谨且有能力的中小学作业批改助手，具备读图与几何推理能力。只输出 JSON。"
+    "能据图中可见的尺寸/图形算出正确答案时，就判对/错/部分对，并在 correction 写出简要推导、correct_answer 给出结果；"
+    "只有当图形被截断、关键尺寸看不清、或你确实无法确信时，才用 verdict=不确定、correct_answer 留空、correction 只给思路。"
+    "绝不编造答案，correct_answer 必须与你的推导一致。"
+)
 _SEGMENT_INSTRUCTIONS = "你是作业题目分割器。只输出 JSON。逐题按题目在图中的真实像素位置给归一化 bbox，不要按题序均匀平铺。"
 
 
