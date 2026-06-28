@@ -451,6 +451,9 @@ private struct LandscapeLearningWorkbench: View {
             .presentationDetents([.large])
             .presentationDragIndicator(.visible)
         }
+        .sheet(isPresented: $state.extractResultVisible) {
+            ExtractResultSheet(state: state)
+        }
         .sheet(item: $selectedContextItem) { item in
             ContextDetailSheet(item: item) {
                 selectedContextItem = nil
@@ -1043,6 +1046,22 @@ private struct FloatingToolDock: View {
             }
 
             FloatingToolButton(
+                title: "题目提取",
+                systemImage: "doc.text.viewfinder",
+                accessibilityLabel: "题目提取",
+                identifier: "extract-action"
+            ) {
+                dismissKeyboard()
+                withAnimation(.spring(response: 0.24, dampingFraction: 0.84)) {
+                    showActivity = false
+                    showContext = false
+                    showHistory = false
+                    toolsExpanded = false
+                }
+                state.beginQuestionExtraction()
+            }
+
+            FloatingToolButton(
                 title: "上下文",
                 systemImage: showContext ? "tray.full.fill" : "tray.full",
                 accessibilityLabel: "上下文",
@@ -1399,15 +1418,18 @@ struct QuestionCaptureOverlay: View {
 
             VStack {
                 HStack(alignment: .top, spacing: 12) {
-                    Button { state.cancelAiming() } label: {
+                    Button {
+                        if state.cameraTaskKind == .extract { state.cancelExtraction() } else { state.cancelAiming() }
+                    } label: {
                         Image(systemName: "xmark").font(.headline.weight(.semibold)).foregroundStyle(.white)
                             .frame(width: 38, height: 38).background(.ultraThinMaterial, in: Circle())
                     }
                     .accessibilityIdentifier("aiming-close")
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(state.segmentationIsGrading ? "作业批改 · 取景" : "拍照答题 · 取景")
+                        Text(state.cameraTaskKind == .extract ? "题目提取 · 取景" : (state.segmentationIsGrading ? "作业批改 · 取景" : "拍照答题 · 取景"))
                             .font(.subheadline.weight(.semibold)).foregroundStyle(.white)
-                        Label(state.cameraAimHint, systemImage: state.cameraAimReady ? "checkmark.circle.fill" : "viewfinder")
+                        Label(state.cameraTaskKind == .extract && !state.extractNotice.isEmpty ? state.extractNotice : state.cameraAimHint,
+                              systemImage: state.cameraAimReady ? "checkmark.circle.fill" : "viewfinder")
                             .font(.caption).foregroundStyle(state.cameraAimReady ? .green : .white.opacity(0.85))
                     }
                     Spacer()
@@ -1448,14 +1470,28 @@ struct QuestionCaptureOverlay: View {
                             .frame(width: 48)
                         }
                         .accessibilityIdentifier("aiming-auto-toggle")
-                        Button { state.captureSegmentationPhoto() } label: {
+                        Button {
+                            if state.cameraTaskKind == .extract { state.captureExtractionPhoto() } else { state.captureSegmentationPhoto() }
+                        } label: {
                             ZStack {
                                 Circle().strokeBorder(.white, lineWidth: 4).frame(width: 74, height: 74)
                                 Circle().fill(.white).frame(width: 60, height: 60)
                             }
                         }
                         .accessibilityIdentifier("aiming-shutter")
-                        Color.clear.frame(width: 48, height: 48)
+                        if state.cameraTaskKind == .extract {
+                            Button { state.finishExtraction() } label: {
+                                VStack(spacing: 3) {
+                                    Image(systemName: "checkmark.circle.fill").font(.title3)
+                                    Text("完成").font(.caption2)
+                                }
+                                .foregroundStyle(.green)
+                                .frame(width: 48)
+                            }
+                            .accessibilityIdentifier("extract-finish")
+                        } else {
+                            Color.clear.frame(width: 48, height: 48)
+                        }
                     }
                 }
                 .padding(.bottom, 28)
@@ -5281,6 +5317,7 @@ enum CameraTaskKind: Equatable {
     case singleCapture
     case burst
     case qaFrame
+    case extract   // 题目提取取景（连拍多张试卷，逐张提取去重）
 }
 
 enum TTSPlaybackPhase: Equatable {
@@ -7046,6 +7083,14 @@ final class AppState: ObservableObject {
     @Published var selectedRegionID: UUID?                  // 当前选中的浮层
     @Published var segmentationDidCorrect = false           // 本次是否做了梯形校正
     @Published var segmentationUseCorrected = true          // 「用矫正图 ⇄ 用原图」切换
+    // MARK: 题目提取（观察模式·融入 iPhone/iPad）。拍清试卷→后端提取结构化题目→服务端去重累积成题集→还原页/空白卷。
+    @Published var extractSessionId: String?                // 本回合题目提取会话（mode=extract，创建即入历史）
+    @Published var extractShotCount = 0                     // 已拍并成功提取的张数
+    @Published var extractUniqueCount = 0                   // 服务端去重后的题集题数（question_set_count）
+    @Published var extractInflight = 0                      // 进行中的上传数（串行 maxInflight=1）
+    @Published var extractNotice = ""                       // 取景/提取实时提示文案
+    @Published var extractResultVisible = false            // 弹出还原/空白卷结果 sheet
+    @Published var extractRestoreHTML: String?             // 还原页 HTML（服务端渲染，WKWebView 显示）
     @Published var segmentationIsGrading = false            // true=作业批改, false=拍照答题
     @Published var segmentationNotice = ""                  // 顶部提示（未框到题等兜底文案）
     // P2 整页批改：端上准 bbox(questionRegions) + 后端 grade-page 逐题判分，按 index 对齐叠 ✓/✗/?。
@@ -7144,6 +7189,7 @@ final class AppState: ObservableObject {
     var captureBurstFrame: (() -> Bool)?
     var captureQAFrame: (() -> Bool)?
     var captureSegment: (() -> Bool)?          // P0：分题/批改取景后全分辨率抓拍
+    var captureExtract: (() -> Bool)?          // 题目提取取景后全分辨率抓拍（连拍）
     var setTorch: ((Bool) -> Void)?            // P0：补光手电
 
     private var burstBuffer: [BurstFrame] = []
@@ -7344,7 +7390,7 @@ final class AppState: ObservableObject {
     }
 
     var inlineCameraPreviewVisible: Bool {
-        cameraPreviewVisible && !cameraSheetVisible && (cameraTaskKind == .qaFrame || isBursting || cameraTaskKind == .burst || cameraTaskKind == .singleCapture)
+        cameraPreviewVisible && !cameraSheetVisible && (cameraTaskKind == .qaFrame || cameraTaskKind == .extract || isBursting || cameraTaskKind == .burst || cameraTaskKind == .singleCapture)
     }
 
     var activeTaskVisible: Bool {
@@ -7532,6 +7578,8 @@ final class AppState: ObservableObject {
             return "智能观察"
         case .qaFrame:
             return "语音画面上下文"
+        case .extract:
+            return "题目提取"
         case .singleCapture, .none:
             return "拍题解析"
         }
@@ -7543,6 +7591,8 @@ final class AppState: ObservableObject {
             return "rectangle.stack.fill"
         case .qaFrame:
             return "camera.metering.center.weighted"
+        case .extract:
+            return "doc.text.viewfinder"
         case .singleCapture, .none:
             return "camera.viewfinder"
         }
@@ -7554,6 +7604,8 @@ final class AppState: ObservableObject {
             return "停止并生成总结"
         case .qaFrame:
             return isListening ? "结束收听并提交" : "回到对话"
+        case .extract:
+            return "完成提取"
         case .singleCapture, .none:
             return "拍照答题"
         }
@@ -7565,6 +7617,8 @@ final class AppState: ObservableObject {
             return "stop.circle"
         case .qaFrame:
             return isListening ? "paperplane.circle.fill" : "bubble.left.and.bubble.right"
+        case .extract:
+            return "checkmark.circle.fill"
         case .singleCapture, .none:
             return "camera.circle.fill"
         }
@@ -7576,6 +7630,8 @@ final class AppState: ObservableObject {
             return false
         case .qaFrame:
             return isThinking
+        case .extract:
+            return false
         case .singleCapture, .none:
             return !isCameraReady
         }
@@ -7952,7 +8008,7 @@ final class AppState: ObservableObject {
     }
 
     private var cameraCanBecomeAvailableForQA: Bool {
-        cameraCaptureAvailable || cameraTaskKind == .qaFrame || isBursting || cameraSheetVisible || cameraPreviewVisible
+        cameraCaptureAvailable || cameraTaskKind == .qaFrame || cameraTaskKind == .extract || isBursting || cameraSheetVisible || cameraPreviewVisible
     }
 
     private var trimmedLongTermInstruction: String {
@@ -9330,7 +9386,11 @@ final class AppState: ObservableObject {
         if cameraAimReady {
             aimReadyStreak += 1
             if aimReadyStreak >= 3 {   // ~连续 3 帧达标(约 1 秒)才自动拍，去抖
-                captureSegmentationPhoto()
+                if cameraTaskKind == .extract {
+                    captureExtractionPhoto()
+                } else {
+                    captureSegmentationPhoto()
+                }
             }
         } else {
             aimReadyStreak = 0
@@ -9381,6 +9441,159 @@ final class AppState: ObservableObject {
         autoRouteRevertText = nil
         if cameraTaskKind == .qaFrame { cameraTaskKind = .none }
         cameraPreviewVisible = false
+    }
+
+    // MARK: - 题目提取（观察模式）：拍清试卷 → 逐张提取 → 服务端去重累积 → 还原页/空白卷。
+    /// 进入题目提取取景：连拍多张试卷，逐张提取去重。强调取景质量（试卷铺满+清晰）。
+    func beginQuestionExtraction() {
+        guard !captureAimingVisible, !segmentationBusy, !isSubmittingQuestion else { return }
+        recordUserOperation("question_extract")
+        extractShotCount = 0
+        extractUniqueCount = 0
+        extractInflight = 0
+        extractRestoreHTML = nil
+        extractNotice = "把试卷铺满取景框、放平、对焦，清晰后会自动拍；也可手动按快门"
+        aimReadyStreak = 0
+        aimCapturing = false
+        cameraAimSharpness = 0
+        cameraAimBrightness = 0.5
+        cameraAimMaterial = 0
+        cameraTaskKind = .extract
+        cameraPreviewVisible = true
+        cameraSheetVisible = false
+        captureAimingVisible = true
+        qaStateText = "对准试卷"
+        qaSystemImage = "doc.text.viewfinder"
+        speak("把试卷对准取景框、拍清楚，我来提取题目", completion: nil)
+        log("题目提取：进入取景拍照")
+        Task { _ = await ensureExtractSession() }
+    }
+
+    /// 手动/自动快门：抓一张全分辨率真照片用于提取。串行（一次只在跑一张）。
+    func captureExtractionPhoto() {
+        guard captureAimingVisible, cameraTaskKind == .extract, !aimCapturing, extractInflight == 0 else { return }
+        aimCapturing = true
+        aimReadyStreak = 0
+        qaStateText = "拍照中"
+        if captureExtract?() != true {
+            aimCapturing = false
+            extractNotice = "抓拍入口不可用（模拟器无相机？请用真机测试）"
+            log("题目提取取景：抓拍入口不可用", level: "warning")
+        }
+    }
+
+    /// 抓到全分辨率照片 → 不关取景层（连拍）→ 异步上传提取，完成后允许下一张。
+    func didCaptureExtractionPhoto(_ image: UIImage) {
+        guard captureAimingVisible, cameraTaskKind == .extract else { return }
+        qaStateText = "提取中"
+        Task { await uploadExtractionPhoto(image) }
+    }
+
+    private func uploadExtractionPhoto(_ image: UIImage) async {
+        guard await ensureExtractSession(), let sid = extractSessionId else {
+            extractNotice = "未能创建题目提取会话，请重试"
+            aimCapturing = false
+            return
+        }
+        extractInflight += 1
+        defer { extractInflight -= 1; aimCapturing = false }
+        do {
+            let files = [MultipartFile(field: "image", name: "extract.jpg", mime: "image/jpeg", data: try jpegData(image))]
+            let data = try await postForm(
+                path: "/api/sessions/\(sid)/extract-questions",
+                fields: ["source": UIDevice.current.identifierForVendor?.uuidString ?? "ios"],
+                files: files
+            )
+            let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let isMaterial = (json?["is_study_material"] as? Bool) ?? false
+            let lowQuality = (json?["low_quality"] as? Bool) ?? false
+            let thisCount = (json?["questions"] as? [[String: Any]])?.count ?? 0
+            let setCount = (json?["question_set_count"] as? Int) ?? extractUniqueCount
+            extractUniqueCount = setCount
+            // 语音 + 文字提醒：拍不到题就引导重拍（用户要求“没有的话需要前端语音提醒”）。
+            if !isMaterial {
+                extractNotice = "这张没看到题目（像是桌面/无关画面），对准试卷再拍一张"
+                speak("这张没看到题目，请把试卷对准取景框", completion: nil)
+            } else if lowQuality || thisCount == 0 {
+                extractNotice = "这张题目没看清，请靠近一点、放平、对焦后重拍"
+                speak("这张没看清，请靠近一点重拍", completion: nil)
+            } else {
+                extractShotCount += 1
+                extractNotice = "已拍 \(extractShotCount) 张 · 去重后 \(setCount) 道题"
+            }
+        } catch {
+            extractNotice = "提取失败（网络或服务繁忙），可再拍一张"
+            log("题目提取上传失败：\(error.localizedDescription)", level: "error")
+        }
+        if captureAimingVisible { qaStateText = "对准试卷" }
+    }
+
+    private func ensureExtractSession() async -> Bool {
+        if extractSessionId != nil { return true }
+        do {
+            var fields = [
+                "device_id": UIDevice.current.identifierForVendor?.uuidString ?? "iphone",
+                "mode": "extract",
+                "title": "题目提取"
+            ]
+            if !AuthSession.shared.activeStudentId.isEmpty {
+                fields["student_profile_id"] = AuthSession.shared.activeStudentId
+            }
+            let data = try await postForm(path: "/api/sessions", fields: fields, files: [])
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let id = json["session_id"] as? String {
+                extractSessionId = id
+                log("题目提取会话创建成功：\(id)")
+                return true
+            }
+        } catch {
+            log("题目提取会话创建失败：\(error.localizedDescription)", level: "error")
+        }
+        return false
+    }
+
+    /// 完成取景：关相机，拉还原页 HTML 弹出结果。
+    func finishExtraction() {
+        if torchOn { setTorch?(false); torchOn = false }
+        captureAimingVisible = false
+        aimCapturing = false
+        aimReadyStreak = 0
+        cameraTaskKind = .none
+        cameraPreviewVisible = false
+        if extractUniqueCount > 0 {
+            Task {
+                if let html = await fetchRestoreHTML(view: "restore") { extractRestoreHTML = html }
+                extractResultVisible = true
+            }
+        } else {
+            extractNotice = "还没提取到题目，把试卷拍清楚、铺满取景框再试"
+            speak("还没提取到题目，请把试卷拍清楚再试", completion: nil)
+        }
+    }
+
+    func cancelExtraction() {
+        if torchOn { setTorch?(false); torchOn = false }
+        captureAimingVisible = false
+        aimCapturing = false
+        aimReadyStreak = 0
+        if cameraTaskKind == .extract { cameraTaskKind = .none }
+        cameraPreviewVisible = false
+    }
+
+    /// 取还原页/空白卷 HTML（服务端渲染，供 WKWebView 显示与打印）。view = restore | blank。
+    func fetchRestoreHTML(view: String) async -> String? {
+        guard let sid = extractSessionId else { return nil }
+        // 用 queryItems 拼 view，避免 URL.appending(path:) 把 "?" 百分号编码导致 query 失效。
+        let url = serverBaseURL
+            .appending(path: "/api/sessions/\(sid)/restore-page")
+            .appending(queryItems: [URLQueryItem(name: "view", value: view)])
+        do {
+            let data = try await getData(url: url)
+            return String(data: data, encoding: .utf8)
+        } catch {
+            log("还原页获取失败：\(error.localizedDescription)", level: "error")
+            return nil
+        }
     }
 
     /// 校正 + 分割（一次性，发生在显式点击「分题」之后，短暂主线程计算可接受）。
@@ -11797,6 +12010,8 @@ final class AppState: ObservableObject {
                 cameraSheetVisible = false
                 cameraPreviewVisible = true
             }
+        case .extract:
+            finishExtraction()
         case .singleCapture, .none:
             captureSingleFromCamera()
         }
@@ -12134,7 +12349,7 @@ final class AppState: ObservableObject {
     func cameraDidClose(hostId: UUID) {
         guard currentCameraHostId == hostId else { return }
         currentCameraHostId = nil
-        let shouldKeepWaitingForReplacementCamera = (isBursting || cameraTaskKind == .qaFrame) && (cameraPreviewVisible || cameraSheetVisible || backgroundCameraActive)
+        let shouldKeepWaitingForReplacementCamera = (isBursting || cameraTaskKind == .qaFrame || cameraTaskKind == .extract) && (cameraPreviewVisible || cameraSheetVisible || backgroundCameraActive)
         let wasWaitingForSingleCapture = pendingSingleCapture
         captureSingle = nil
         captureBurstFrame = nil
@@ -13299,6 +13514,7 @@ struct CameraView: UIViewControllerRepresentable {
         state.captureBurstFrame = { [weak controller] in controller?.capture(kind: .burst) ?? false }
         state.captureQAFrame = { [weak controller] in controller?.capture(kind: .qa) ?? false }
         state.captureSegment = { [weak controller] in controller?.capture(kind: .segment) ?? false }
+        state.captureExtract = { [weak controller] in controller?.capture(kind: .extract) ?? false }
         state.setTorch = { [weak controller] on in controller?.setTorch(on) }
         return controller
     }
@@ -13344,6 +13560,8 @@ struct CameraView: UIViewControllerRepresentable {
                     state.didCaptureQAFrame(image)
                 case .segment:
                     state.didCaptureSegmentationPhoto(image)
+                case .extract:
+                    state.didCaptureExtractionPhoto(image)
                 }
             }
         }
@@ -13369,6 +13587,7 @@ enum CaptureKind {
     case burst
     case qa
     case segment   // P0：分题/批改取景后抓拍（全分辨率真照片）
+    case extract   // 题目提取取景后抓拍（全分辨率真照片，连拍）
 }
 
 protocol CameraViewControllerDelegate: AnyObject {

@@ -73,6 +73,11 @@ struct iPadLearnView: View {
             } label: {
                 Label("批改作业", systemImage: "checkmark.rectangle.stack")
             }
+            Button {
+                state.beginQuestionExtraction()
+            } label: {
+                Label("题目提取", systemImage: "doc.text.viewfinder")
+            }
             // 动态（活动日志），对齐 iPhone 的「动态」(#2)。偏好已移到 设置·一句话辅导偏好(#3 移除旧菜单)
             Button {
                 showActivity = true

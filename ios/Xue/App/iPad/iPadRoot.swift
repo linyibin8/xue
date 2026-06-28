@@ -77,6 +77,9 @@ struct iPadRootView: View {
                 QuestionCaptureOverlay(state: state)
             }
         }
+        .sheet(isPresented: $state.extractResultVisible) {
+            ExtractResultSheet(state: state)
+        }
     }
 
     private var sidebar: some View {

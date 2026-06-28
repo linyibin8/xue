@@ -11196,6 +11196,246 @@ def observe_demo_page() -> str:
     return (Path(__file__).parent / "static" / "observe.html").read_text(encoding="utf-8")
 
 
+# ---------------------------------------------------------------------------
+# 题目提取（融入 iPhone/iPad 观察）：有状态会话端点。每张照片提取题目→服务端去重累积成
+# 「题目集」存库→会话创建即入历史(status='saved')→还原页/空白卷由服务端渲染 HTML 供 WKWebView 显示与打印。
+# 复用 observe_extract 提示词与 _build_observe_response；几何/读图题已被强制“不确定”，本功能不判分。
+# ---------------------------------------------------------------------------
+def _simhash_hamming(a: str, b: str) -> int:
+    if not a or not b:
+        return 64
+    try:
+        return bin(int(a, 16) ^ int(b, 16)).count("1")
+    except ValueError:
+        return 64
+
+
+def _consolidate_question_set(prior: list[dict], new: list[dict]) -> list[dict]:
+    """把本张图新提取的题并入已有题目集并去重（服务端是唯一去重者，两端一致）。
+    fingerprint 精确命中跳过；否则 simhash 十六进制 Hamming<=3 视为近似同题跳过。保留先到题。"""
+    result = list(prior)
+    seen_fp = {q.get("fingerprint") for q in result if q.get("fingerprint")}
+    for q in new:
+        if not (q.get("stem") or "").strip():
+            continue
+        fp = q.get("fingerprint") or ""
+        if fp and fp in seen_fp:
+            continue
+        sh = q.get("simhash") or ""
+        if sh and any(_simhash_hamming(sh, e.get("simhash") or "") <= 3 for e in result):
+            continue
+        result.append(q)
+        if fp:
+            seen_fp.add(fp)
+    return result
+
+
+def _latest_question_set(session_id: str) -> list[dict]:
+    """读取本会话已存的题目集（report_events 中单条 event_type='question_set'）。"""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT content FROM report_events WHERE session_id=? AND event_type='question_set' ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+    if not row:
+        return []
+    try:
+        data = json.loads(row["content"])
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def _save_question_set(session_id: str, qset: list[dict]) -> None:
+    """把题目集 upsert 成单条 report_events 行（避免逐张追加撑爆 overview 的 40 条窗口、也避免
+    record_report_event 的 6000 字截断毁坏 JSON）。content 为完整 JSON（TEXT 列无长度限制）。"""
+    payload = json.dumps(qset, ensure_ascii=False)
+    now = utc_now()
+    with connect() as conn:
+        existing = conn.execute(
+            "SELECT id FROM report_events WHERE session_id=? AND event_type='question_set' ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if existing:
+            conn.execute("UPDATE report_events SET content=?, created_at=? WHERE id=?", (payload, now, existing["id"]))
+        else:
+            conn.execute(
+                "INSERT INTO report_events(session_id, analysis_id, event_type, title, content, created_at) VALUES(?,?,?,?,?,?)",
+                (session_id, None, "question_set", "题目集", payload, now),
+            )
+        conn.commit()
+
+
+@app.post("/api/sessions/{session_id}/extract-questions")
+async def extract_session_questions(
+    session_id: str,
+    request: Request,
+    image: UploadFile = File(...),
+    source: str = Form("ios"),
+) -> dict:
+    """题目提取（供 iOS 观察模式调用）：对一张拍清的试卷图提取结构化题目，服务端去重累积成题目集并存库，
+    会话置 status='saved' 直接进历史。鉴权/存图/限流口径与 segment-questions 一致；BACKGROUND 优先级给课堂实时让路；
+    不判分（do_grade=False，几何题已强制不确定）、不触发任何报告任务（绝不调用 finish）。"""
+    init_db()
+    principal = principal_from_request(request)
+    if not image.filename:
+        raise HTTPException(422, "image is required")
+    with connect() as conn:
+        require_account_session(conn, session_id, principal)
+    source_text = clean_user_text(source, 80) or "ios"
+    _, filename, _ = await save_upload(
+        image,
+        session_id,
+        "extract",
+        batch_id="extract",
+        captured_at=utc_now(),
+        capture_meta={"source": source_text, "purpose": "question_extraction"},
+    )
+    settings = effective_llm_settings_for_session(session_id)
+    prompt = prompts.render_prompt("observe_extract")
+    image_paths = [image_path_for_request(filename)]
+    try:
+        raw = await run_with_llm_gate(
+            f"extract:{session_id[:8]}",
+            session_id,
+            lambda: llm.analyze_images(settings, prompt, image_paths),
+            priority=LLM_PRIORITY_BACKGROUND,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        emit_log(
+            f"题目提取调用视觉模型失败：{truncate_text(str(exc), 180)}",
+            session_id=session_id,
+            device_id=source_text,
+            source="extract",
+            level="warning",
+        )
+        raise HTTPException(502, "question extraction failed")
+    per = _build_observe_response(raw, do_grade=False)
+    for q in per["questions"]:
+        q["src_filename"] = filename
+    consolidated = _consolidate_question_set(_latest_question_set(session_id), per["questions"])
+    _save_question_set(session_id, consolidated)
+    subject = next((q.get("subject") for q in consolidated if q.get("subject")), "")
+    title = (f"{subject} · 题目提取" if subject else "题目提取")
+    with connect() as conn:
+        conn.execute(
+            "UPDATE sessions SET status='saved', updated_at=?, title=? WHERE id=?",
+            (utc_now(), title, session_id),
+        )
+        conn.commit()
+    emit_log(
+        f"题目提取完成：本图 {len(per['questions'])} 题，去重后题集 {len(consolidated)} 题，low_quality={per['low_quality']}",
+        session_id=session_id,
+        device_id=source_text,
+        source="extract",
+    )
+    return {
+        "is_study_material": per["is_study_material"],
+        "questions": per["questions"],
+        "low_quality": per["low_quality"],
+        "question_set": consolidated,
+        "question_set_count": len(consolidated),
+        "filename": filename,
+    }
+
+
+def _restore_esc(s: object) -> str:
+    return html.escape(str(s or ""))
+
+
+def _restore_stem_html(stem: str) -> str:
+    return _restore_esc(stem).replace("未识别", '<span style="color:#c0392b">未识别</span>')
+
+
+def _restore_options_html(q: dict) -> str:
+    opts = q.get("options") or []
+    if not isinstance(opts, list) or not opts:
+        return ""
+    items = "".join(
+        f"<li><b>{_restore_esc(o.get('label'))}.</b> {_restore_esc(o.get('text'))}</li>"
+        for o in opts if isinstance(o, dict)
+    )
+    return f'<ul style="margin:6px 0 0;padding-left:18px">{items}</ul>'
+
+
+def _blank_answer_area(q: dict) -> str:
+    qtype = q.get("qtype") or ""
+    if qtype == "选择题" and (q.get("options") or []):
+        return ""
+    try:
+        blanks = int(q.get("blanks") or 0)
+    except (TypeError, ValueError):
+        blanks = 0
+    n = blanks if blanks > 0 else (1 if qtype == "口算题" else (12 if qtype == "作文题" else 4))
+    line = '<div style="border-bottom:1px solid #999;height:1.7em;margin:7px 0"></div>'
+    return f'<div>{line * n}</div>'
+
+
+def _render_restore_html(qset: list[dict], view: str, base_url: str) -> str:
+    """从已存题目集渲染服务端 HTML（还原页 / 空白卷）。含图题只输出『见原图』+原图缩略（走免鉴权
+    thumbnail 绝对URL），不重绘几何、不渲染学生手写。view='blank' 带 @media print A4 空白作答区。"""
+    is_blank = view == "blank"
+    subject = next((q.get("subject") for q in qset if q.get("subject")), "")
+    cards = []
+    for i, q in enumerate(qset):
+        num = _restore_esc(q.get("number")) or (f"{i + 1}." if is_blank else f"第{i + 1}题")
+        figure = ""
+        fn = q.get("figure_note") or ""
+        src = q.get("src_filename") or ""
+        if fn or (q.get("qtype") in ("解答题", "应用题") and "图" in (q.get("stem") or "")):
+            note = _restore_esc(fn) or "此题含图，见原图"
+            img = f'<img src="{base_url}/api/images/{_restore_esc(src)}/thumbnail" style="max-width:60%;border:1px solid #ccc;margin-top:6px;display:block">' if src else ""
+            figure = f'<div style="color:#b9770e;font-size:13px;margin-top:6px">🖼 {note}</div>{img}'
+        pills = f'<span style="font-size:12px;color:#666">[{_restore_esc(q.get("qtype"))}]</span>'
+        if not is_blank and q.get("subject"):
+            pills = f'<span style="font-size:12px;color:#666">{_restore_esc(q.get("subject"))} · </span>' + pills
+        blanks_note = ""
+        if not is_blank and q.get("blanks"):
+            blanks_note = f'<div style="font-size:12px;color:#888;margin-top:4px">填空 {int(q["blanks"])} 处</div>'
+        body = (
+            f'<div style="margin-bottom:6px"><b style="color:#2962ff">{num}</b> {pills}</div>'
+            f'<div style="font-size:15px;white-space:pre-wrap">{_restore_stem_html(q.get("stem"))}</div>'
+            f'{_restore_options_html(q)}{blanks_note}{figure}'
+        )
+        if is_blank:
+            body += _blank_answer_area(q)
+            cards.append(f'<div style="padding:12px 0;border-bottom:1px dashed #ccc;break-inside:avoid;page-break-inside:avoid">{body}</div>')
+        else:
+            thumb = ""
+            if src:
+                thumb = f'<div style="flex:0 0 180px"><img src="{base_url}/api/images/{_restore_esc(src)}/thumbnail" style="width:100%;border:1px solid #ddd;border-radius:6px"><div style="font-size:11px;color:#999;text-align:center">原图核对</div></div>'
+            cards.append(f'<div style="display:flex;gap:14px;border:1px solid #e0e0e0;border-radius:10px;padding:14px;margin-bottom:12px"><div style="flex:1">{body}</div>{thumb}</div>')
+    body_html = "".join(cards) or '<div style="color:#888;text-align:center;padding:40px">还没有提取到题目。把试卷拍清楚、铺满取景框再试。</div>'
+    if is_blank:
+        head = f'<div style="display:flex;justify-content:space-between;border-bottom:2px solid #111;padding-bottom:8px;margin-bottom:16px;font-size:13px"><span>{_restore_esc(subject)} 空白练习卷</span><span>姓名______ 日期______ 得分____</span></div>'
+        return (
+            '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<style>@page{size:A4;margin:14mm}body{font-family:-apple-system,"PingFang SC",sans-serif;color:#111;padding:16px;max-width:780px;margin:0 auto}</style>'
+            f'</head><body>{head}{body_html}</body></html>'
+        )
+    return (
+        '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<style>body{font-family:-apple-system,"PingFang SC",sans-serif;color:#1a1a1a;padding:14px;margin:0}</style>'
+        f'</head><body><div style="color:#888;font-size:12px;margin-bottom:10px">题目还原（印刷题干语义重排 + 原图核对）。含图题只标“见原图”，不重绘、不渲染手写作答。</div>{body_html}</body></html>'
+    )
+
+
+@app.get("/api/sessions/{session_id}/restore-page", response_class=HTMLResponse)
+def session_restore_page(session_id: str, request: Request, view: str = "restore") -> str:
+    """从已存题目集渲染还原页/空白卷 HTML（供 iOS WKWebView 显示与打印）。鉴权口径同其它会话端点。"""
+    init_db()
+    principal = principal_from_request(request)
+    with connect() as conn:
+        require_account_session(conn, session_id, principal)
+    qset = _latest_question_set(session_id)
+    base_url = (get_settings().public_base_url or "").rstrip("/")
+    return _render_restore_html(qset, "blank" if view == "blank" else "restore", base_url)
+
+
 @app.post("/api/solve-single")
 async def solve_single(
     request: Request,
