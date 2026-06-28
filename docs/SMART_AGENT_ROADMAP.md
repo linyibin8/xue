@@ -109,6 +109,15 @@
 - **验收(实测过)**：①/observe 200 ②清晰题页→5 题结构化(qtype/题号/选项/填空/指纹齐) 6.2s/页 ③非题目图→is_study_material=false ④中文几何题→强制"不确定"、gradable=false ⑤连测后 0 临时残留、0 用户表写入(不污染) ⑥已部署 prod xue.evowit.com,现有 / 等端点无回归。
 - **后续(确认效果后)**：融入语音指令(实时对话说"把这些题提取出来/打印空白卷"自动进观察台);iOS 端上 Vision 强去重+透视校正;真相机+麦克风转文字图文联合。
 
+## 增量4 · 题目提取融入 iPhone+iPad 观察（2026-06-28，commit cfbb3a0）
+用户：① 先拿过去真实观察照片跑一轮提取评估可行性；② 把「拍照观察式题目提取/还原/打印空白卷」融入 iPhone+iPad 观察功能，方便真机拍照实测；没读到题要前端【语音提醒】。多角色子代理(PM/iOS架构/后端/交互/对抗整合)交叉验证落地。
+- **可行性评估(40 张真实观察照片实测)**：试卷【拍清+占满取景框】时提取极好且稳定(同一份几何卷连拍稳定 6/6 题，题干准确转写)；【广角桌面环境照/试卷远小】时 48% 帧为空。114 题→去重 29(~4x)，avg 9s/张。**根因=取景质量(印证增量2)**，模型够用。→ 整合必须引导取景 + 失败时语音提醒。
+- **后端**(app/main.py)：`POST /api/sessions/{id}/extract-questions`(有状态，复用 observe_extract+27B VLM，BACKGROUND 优先级，服务端去重 `_consolidate_question_set` 累积成题集 upsert 单条 report_events，会话 status='saved' 入历史，**不触发任何报告/不判分**)；`GET .../restore-page?view=restore|blank` 服务端渲染还原页/空白卷 HTML(含图题只标见原图+原图缩略，不渲染手写)。已部署 prod 实测：建会话→2 次提取去重稳定→还原/空白卷 200→历史含 mode=extract/status=saved。
+- **iOS**(两端共享核心一次/UI 各接一次)：`CameraTaskKind`+`CaptureKind.extract` 独立枚举(不污染 QA)；AppState beginQuestionExtraction/captureExtractionPhoto/didCaptureExtractionPhoto(连拍不关取景层)/finishExtraction/fetchRestoreHTML + 串行(maxInflight=1)上传去重计数；`QuestionCaptureOverlay`(两端共享)加 extract 分支(标题/快门/完成按钮)；失败→`speak()` **语音+文字重拍提醒**；iPhone 工具簇 + iPad 工具栏各加「题目提取」入口；新增共享叶子 `QuestionExtractView.swift`(RestorePageWebView WKWebView 显示还原页 + BlankPaperPrinter 系统打印空白卷，iPad popover 锚点兜底)。
+- **编译**：generic iOS device build **BUILD SUCCEEDED**(Mac 模拟器 CoreSimulator 过期无法跑模拟器，改 generic 设备编译验证)。修了 6 处 CameraTaskKind switch 穷尽。
+- **发版**：oneclick-ios bump-and-publish build 202606280913(发版中/待确认)。真机相机/语音流只能真机验收。
+- **后续优化(非验收，已记)**：取景门槛照搬 segment 0.5 偏松(materialScore 4 行饱和)→ 真机标定后改 lineCount/maxLineHeightRatio 收紧；语音路径自动分流；端上 Vision 强去重+透视校正。
+
 ## 约束
 - 两端共享核心（AppState/AuthSession/模型/API），UI 各接一次（见 docs/MULTI_CLIENT_GUIDE.md）。
 - 后端 surgical 部署，data/ 勿覆盖。
