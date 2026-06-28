@@ -9820,13 +9820,14 @@ final class AppState: ObservableObject {
             let generation = beginQuestionSubmissionGeneration()
             Task { await submitRecognizedQuestion(generation: generation) }
         } else {
-            // 拍照答题（“点一题，我来讲”）：选中题直接讲解，不再等用户开口说话（修复“点了没反应”）。
+            // 拍照答题：选中题→讲解那一道；整图问答(questionLabel==nil)→解答整页所有题，
+            // 不能再用“这道题”单数话术(否则整页多题会上下文错配)。均不再等语音，直接出答案。
             stopSpeaking()
             stopListening(submit: false)
             pendingQATrigger = "region_select"
             pendingQAFocus = focus
             let prompt = questionLabel.map { "请讲解\($0)：给出解题思路和最终答案。" }
-                ?? "请讲解这道题：给出解题思路和最终答案。"
+                ?? "请解答这张图里的题目：如果有多道题，请逐题（按题号）给出解题思路和最终答案；图中看不清的地方如实说明，不要编造。"
             pendingQAQuestion = prompt
             recognizedText = prompt
             qaAnswer = ""
