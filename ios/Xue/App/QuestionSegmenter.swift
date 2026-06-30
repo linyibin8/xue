@@ -59,15 +59,16 @@ enum QuestionSegmenter {
 
     /// 把整页拍摄图分割成若干“大题块”（小问 (1)(2)(3) 不单独拆）。
     /// - Returns: [QuestionRegion]，归一化矩形定义在 orientation 归一后的图坐标系；异常返回 []。
-    static func segment(_ image: UIImage) -> [QuestionRegion] {
+    static func segment(_ image: UIImage, fast: Bool = false) -> [QuestionRegion] {
         let base = normalizedUp(image)
-        let visionImage = base.resizedForVision(maxSide: 1400)
+        // 实时扫描用更小图 + fast 识别（省功耗、可达每秒数帧）；静态精提取用 accurate。
+        let visionImage = base.resizedForVision(maxSide: fast ? 1000 : 1400)
         guard let cg = visionImage.cgImage else { return [] }
         let orientation = visionImage.cgImagePropertyOrientation
 
         let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = true
+        request.recognitionLevel = fast ? .fast : .accurate
+        request.usesLanguageCorrection = !fast
         request.recognitionLanguages = ["zh-Hans", "en-US"]
 
         let handler = VNImageRequestHandler(cgImage: cg, orientation: orientation, options: [:])

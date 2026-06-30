@@ -7091,6 +7091,10 @@ final class AppState: ObservableObject {
     @Published var extractNotice = ""                       // 取景/提取实时提示文案
     @Published var extractResultVisible = false            // 弹出还原/空白卷结果 sheet
     @Published var extractRestoreHTML: String?             // 还原页 HTML（服务端渲染，WKWebView 显示）
+    @Published var extractAutoScan = false                 // 自动扫描：开相机时端上跟踪、发现新题才异步识别
+    fileprivate var extractScanTimer: Timer?               // 自动扫描定时器（~1.2s 一帧）
+    fileprivate var extractSeenKeys: [String] = []         // 已捕获题的端上指纹（题文归一化），用于跟踪去重
+    fileprivate var extractScanBusy = false                // 端上扫描计算中（避免叠帧）
     @Published var segmentationIsGrading = false            // true=作业批改, false=拍照答题
     @Published var segmentationNotice = ""                  // 顶部提示（未框到题等兜底文案）
     // P2 整页批改：端上准 bbox(questionRegions) + 后端 grade-page 逐题判分，按 index 对齐叠 ✓/✗/?。
@@ -7190,6 +7194,7 @@ final class AppState: ObservableObject {
     var captureQAFrame: (() -> Bool)?
     var captureSegment: (() -> Bool)?          // P0：分题/批改取景后全分辨率抓拍
     var captureExtract: (() -> Bool)?          // 题目提取取景后全分辨率抓拍（连拍）
+    var latestPreviewFrame: (() -> UIImage?)?  // 题目提取「自动扫描」端上跟踪用：取当前预览帧
     var setTorch: ((Bool) -> Void)?            // P0：补光手电
 
     private var burstBuffer: [BurstFrame] = []
@@ -9466,7 +9471,9 @@ final class AppState: ObservableObject {
         qaSystemImage = "doc.text.viewfinder"
         speak("把试卷对准取景框、拍清楚，我来提取题目", completion: nil)
         log("题目提取：进入取景拍照")
+        extractSeenKeys = []
         Task { _ = await ensureExtractSession() }
+        if extractAutoScan { startExtractScan() }
     }
 
     /// 手动/自动快门：抓一张全分辨率真照片用于提取。串行（一次只在跑一张）。
@@ -9526,6 +9533,71 @@ final class AppState: ObservableObject {
             log("题目提取上传失败：\(error.localizedDescription)", level: "error")
         }
         if captureAimingVisible { qaStateText = "对准试卷" }
+    }
+
+    // MARK: - 题目提取「自动扫描」（实验）：开相机时端上每秒扫一次→按题文指纹跟踪→发现新题才异步识别入库。
+    // 思路：端上 Vision 切题+题文指纹（几乎零成本）做「这题见过没」的跟踪去重，只有新题才发后端大模型，
+    // 所以被动扫描也不会卡（绝大多数帧不触发任何 VLM 调用）。文字相同仅图不同的题会被指纹合并（已知边界）。
+    func toggleExtractAutoScan() {
+        extractAutoScan.toggle()
+        if extractAutoScan && cameraTaskKind == .extract {
+            extractNotice = "自动扫描中：对准试卷慢慢移动，发现新题会自动识别"
+            startExtractScan()
+        } else {
+            stopExtractScan()
+            extractNotice = "已停自动扫描，可手动按快门"
+        }
+    }
+
+    private func startExtractScan() {
+        extractScanTimer?.invalidate()
+        extractScanTimer = Timer.scheduledTimer(withTimeInterval: 1.2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.extractScanTick() }
+        }
+    }
+
+    private func stopExtractScan() {
+        extractScanTimer?.invalidate()
+        extractScanTimer = nil
+    }
+
+    private func extractScanTick() {
+        guard extractAutoScan, cameraTaskKind == .extract, captureAimingVisible,
+              !extractScanBusy, extractInflight == 0,
+              let frame = latestPreviewFrame?() else { return }
+        extractScanBusy = true
+        Task.detached(priority: .userInitiated) { [weak self] in
+            // 端上 fast 分题（轻量），取每题题文做指纹。
+            let regions = QuestionSegmenter.segment(frame, fast: true)
+            let keys = regions.compactMap { Self.extractScanKey($0.ocrText ?? "") }
+            await MainActor.run {
+                guard let self else { return }
+                self.extractScanBusy = false
+                guard self.extractAutoScan, self.cameraTaskKind == .extract, self.extractInflight == 0 else { return }
+                let newKeys = keys.filter { k in !self.extractSeenKeys.contains { Self.extractKeySimilar($0, k) } }
+                guard !newKeys.isEmpty else { return }
+                self.extractSeenKeys.append(contentsOf: newKeys)
+                self.extractNotice = "发现新题，正在识别…（已捕获 \(self.extractUniqueCount) 题）"
+                // 整帧异步发后端精提取（服务端再切题+去重），更新题集计数。
+                Task { await self.uploadExtractionPhoto(frame) }
+            }
+        }
+    }
+
+    /// 题文指纹：去空白标点+小写，截前 40 字。太短(<8)的不作数（噪声）。
+    private static func extractScanKey(_ text: String) -> String? {
+        let norm = text.lowercased().filter { !$0.isWhitespace && !$0.isPunctuation }
+        return norm.count >= 8 ? String(norm.prefix(40)) : nil
+    }
+
+    /// 两个指纹是否同题（容忍 OCR 抖动）：相等/包含/前 12 字相同 即视为同题。
+    private static func extractKeySimilar(_ a: String, _ b: String) -> Bool {
+        if a == b { return true }
+        let shorter = a.count <= b.count ? a : b
+        let longer = a.count <= b.count ? b : a
+        if longer.contains(shorter) { return true }
+        let p = min(shorter.count, 12)
+        return p >= 8 && shorter.prefix(p) == longer.prefix(p)
     }
 
     private func ensureExtractSession() async -> Bool {
@@ -13532,6 +13604,7 @@ struct CameraView: UIViewControllerRepresentable {
         state.captureQAFrame = { [weak controller] in controller?.capture(kind: .qa) ?? false }
         state.captureSegment = { [weak controller] in controller?.capture(kind: .segment) ?? false }
         state.captureExtract = { [weak controller] in controller?.capture(kind: .extract) ?? false }
+        state.latestPreviewFrame = { [weak controller] in controller?.currentPreviewFrame() }
         state.setTorch = { [weak controller] on in controller?.setTorch(on) }
         return controller
     }
@@ -13666,6 +13739,13 @@ final class CameraViewController: UIViewController, AVCapturePhotoCaptureDelegat
         latestVideoImageAt = nil
         pendingKinds.removeAll()
         resetGestureStability()
+    }
+
+    /// 当前预览帧（题目提取「自动扫描」端上跟踪用，轻量、不触发快门）。
+    func currentPreviewFrame() -> UIImage? {
+        guard let latestVideoImage, let latestVideoImageAt,
+              Date().timeIntervalSince(latestVideoImageAt) < 2 else { return nil }
+        return latestVideoImage
     }
 
     @discardableResult
